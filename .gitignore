@@ -1,0 +1,16 @@
+# Goose build artifacts
+*.o
+!adapter.c
+demo
+demo_run
+termbox2
+termbox2_lib
+
+# Goose cache
+.goose/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
