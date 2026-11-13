@@ -581,6 +581,10 @@ fn tb_init_rwfd(rfd: i32, wfd: i32) -> i32 {
     g.width = g.winsize[2] | (g.winsize[3] << 8);
     guard g.width > 0 && g.height > 0 else { return TB_ERR_RESIZE_IOCTL; }
 
+    // Initialize back and front cell buffers
+    let _ = grow_cells(g.back, g.width, g.height);
+    let _ = grow_cells(g.front, g.width, g.height);
+
     let rv5 = tb_adapter_setup_signwinch(g.resize_pipefd[1]);
     guard rv5 == 0 else { return TB_ERR_RESIZE_SIGACTION; }
 
