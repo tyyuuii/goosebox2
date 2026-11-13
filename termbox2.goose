@@ -296,6 +296,7 @@ root struct tb_global {
     cap_trie_children: i32[>..],
     inbuf: u8[>..],
     outbuf: u8[>..],
+    outbuf_len: i64,
     back: cellbuf,
     front: cellbuf,
     orig_tios: u8[64],
@@ -594,6 +595,7 @@ fn tb_init_rwfd(rfd: i32, wfd: i32) -> i32 {
 
     g.input_mode = TB_INPUT_ESC;
     g.output_mode = TB_OUTPUT_NORMAL;
+    g.outbuf_len = 0;
     g.initialized = 1;
 
     return TB_OK;
@@ -999,22 +1001,50 @@ fn tb_hide_cursor() -> i32 {
 // OUTPUT BUFFER
 // ===========================================================================
 
-// outbuf_nputs — write n bytes directly to the TTY.
-fn outbuf_nputs(buf: const u8[:], n: i64) -> i32 {
+// outbuf_puts — append bytes to the frame buffer (do not touch the TTY).
+fn outbuf_puts(str: const u8[:]) -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
-    let _ = tb_adapter_write(g.wfd, buf[0], n as u64);
+    var i: i64 = 0;
+    while i < str.len {
+        let pos = g.outbuf_len;
+        if pos < g.outbuf.len {
+            g.outbuf[pos as i32] = str[i as i32];
+        } else {
+            g.outbuf.push(str[i as i32]);
+        }
+        g.outbuf_len = g.outbuf_len + 1;
+        i = i + 1;
+    }
     return TB_OK;
 }
 
-// outbuf_puts — append bytes to the output buffer.
-fn outbuf_puts(str: const u8[:]) -> i32 {
-    return outbuf_nputs(str, str.len);
+// outbuf_nputs — append n bytes to the frame buffer.
+fn outbuf_nputs(buf: const u8[:], n: i64) -> i32 {
+    let g = gbl();
+    guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
+    var i: i64 = 0;
+    while i < n {
+        let pos = g.outbuf_len;
+        if pos < g.outbuf.len {
+            g.outbuf[pos as i32] = buf[i as i32];
+        } else {
+            g.outbuf.push(buf[i as i32]);
+        }
+        g.outbuf_len = g.outbuf_len + 1;
+        i = i + 1;
+    }
+    return TB_OK;
 }
 
-// outbuf_flush — clear the output buffer (actual write to TTY needs FFI wrapper).
+// outbuf_flush — write the whole frame to the TTY in one syscall.
 fn outbuf_flush(fd: i32) -> i32 {
-    // Writes happen directly in outbuf_nputs; flush is a no-op.
+    let g = gbl();
+    guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
+    if g.outbuf_len > 0 {
+        let _ = tb_adapter_write(fd, g.outbuf[0], g.outbuf_len as u64);
+        g.outbuf_len = 0;
+    }
     return TB_OK;
 }
 
@@ -1126,9 +1156,10 @@ fn tb_present() -> i32 {
                     let _ = send_attr(fg, bg);
                 }
 
-                // send cursor position
-                // send_cursor_if(x, y)
-                let _ = send_cursor_if(x as i32, y);
+                // send cursor position — skip if adjacent to previous cell
+                if x != g.last_x + 1 || y != g.last_y {
+                    let _ = send_cursor_if(x as i32, y);
+                }
                 g.last_x = x as i32;
                 g.last_y = y;
 
@@ -1160,7 +1191,10 @@ fn tb_present() -> i32 {
         }
     }
 
-    let _ = send_cursor_if(g.cursor_x, g.cursor_y);
+    // final cursor reposition — skip if adjacent to last drawn cell
+    if g.cursor_x != g.last_x + 1 || g.cursor_y != g.last_y {
+        let _ = send_cursor_if(g.cursor_x, g.cursor_y);
+    }
     g.last_x = g.cursor_x;
     g.last_y = g.cursor_y;
 
