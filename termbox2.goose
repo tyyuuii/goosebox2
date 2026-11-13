@@ -855,7 +855,9 @@ fn try_match_escape_buf(buf: const u8[:], event: tb_event&) -> i32 {
     }
 
     // Find the final byte (0x40-0x7e) that terminates the sequence.
-    var end = 1;
+    // Start at index 2 to skip the introducer byte (0x5b '[' or 0x4f 'O')
+    // which is itself in the 0x40-0x7e range.
+    var end = 2;
     while end < buf.len {
         let b = buf[end];
         if b >= 0x40 && b <= 0x7e { break; }
@@ -881,9 +883,10 @@ fn try_match_escape_buf(buf: const u8[:], event: tb_event&) -> i32 {
                 if seq[k] != buf[k] { matched = 0; }
             }
             if matched != 0 {
+                // Key codes are 0xffff - cap_index (e.g. cap 18 = arrow up → key 0xffed)
                 event.kind = TB_EVENT_KEY;
                 event.mod = 0;
-                event.key = ci as u16;
+                event.key = (0xffff - ci) as u16;
                 event.ch = 0;
                 return seq_len as i32;
             }
@@ -933,6 +936,10 @@ fn tb_peek_event(event: tb_event&, timeout_ms: i32) -> i32 {
 
     // Process the bytes we read
     let consumed = try_match_escape_buf(readbuf[0..nread], event);
+    if consumed == TB_ERR_NEED_MORE {
+        // Incomplete escape sequence: drop it (no buffering yet)
+        return TB_ERR_NO_EVENT;
+    }
     if consumed > 0 {
         return TB_OK;
     }
