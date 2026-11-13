@@ -1084,7 +1084,58 @@ fn convert_num(num: u64, buf: u8[32]&) -> i32 {
 fn send_attr(fg: uintattr_t, bg: uintattr_t) -> i32 {
     let g = gbl();
     if fg == g.last_fg && bg == g.last_bg { return TB_OK; }
+
+    // 1) Reset all SGR attributes and colors to a known state.
     let _ = outbuf_puts("\x1b[m");
+
+    // 2) Attribute flags live in the high bits of `fg` (termbox convention).
+    if fg & TB_BOLD        != 0 { let _ = outbuf_puts("\x1b[1m");  }
+    if fg & TB_DIM         != 0 { let _ = outbuf_puts("\x1b[2m");  }
+    if fg & TB_ITALIC      != 0 { let _ = outbuf_puts("\x1b[3m");  }
+    if fg & TB_UNDERLINE   != 0 { let _ = outbuf_puts("\x1b[4m");  }
+    if fg & TB_BLINK       != 0 { let _ = outbuf_puts("\x1b[5m");  }
+    if fg & TB_REVERSE     != 0 { let _ = outbuf_puts("\x1b[7m");  }
+    if fg & TB_INVISIBLE   != 0 { let _ = outbuf_puts("\x1b[8m");  }
+    if fg & TB_STRIKEOUT   != 0 { let _ = outbuf_puts("\x1b[9m");  }
+    if fg & TB_UNDERLINE_2 != 0 { let _ = outbuf_puts("\x1b[21m"); }
+    if fg & TB_OVERLINE    != 0 { let _ = outbuf_puts("\x1b[53m"); }
+
+    // 3) Foreground color. Palette index is in the low 8 bits; 0 = default.
+    //    TB_BRIGHT upgrades 30..37 -> 90..97.
+    //    TB_HI_BLACK with no palette index means "bright black" (gray).
+    var fg_idx = fg & 0xff;
+    var fg_bright: i32 = 0;
+    if fg & TB_BRIGHT != 0 { fg_bright = 1; }
+    if fg & TB_HI_BLACK != 0 {
+        if fg_idx == 0 { fg_idx = 1; fg_bright = 1; }
+    }
+    if fg_idx != 0 {
+        let base: u64 = if fg_bright != 0 { 90 } else { 30 };
+        let code = base + fg_idx - 1;
+        let nbuf: u8[32] = [0; 32];
+        let len = convert_num(code, nbuf);
+        let _ = outbuf_puts("\x1b[");
+        let _ = outbuf_puts(nbuf[0..len]);
+        let _ = outbuf_puts("m");
+    }
+
+    // 4) Background color. Same scheme, 40..47 / 100..107.
+    var bg_idx = bg & 0xff;
+    var bg_bright: i32 = 0;
+    if bg & TB_BRIGHT != 0 { bg_bright = 1; }
+    if bg & TB_HI_BLACK != 0 {
+        if bg_idx == 0 { bg_idx = 1; bg_bright = 1; }
+    }
+    if bg_idx != 0 {
+        let base: u64 = if bg_bright != 0 { 100 } else { 40 };
+        let code = base + bg_idx - 1;
+        let nbuf: u8[32] = [0; 32];
+        let len = convert_num(code, nbuf);
+        let _ = outbuf_puts("\x1b[");
+        let _ = outbuf_puts(nbuf[0..len]);
+        let _ = outbuf_puts("m");
+    }
+
     g.last_fg = fg;
     g.last_bg = bg;
     return TB_OK;
