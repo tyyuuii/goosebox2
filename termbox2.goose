@@ -333,6 +333,7 @@ extern fn tb_adapter_ttyname(fd: i32) -> u64;
 extern fn tb_adapter_vsnprintf(buf: u8[TB_OPT_PRINTF_BUF]&, bufsz: u64, fmt: const u8&, ap: u64) -> i32;
 extern fn tb_adapter_setup_signwinch(pipe_fd: i32) -> i32;
 extern fn tb_adapter_resize_notify(fd: i32) -> i32;
+extern fn tb_adapter_set_raw_mode(fd: i32) -> i32;
 
 // ===========================================================================
 // UTF-8 HELPERS
@@ -568,6 +569,9 @@ fn tb_init_rwfd(rfd: i32, wfd: i32) -> i32 {
     guard flags >= 0 else { return TB_ERR_READ; }
     let rv2 = tb_adapter_fcntl_setfl(rfd, flags | O_NONBLOCK);
     guard rv2 == 0 else { return TB_ERR_READ; }
+
+    let rv_raw = tb_adapter_set_raw_mode(rfd);
+    guard rv_raw == 0 else { return TB_ERR_TCSETATTR; }
 
     var pipefd: i32[2] = [0, 0];
     let rv3 = tb_adapter_pipe(pipefd);
@@ -839,41 +843,10 @@ fn try_match_escape_buf(buf: const u8[:], event: tb_event&) -> i32 {
         return 1;
     }
 
-    if buf[1] == 0x5b {
-        var end = 1;
-        while end < buf.len {
-            let b = buf[end];
-            if b >= 0x40 && b <= 0x7e { break; }
-            end = end + 1;
-        }
-        if end >= buf.len { return TB_ERR_NEED_MORE; }
-
-        let seq_len = end + 1;
-
-        var ti = 0;
-        for ti in builtin_terms.len {
-            let entry = builtin_terms[ti];
-            var ci = 0;
-            for ci in TB_CAP__COUNT {
-                let caps = entry.caps;
-                let seq = caps[ci];
-                if seq.len == 0 { continue; }
-                if seq.len != seq_len { continue; }
-                var matched = 1;
-                var k = 0;
-                for k in seq.len {
-                    if seq[k] != buf[k] { matched = 0; }
-                }
-                if matched != 0 {
-                    event.kind = TB_EVENT_KEY;
-                    event.mod = 0;
-                    event.key = ci as u16;
-                    event.ch = 0;
-                    return seq_len as i32;
-                }
-            }
-        }
-
+    // ESC followed by an introducer: '[' (CSI) or 'O' (SS3)
+    let intro = buf[1];
+    if intro != 0x5b && intro != 0x4f {
+        // Not CSI or SS3: ESC by itself
         event.kind = TB_EVENT_KEY;
         event.mod = 0;
         event.key = TB_KEY_ESC;
@@ -881,6 +854,43 @@ fn try_match_escape_buf(buf: const u8[:], event: tb_event&) -> i32 {
         return 1;
     }
 
+    // Find the final byte (0x40-0x7e) that terminates the sequence.
+    var end = 1;
+    while end < buf.len {
+        let b = buf[end];
+        if b >= 0x40 && b <= 0x7e { break; }
+        end = end + 1;
+    }
+    if end >= buf.len { return TB_ERR_NEED_MORE; }
+
+    let seq_len = end + 1;
+
+    // Match against every builtin capability sequence.
+    var ti = 0;
+    for ti in builtin_terms.len {
+        let entry = builtin_terms[ti];
+        var ci = 0;
+        for ci in TB_CAP__COUNT {
+            let caps = entry.caps;
+            let seq = caps[ci];
+            if seq.len == 0 { continue; }
+            if seq.len != seq_len { continue; }
+            var matched = 1;
+            var k = 0;
+            for k in seq.len {
+                if seq[k] != buf[k] { matched = 0; }
+            }
+            if matched != 0 {
+                event.kind = TB_EVENT_KEY;
+                event.mod = 0;
+                event.key = ci as u16;
+                event.ch = 0;
+                return seq_len as i32;
+            }
+        }
+    }
+
+    // No capability matched; treat as ESC.
     event.kind = TB_EVENT_KEY;
     event.mod = 0;
     event.key = TB_KEY_ESC;

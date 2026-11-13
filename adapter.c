@@ -101,3 +101,15 @@ int tb_adapter_resize_notify(int fd) {
     const char b = 1;
     return write(fd, &b, 1);
 }
+
+int tb_adapter_set_raw_mode(int fd) {
+    struct termios raw;
+    if (tcgetattr(fd, &raw) != 0) return -1;
+    /* Disable canonical mode, echo, signal chars, output processing */
+    raw.c_lflag &= ~(ICANON | ECHO | ECHOE | ECHOK | ECHONL | ISIG);
+    raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+    raw.c_oflag &= ~(OPOST);
+    raw.c_cc[VMIN] = 1;
+    raw.c_cc[VTIME] = 0;
+    return tcsetattr(fd, TCSAFLUSH, &raw);
+}

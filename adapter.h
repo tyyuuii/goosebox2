@@ -43,4 +43,7 @@ int tb_adapter_setup_signwinch(int pipe_fd);
 /* Resize pipe notification: write a byte to wake the poll loop. */
 int tb_adapter_resize_notify(int fd);
 
+/* Put the terminal into raw mode (disable canonical mode, echo, signals). */
+int tb_adapter_set_raw_mode(int fd);
+
 #endif /* TERMBOX2_ADAPTER_H */
