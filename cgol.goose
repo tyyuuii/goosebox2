@@ -405,7 +405,7 @@ fn cgol_draw() {
     let status_y = h - 1;
     if status_y >= 0 {
         let _ = tb_print(0, status_y, TB_YELLOW, TB_DEFAULT,
-            "HJKL:move X:toggle Enter:run Space:step C:clear Z:rand G:glider B:block b:blink T:toad P:rpent A:acorn D:diehard L:lwss +/-/0:speed Q:quit");
+            "HJKL:move X:toggle Space:step C:clear Z:rand G:glider B:block b:blink T:toad O:rpent A:acorn D:diehard L:lwss P:pause R:run +/-/0:speed Q:quit");
         let _ = tb_print(0, status_y - 1, TB_CYAN, TB_DEFAULT,
             "Gen: ");
         // Print gen number
@@ -458,6 +458,10 @@ fn cgol_draw() {
         }
         let _ = tb_print(50, status_y - 1, TB_WHITE, TB_DEFAULT, spd_str[0..spd_len]);
         let _ = tb_print(50 + spd_len, status_y - 1, TB_WHITE, TB_DEFAULT, "ms");
+        // Pause indicator
+        if world.running == 0 {
+            let _ = tb_print(60, status_y - 1, TB_RED | TB_BOLD, TB_DEFAULT, "  [PAUSED]");
+        }
     }
 
     let _ = tb_present();
@@ -508,10 +512,13 @@ fn cgol_handle_key(ev: tb_event&) -> i32 {
     if ev.ch == 'b' { cgol_place_pattern("blinker", world.cx, world.cy); return 1; }
     if ev.ch == 'B' { cgol_place_pattern("block", world.cx, world.cy); return 1; }
     if ev.ch == 't' { cgol_place_pattern("toad", world.cx, world.cy); return 1; }
-    if ev.ch == 'p' { cgol_place_pattern("rpent", world.cx, world.cy); return 1; }
+    if ev.ch == 'o' { cgol_place_pattern("rpent", world.cx, world.cy); return 1; }
     if ev.ch == 'a' { cgol_place_pattern("acorn", world.cx, world.cy); return 1; }
     if ev.ch == 'd' { cgol_place_pattern("diehard", world.cx, world.cy); return 1; }
     if ev.ch == 'l' { cgol_place_pattern("lwss", world.cx, world.cy); return 1; }
+    // Pause/Run
+    if ev.ch == 'p' { world.running = 0; return 1; }
+    if ev.ch == 'r' || ev.key == TB_KEY_ENTER { world.running = 1; return 1; }
     // Speed control (33ms = ~30 FPS minimum)
     if ev.ch == '+' || ev.ch == '=' { if world.speed_ms > 33 { world.speed_ms = world.speed_ms - 10; } else if world.speed_ms > 0 { world.speed_ms = 33; } return 1; }
     if ev.ch == '-' { world.speed_ms = world.speed_ms + 10; return 1; }
