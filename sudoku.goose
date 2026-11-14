@@ -921,28 +921,32 @@ fn init_puzzle(diff: i32) {
     var seed: i32 = base_seed * 4 + diff;
 
     // Generate a solved board with entropy from game instance + difficulty
-    var src: i32[81] = PUZZLE_EASY;
-    let ok = generate_solved_board(src, seed);
+    // Retry with different seeds if generation fails - NO PUZZLE_EASY FALLBACK
+    var src: i32[81] = PUZZLE_EASY;  // Initialize to avoid 'used before assigned'
+    var gen_attempts: i32 = 0;
+    var ok: i32 = 0;
+    while gen_attempts < 50 {
+        var i = 0;
+        for i in 81 { src[i] = 0; }
+        ok = generate_solved_board(src, seed);
+        if ok != 0 { break; }
+        seed = seed + 4;
+        gen_attempts = gen_attempts + 1;
+    }
     if ok == 0 {
-        // Fallback to easy puzzle if generation fails
+        // Should never happen, but use PUZZLE_EASY as absolute last resort
         src = PUZZLE_EASY;
         clues = 40;
     }
 
     // Generate puzzle with target clue count, seeded by game instance + difficulty
-    // Retry with different seed if puzzle is invalid (should be rare)
+    // Retry with different seed if puzzle is invalid
     var attempts: i32 = 0;
-    while attempts < 10 {
+    while attempts < 50 {
         let _ = generate_puzzle(src, clues, seed);
         if validate_puzzle(src) != 0 { break; }
-        // Invalid puzzle - try next seed
-        seed = seed + 4;  // Step by 4 to keep same difficulty class
+        seed = seed + 4;
         attempts = attempts + 1;
-    }
-    if attempts >= 10 {
-        // Last resort: fallback to easy puzzle
-        src = PUZZLE_EASY;
-        clues = 40;
     }
 
     var i2 = 0;
