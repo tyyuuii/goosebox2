@@ -546,10 +546,11 @@ fn cgol_handle_key(ev: tb_event&) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// Main loop (fixed timestep: poll input at ~60Hz, simulate at speed_ms)
+// Main loop: non-blocking input poll + fixed timestep + frame pacing
 // ---------------------------------------------------------------------------
 
 extern fn tb_adapter_now_ms() -> i64 = "tb_adapter_now_ms";
+extern fn tb_adapter_sleep_ms(ms: i32) = "tb_adapter_sleep_ms";
 
 fn main() {
     let rv = cgol_init();
@@ -568,8 +569,8 @@ fn main() {
 
     loop {
         var ev = tb_event { .. };
-        // Poll input with short timeout (16ms ~ 60Hz) for responsive controls
-        let rv2 = tb_peek_event(ev, 16);
+        // NON-BLOCKING input poll (0ms) - returns immediately
+        let rv2 = tb_peek_event(ev, 0);
         if rv2 == TB_OK {
             if ev.kind == TB_EVENT_KEY {
                 let should_continue = cgol_handle_key(ev);
@@ -608,6 +609,9 @@ fn main() {
         }
 
         cgol_draw();
+
+        // Frame pacing: sleep to ~60 FPS (16ms) to not burn CPU
+        tb_adapter_sleep_ms(16);
     }
 
     cgol_shutdown();

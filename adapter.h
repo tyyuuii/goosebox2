@@ -52,4 +52,7 @@ int tb_adapter_set_raw_mode(int fd);
 /* Current time in milliseconds (monotonic-ish). */
 long long tb_adapter_now_ms(void);
 
+/* Sleep for milliseconds. */
+void tb_adapter_sleep_ms(int ms);
+
 #endif /* TERMBOX2_ADAPTER_H */
