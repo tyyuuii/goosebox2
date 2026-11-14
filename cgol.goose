@@ -442,7 +442,7 @@ fn cgol_draw() {
         var spd_len: i32 = 0;
         var sv = world.speed_ms;
         if sv == 0 {
-            spd_str[0] = 'M' as u8; spd_str[1] = 'A' as u8; spd_str[2] = 'X' as u8; spd_len = 3;
+            spd_str[0] = 'M'; spd_str[1] = 'A'; spd_str[2] = 'X'; spd_len = 3;
         } else {
             while sv > 0 {
                 spd_str[spd_len] = (0x30 + (sv % 10)) as u8;
