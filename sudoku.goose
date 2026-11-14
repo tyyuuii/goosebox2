@@ -859,38 +859,41 @@ fn is_solved() -> i32 {
 fn init_puzzle(diff: i32) {
     // Increment game instance for entropy
     game.game_instance = game.game_instance + 1;
-    var seed: i32 = game.game_instance;
+    var base_seed: i32 = game.game_instance;
 
     // Map difficulty to clue count
     var clues: i32 = 36;
-    if diff == 0 { clues = 36; }      // Easy
-    else if diff == 1 { clues = 32; } // Medium
+    if diff == 0 { clues = 40; }      // Easy: more clues = easier
+    else if diff == 1 { clues = 34; } // Medium
     else if diff == 2 { clues = 28; } // Hard
     else { clues = 24; }              // Expert
 
-    // Generate a solved board with entropy from game instance
+    // Mix difficulty into seed so each difficulty gets different puzzles
+    var seed: i32 = base_seed * 4 + diff;
+
+    // Generate a solved board with entropy from game instance + difficulty
     var src: i32[81] = PUZZLE_EASY;
     let ok = generate_solved_board(src, seed);
     if ok == 0 {
         // Fallback to easy puzzle if generation fails
         src = PUZZLE_EASY;
-        clues = 36;
+        clues = 40;
     }
 
-    // Generate puzzle with target clue count, seeded by game instance
+    // Generate puzzle with target clue count, seeded by game instance + difficulty
     // Retry with different seed if puzzle is invalid (should be rare)
     var attempts: i32 = 0;
     while attempts < 10 {
         let _ = generate_puzzle(src, clues, seed);
         if validate_puzzle(src) != 0 { break; }
         // Invalid puzzle - try next seed
-        seed = seed + 1;
+        seed = seed + 4;  // Step by 4 to keep same difficulty class
         attempts = attempts + 1;
     }
     if attempts >= 10 {
         // Last resort: fallback to easy puzzle
         src = PUZZLE_EASY;
-        clues = 36;
+        clues = 40;
     }
 
     var i2 = 0;
