@@ -997,6 +997,11 @@ fn show_menu(diff: i32&) -> i32 {
     put_str(8, 14, TB_CYAN, TB_DEFAULT, "Press 1-4   (Q to quit)");
     let _ = tb_present();
 
+    // Clear input buffer to prevent rapid key press glitches
+    let g = gbl();
+    g.inbuf_len = 0;
+    g.inbuf_pos = 0;
+
     loop {
         var ev = tb_event { .. };
         let rv = tb_poll_event(ev);
@@ -1025,6 +1030,12 @@ fn show_win() -> i32 {
     put_str(8, 11, TB_YELLOW, TB_DEFAULT, "M: main menu (new difficulty)");
     put_str(8, 12, TB_YELLOW, TB_DEFAULT, "Q: quit");
     let _ = tb_present();
+
+    // Clear input buffer to prevent rapid key press glitches
+    let g = gbl();
+    g.inbuf_len = 0;
+    g.inbuf_pos = 0;
+
     loop {
         var ev = tb_event { .. };
         let rv = tb_poll_event(ev);
@@ -1069,6 +1080,11 @@ fn main() {
         if ev.ch == 'q' || ev.ch == 'Q' || ev.key == TB_KEY_ESC { break; }
 
         if ev.ch == ' ' {
+            // Clear input buffer to prevent rapid key press glitches
+            let g = gbl();
+            g.inbuf_len = 0;
+            g.inbuf_pos = 0;
+
             if show_menu(diff) == 0 { break; }
             init_puzzle(diff);
             let _ = check_errors();
