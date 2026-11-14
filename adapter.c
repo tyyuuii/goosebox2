@@ -71,6 +71,28 @@ int tb_adapter_poll(int fd, int timeout_ms) {
     return poll(&pfd, 1, timeout_ms);
 }
 
+/* Poll two fds simultaneously. Stores revents in g_poll_revents[0]/[1]. */
+static int g_poll_revents[2];
+int tb_adapter_poll_multi(int fd1, int fd2, int timeout_ms) {
+    struct pollfd pfds[2];
+    pfds[0].fd = fd1;
+    pfds[0].events = POLLIN;
+    pfds[0].revents = 0;
+    pfds[1].fd = fd2;
+    pfds[1].events = POLLIN;
+    pfds[1].revents = 0;
+    int rv = poll(pfds, 2, timeout_ms);
+    g_poll_revents[0] = pfds[0].revents;
+    g_poll_revents[1] = pfds[1].revents;
+    return rv;
+}
+
+/* Return revents for fd index (0=fd1, 1=fd2) from the last tb_adapter_poll_multi call. */
+int tb_adapter_poll_revents(int idx) {
+    if (idx < 0 || idx > 1) return 0;
+    return g_poll_revents[idx];
+}
+
 int tb_adapter_isatty(int fd) {
     return isatty(fd);
 }

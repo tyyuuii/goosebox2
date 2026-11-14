@@ -276,6 +276,7 @@ root struct tb_global {
     rfd: i32,
     wfd: i32,
     ttyfd_open: i32,
+    fd_owned: i32,
     resize_pipefd: i32[2],
     width: i32,
     height: i32,
@@ -295,6 +296,8 @@ root struct tb_global {
     cap_trie: cap_trie_node[>..],
     cap_trie_children: i32[>..],
     inbuf: u8[>..],
+    inbuf_pos: i64,
+    inbuf_len: i64,
     outbuf: u8[>..],
     outbuf_len: i64,
     back: cellbuf,
@@ -327,6 +330,8 @@ extern fn tb_adapter_close(fd: i32) -> i32;
 extern fn tb_adapter_write(fd: i32, buf: const u8&, n: u64) -> i64;
 extern fn tb_adapter_read(fd: i32, buf: u8&, n: u64) -> i64;
 extern fn tb_adapter_poll(fd: i32, timeout_ms: i32) -> i32;
+extern fn tb_adapter_poll_multi(fd1: i32, fd2: i32, timeout_ms: i32) -> i32;
+extern fn tb_adapter_poll_revents(idx: i32) -> i32;
 extern fn tb_adapter_pipe(pipefd: i32[2]&) -> i32;
 extern fn tb_adapter_isatty(fd: i32) -> i32;
 extern fn tb_adapter_errno() -> i32;
@@ -544,6 +549,7 @@ fn tb_init_file(path: const u8[:]) -> i32 {
     let fd = tb_adapter_open_tty(pathbuf[0], O_RDWR);
     guard fd >= 0 else { return TB_ERR_INIT_OPEN; }
 
+    g.fd_owned = 1;
     return tb_init_fd(fd);
 }
 
@@ -561,6 +567,7 @@ fn tb_init_rwfd(rfd: i32, wfd: i32) -> i32 {
     g.wfd = wfd;
     g.rfd = rfd;
     g.ttyfd_open = 1;
+    g.fd_owned = 0;
 
     let rv = tb_adapter_tcgetattr(rfd, g.orig_tios);
     guard rv == 0 else { return TB_ERR_TCGETATTR; }
@@ -595,6 +602,8 @@ fn tb_init_rwfd(rfd: i32, wfd: i32) -> i32 {
 
     g.input_mode = TB_INPUT_ESC;
     g.output_mode = TB_OUTPUT_NORMAL;
+    g.inbuf_pos = 0;
+    g.inbuf_len = 0;
     g.outbuf_len = 0;
     g.initialized = 1;
 
@@ -609,7 +618,7 @@ fn tb_shutdown() -> i32 {
         let _ = tb_adapter_tcsetattr(g.rfd, 0, g.orig_tios);
     }
 
-    if g.ttyfd_open != 0 {
+    if g.ttyfd_open != 0 && g.fd_owned != 0 {
         let _ = tb_adapter_close(g.ttyfd);
     }
     let _ = tb_adapter_close(g.resize_pipefd[0]);
@@ -617,6 +626,7 @@ fn tb_shutdown() -> i32 {
 
     g.initialized = 0;
     g.has_orig_tios = 0;
+    g.fd_owned = 0;
     return TB_OK;
 }
 
@@ -903,31 +913,92 @@ fn try_match_escape_buf(buf: const u8[:], event: tb_event&) -> i32 {
     return 1;
 }
 
+fn inbuf_consume(n: i64) {
+    let g = gbl();
+    guard n > 0 && n <= g.inbuf_len else { return; }
+    g.inbuf_pos = g.inbuf_pos + n;
+    g.inbuf_len = g.inbuf_len - n;
+    // Compact when position gets too large
+    if g.inbuf_pos > 32 {
+        var i: i64 = 0;
+        while i < g.inbuf_len {
+            let idx = i as i32;
+            let src = (g.inbuf_pos + i) as i32;
+            g.inbuf[idx] = g.inbuf[src];
+            i = i + 1;
+        }
+        g.inbuf_pos = 0;
+    }
+}
+
 fn tb_peek_event(event: tb_event&, timeout_ms: i32) -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
 
-    // First, try to parse any bytes already in inbuf
-    if g.inbuf.len > 0 {
-        let consumed = try_match_escape_buf(g.inbuf, event);
-        if consumed > 0 {
-            return TB_OK;
+    // Helper: copy valid inbuf bytes to a local buffer for matching
+    fn inbuf_copy_to(mbuf: u8[64]&) -> i64 {
+        let g = gbl();
+        var i: i64 = 0;
+        while i < g.inbuf_len && i < 64 {
+            let src = (g.inbuf_pos + i) as i32;
+            let idx = i as i32;
+            mbuf[idx] = g.inbuf[src];
+            i = i + 1;
         }
-        // Regular character from inbuf
-        event.kind = TB_EVENT_KEY;
-        event.mod = 0;
-        event.key = 0;
-        event.ch = g.inbuf[0];
-        return TB_OK;
+        return i;
     }
 
-    // Poll the TTY for available data
-    let poll_rv = tb_adapter_poll(g.rfd, timeout_ms);
+    // Phase 1: Try to parse bytes already in inbuf
+    if g.inbuf_len > 0 {
+        let mbuf: u8[64] = [0; 64];
+        let mlen = inbuf_copy_to(mbuf);
+        let consumed = try_match_escape_buf(mbuf[0..mlen], event);
+        if consumed > 0 {
+            inbuf_consume(consumed);
+            return TB_OK;
+        }
+        if consumed == 0 {
+            // Regular single byte (not ESC)
+            event.kind = TB_EVENT_KEY;
+            event.mod = 0;
+            event.key = 0;
+            event.ch = g.inbuf[g.inbuf_pos as i32];
+            inbuf_consume(1);
+            return TB_OK;
+        }
+        // consumed == TB_ERR_NEED_MORE: need more data, fall through to read
+    }
+
+    // Phase 2: Poll for data on both TTY and resize pipe
+    let poll_rv = tb_adapter_poll_multi(g.rfd, g.resize_pipefd[0], timeout_ms);
     if poll_rv <= 0 {
         return TB_ERR_NO_EVENT;
     }
 
-    // Read available bytes from TTY into a local buffer
+    // Check resize pipe first
+    if tb_adapter_poll_revents(1) != 0 {
+        // Drain the resize pipe
+        let rb: u8[1];
+        tb_adapter_read(g.resize_pipefd[0], rb[0], 1);
+        // Re-read terminal size
+        let rv = tb_adapter_ioctl_winsize(g.rfd, TIOCGWINSZ, g.winsize);
+        if rv == 0 {
+            let new_h = g.winsize[0] | (g.winsize[1] << 8);
+            let new_w = g.winsize[2] | (g.winsize[3] << 8);
+            if new_w != g.width || new_h != g.height {
+                g.width = new_w;
+                g.height = new_h;
+                let _ = grow_cells(g.back, g.width, g.height);
+                let _ = grow_cells(g.front, g.width, g.height);
+            }
+        }
+        event.kind = TB_EVENT_RESIZE;
+        event.w = g.width;
+        event.h = g.height;
+        return TB_OK;
+    }
+
+    // Phase 3: Read available bytes from TTY
     let readbuf: u8[64];
     var i = 0;
     for i in 64 { readbuf[i] = 0; }
@@ -936,20 +1007,31 @@ fn tb_peek_event(event: tb_event&, timeout_ms: i32) -> i32 {
         return TB_ERR_NO_EVENT;
     }
 
-    // Process the bytes we read
-    let consumed = try_match_escape_buf(readbuf[0..nread], event);
-    if consumed == TB_ERR_NEED_MORE {
-        // Incomplete escape sequence: drop it (no buffering yet)
-        return TB_ERR_NO_EVENT;
+    // Append new bytes to inbuf
+    var j = 0;
+    while j < nread {
+        g.inbuf.push(readbuf[j]);
+        j = j + 1;
     }
+    g.inbuf_len = g.inbuf_len + nread;
+
+    // Try to match the combined buffer
+    let mbuf: u8[64] = [0; 64];
+    let mlen = inbuf_copy_to(mbuf);
+    let consumed = try_match_escape_buf(mbuf[0..mlen], event);
     if consumed > 0 {
+        inbuf_consume(consumed);
         return TB_OK;
     }
-    // Regular character
+    if consumed == TB_ERR_NEED_MORE {
+        return TB_ERR_NO_EVENT;  // inbuf retains all bytes for next call
+    }
+    // consumed == 0: regular char
     event.kind = TB_EVENT_KEY;
     event.mod = 0;
     event.key = 0;
-    event.ch = readbuf[0];
+    event.ch = g.inbuf[g.inbuf_pos as i32];
+    inbuf_consume(1);
     return TB_OK;
 }
 
@@ -960,7 +1042,7 @@ fn tb_poll_event(event: tb_event&) -> i32 {
 fn tb_get_fds(ttyfd: i32&, resizefd: i32&) -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
-    ttyfd = g.ttyfd;
+    ttyfd = g.rfd;
     resizefd = g.resize_pipefd[0];
     return TB_OK;
 }
@@ -1037,14 +1119,39 @@ fn outbuf_nputs(buf: const u8[:], n: i64) -> i32 {
     return TB_OK;
 }
 
-// outbuf_flush — write the whole frame to the TTY in one syscall.
+// outbuf_flush — write the whole frame to the TTY, handling partial writes.
 fn outbuf_flush(fd: i32) -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
-    if g.outbuf_len > 0 {
-        let _ = tb_adapter_write(fd, g.outbuf[0], g.outbuf_len as u64);
-        g.outbuf_len = 0;
+    if g.outbuf_len <= 0 { return TB_OK; }
+
+    var written: i64 = 0;
+    while written < g.outbuf_len {
+        let off = written as i32;
+        let n = tb_adapter_write(fd, g.outbuf[off], (g.outbuf_len - written) as u64);
+        if n > 0 {
+            written = written + n;
+        } else {
+            let err = tb_adapter_errno();
+            // EINTR=4: interrupted, retry
+            if err == 4 { continue; }
+            // EAGAIN=11: non-blocking would block, keep remaining bytes
+            if err == 11 { break; }
+            return TB_ERR_READ;
+        }
     }
+
+    if written > 0 {
+        // Shift any remaining bytes to the front of the buffer
+        var i: i64 = 0;
+        while i < (g.outbuf_len - written) {
+            let src = (written + i) as i32;
+            let dst = i as i32;
+            g.outbuf[dst] = g.outbuf[src];
+            i = i + 1;
+        }
+    }
+    g.outbuf_len = g.outbuf_len - written;
     return TB_OK;
 }
 
