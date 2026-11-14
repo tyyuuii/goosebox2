@@ -606,6 +606,7 @@ fn tb_init_rwfd(rfd: i32, wfd: i32) -> i32 {
     g.resize_pipefd[1] = pipefd[1];
 
     let rv4 = tb_adapter_ioctl_winsize(rfd, TIOCGWINSZ, g.winsize);
+    print("DEBUG init: ioctl rv=", rv4);
     guard rv4 == 0 else { return TB_ERR_RESIZE_IOCTL; }
     g.height = g.winsize[0] | (g.winsize[1] << 8);
     g.width = g.winsize[2] | (g.winsize[3] << 8);
@@ -661,6 +662,7 @@ fn tb_init_rwfd(rfd: i32, wfd: i32) -> i32 {
 
 fn tb_shutdown() -> i32 {
     let g = gbl();
+    print("DEBUG shutdown: called, initialized=", g.initialized);
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
 
     if g.has_orig_tios != 0 {
@@ -1006,6 +1008,14 @@ fn inbuf_consume(n: i64) {
 fn tb_peek_event(event: tb_event&, timeout_ms: i32) -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
+
+    // DEBUG
+    if g.rfd < 0 || g.resize_pipefd[0] < 0 {
+        print("DEBUG peek: bad fd rfd=", g.rfd, " pipe=", g.resize_pipefd[0]);
+    }
+    if g.initialized == 0 {
+        print("DEBUG peek: initialized=0 but guard passed?!");
+    }
 
     // Helper: copy valid inbuf bytes to a local buffer for matching
     fn inbuf_copy_to(mbuf: u8[64]&) -> i64 {
