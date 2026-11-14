@@ -15,3 +15,7 @@ termbox2_lib
 *.swp
 *~
 sudoku
+
+# Internal development notes (not published)
+development.md
+agents.md

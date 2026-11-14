@@ -489,11 +489,27 @@ fn tb_set_cell_ex(x: i32, y: i32, ch: const u32&, nch: i64, fg: uintattr_t, bg: 
     g.back.cells[idx].ch = ch;
     g.back.cells[idx].fg = fg;
     g.back.cells[idx].bg = bg;
+    // nch not used: Goose cells hold a single codepoint.
+    // Callers needing wide chars should set cell at x and x+1 manually.
     return TB_OK;
 }
 
 fn tb_extend_cell(x: i32, y: i32, ch: u32) -> i32 {
-    return tb_set_cell(x, y, ch, TB_DEFAULT, TB_DEFAULT);
+    let g = gbl();
+    guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
+    guard x >= 0 && x < g.width && y >= 0 && y < g.height else {
+        return TB_ERR_OUT_OF_BOUNDS;
+    }
+    if TB_OPT_EGC == 0 {
+        return TB_ERR;
+    }
+    let idx = y * g.width + x;
+    // EGC extension: append ch to existing cell's combining sequence.
+    // Goose cells hold one codepoint; store extension in bg as a marker.
+    let existing = g.back.cells[idx].ch;
+    g.back.cells[idx].ch = existing;
+    g.back.cells[idx].bg = g.back.cells[idx].bg | ((ch & 0xffff) as uintattr_t << 32);
+    return TB_OK;
 }
 
 fn tb_get_cell(x: i32, y: i32, back: i32, cell: tb_cell&) -> i32 {
@@ -749,7 +765,7 @@ fn find_builtin_term(name: const u8[:]) -> i32 {
 }
 
 fn tb_has_truecolor() -> i32 {
-    return 1;
+    return if gbl().output_mode == TB_OUTPUT_TRUECOLOR { 1 } else { 0 };
 }
 
 fn tb_has_egc() -> i32 {
@@ -769,7 +785,29 @@ fn tb_last_errno() -> i32 {
 }
 
 fn tb_strerror(err: i32) -> const u8[:] {
-    return "termbox2 error";
+    if err == TB_ERR { return "termbox2 error"; }
+    if err == TB_ERR_NEED_MORE { return "termbox2 needs more data"; }
+    if err == TB_ERR_INIT_ALREADY { return "termbox2 already initialized"; }
+    if err == TB_ERR_INIT_OPEN { return "termbox2 cannot open terminal"; }
+    if err == TB_ERR_MEM { return "termbox2 out of memory"; }
+    if err == TB_ERR_NO_EVENT { return "termbox2 no event"; }
+    if err == TB_ERR_NO_TERM { return "termbox2 no terminal"; }
+    if err == TB_ERR_NOT_INIT { return "termbox2 not initialized"; }
+    if err == TB_ERR_OUT_OF_BOUNDS { return "termbox2 out of bounds"; }
+    if err == TB_ERR_READ { return "termbox2 read error"; }
+    if err == TB_ERR_RESIZE_IOCTL { return "termbox2 resize ioctl error"; }
+    if err == TB_ERR_RESIZE_PIPE { return "termbox2 resize pipe error"; }
+    if err == TB_ERR_RESIZE_SIGACTION { return "termbox2 resize sigaction error"; }
+    if err == TB_ERR_POLL { return "termbox2 poll error"; }
+    if err == TB_ERR_TCGETATTR { return "termbox2 tcgetattr error"; }
+    if err == TB_ERR_TCSETATTR { return "termbox2 tcsetattr error"; }
+    if err == TB_ERR_UNSUPPORTED_TERM { return "termbox2 unsupported terminal"; }
+    if err == TB_ERR_RESIZE_WRITE { return "termbox2 resize write error"; }
+    if err == TB_ERR_RESIZE_POLL { return "termbox2 resize poll error"; }
+    if err == TB_ERR_RESIZE_READ { return "termbox2 resize read error"; }
+    if err == TB_ERR_RESIZE_SSCANF { return "termbox2 resize sscanf error"; }
+    if err == TB_ERR_CAP_COLLISION { return "termbox2 capability collision"; }
+    return "termbox2 unknown error";
 }
 
 // ===========================================================================
@@ -1051,6 +1089,9 @@ fn tb_set_input_mode(mode: i32) -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
     if mode == TB_INPUT_CURRENT { return g.input_mode; }
+    guard mode == TB_INPUT_ESC || mode == TB_INPUT_ALT || mode == TB_INPUT_MOUSE || mode == 0 else {
+        return TB_ERR;
+    }
     g.input_mode = mode;
     return TB_OK;
 }
@@ -1059,11 +1100,27 @@ fn tb_set_output_mode(mode: i32) -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
     if mode == TB_OUTPUT_CURRENT { return g.output_mode; }
+    guard mode == TB_OUTPUT_NORMAL || mode == TB_OUTPUT_256 || mode == TB_OUTPUT_216 || mode == TB_OUTPUT_GRAYSCALE || mode == TB_OUTPUT_TRUECOLOR else {
+        return TB_ERR;
+    }
     g.output_mode = mode;
     return TB_OK;
 }
 
 fn tb_invalidate() -> i32 {
+    let g = gbl();
+    guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
+    // Mark front buffer as empty so next tb_present() redraws everything.
+    var y = 0;
+    for y in g.front.height {
+        var x = 0;
+        for x in g.front.width {
+            let idx = y * g.front.width + x;
+            g.front.cells[idx].ch = 0xffffffff;
+            g.front.cells[idx].fg = 0xffffffffffffffff;
+            g.front.cells[idx].bg = 0xffffffffffffffff;
+        }
+    }
     return TB_OK;
 }
 
@@ -1076,6 +1133,9 @@ fn tb_set_cursor(cx: i32, cy: i32) -> i32 {
 }
 
 fn tb_hide_cursor() -> i32 {
+    let g = gbl();
+    guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
+    let _ = outbuf_puts("\x1b[?25l");
     return TB_OK;
 }
 
@@ -1427,6 +1487,8 @@ fn tb_send(buf: const u8[:], nbuf: i64) -> i32 {
 }
 
 // tb_sendf — append a format string to the output buffer.
+// Goose has no variadic functions, so the format string is sent literally.
+// C-side varargs (vsnprintf) would require a Goose-side adapter; not implemented.
 fn tb_sendf(fmt: const u8[:]) -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
@@ -1434,14 +1496,17 @@ fn tb_sendf(fmt: const u8[:]) -> i32 {
 }
 
 // tb_printf — print formatted string at position.
+// Goose has no variadic functions, so the format string is sent literally.
 fn tb_printf(x: i32, y: i32, fg: uintattr_t, bg: uintattr_t, fmt: const u8[:]) -> i32 {
     return tb_print_ex(x, y, fg, bg, fmt);
 }
 
 // tb_printf_ex — print formatted string at position with width output.
+// out_w is not populated because Goose has no variadic formatting.
 fn tb_printf_ex(x: i32, y: i32, fg: uintattr_t, bg: uintattr_t, out_w: u64&, fmt: const u8[:]) -> i32 {
     let rv = tb_print_ex(x, y, fg, bg, fmt);
     if rv != TB_OK { return rv; }
+    out_w = 0;
     return TB_OK;
 }
 
