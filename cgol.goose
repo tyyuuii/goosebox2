@@ -512,8 +512,8 @@ fn cgol_handle_key(ev: tb_event&) -> i32 {
     if ev.ch == 'a' { cgol_place_pattern("acorn", world.cx, world.cy); return 1; }
     if ev.ch == 'd' { cgol_place_pattern("diehard", world.cx, world.cy); return 1; }
     if ev.ch == 'l' { cgol_place_pattern("lwss", world.cx, world.cy); return 1; }
-    // Speed control
-    if ev.ch == '+' || ev.ch == '=' { if world.speed_ms > 0 { world.speed_ms = world.speed_ms - 10; } return 1; }
+    // Speed control (33ms = ~30 FPS minimum)
+    if ev.ch == '+' || ev.ch == '=' { if world.speed_ms > 33 { world.speed_ms = world.speed_ms - 10; } else if world.speed_ms > 0 { world.speed_ms = 33; } return 1; }
     if ev.ch == '-' { world.speed_ms = world.speed_ms + 10; return 1; }
     if ev.ch == '0' { world.speed_ms = 0; return 1; }
 
