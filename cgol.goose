@@ -6,7 +6,7 @@
 // Controls:
 //   HJKL / WASD / Arrow keys   move cursor
 //   X / Space / Left click     toggle cell at cursor
-//   ENTER / R                  toggle auto-run
+//   ENTER / R                  force run
 //   S / SPACE                  single step (when paused)
 //   C                          clear grid
 //   Z                          randomize (~50% alive)
@@ -14,10 +14,11 @@
 //   B                          place Block at cursor
 //   b                          place Blinker at cursor
 //   T                          place Toad at cursor
-//   P                          place R-pentomino at cursor
+//   O                          place R-pentomino at cursor
 //   A                          place Acorn at cursor
 //   D                          place Diehard at cursor
 //   L                          place Lightweight Spaceship (LWSS) at cursor
+//   P                          toggle pause/run
 //   Q / ESC                    quit
 
 import termbox2;
@@ -44,7 +45,13 @@ root struct cgol_world {
     running: i32,      // auto-run on/off
     cx: i32,           // cursor x
     cy: i32,           // cursor y
-    speed_ms: i32,     // animation speed (peek timeout)
+    speed_ms: i32,     // animation speed (simulation interval)
+    // Performance tracking
+    frame_count: i64,
+    last_fps_update: i64,
+    current_fps: i32,
+    frame_time_ms: i32,
+    skip_frame: i32,
 }
 
 var world: cgol_world;
@@ -186,6 +193,11 @@ fn cgol_init() -> i32 {
     world.cx = world.width / 2;
     world.cy = world.height / 2;
     world.speed_ms = 0;  // 0 = max FPS (no throttle)
+    world.frame_count = 0;
+    world.last_fps_update = tb_adapter_now_ms();
+    world.current_fps = 0;
+    world.frame_time_ms = 0;
+    world.skip_frame = 0;
 
     let _ = tb_hide_cursor();
     return TB_OK;
@@ -462,6 +474,54 @@ fn cgol_draw() {
         if world.running == 0 {
             let _ = tb_print(60, status_y - 1, TB_RED | TB_BOLD, TB_DEFAULT, "  [PAUSED]");
         }
+        // FPS
+        if world.current_fps > 0 {
+            let fps_str: u8[16];
+            var fps_len: i32 = 0;
+            var fv = world.current_fps;
+            if fv == 0 {
+                fps_str[0] = 0x30;
+                fps_len = 1;
+            } else {
+                while fv > 0 {
+                    fps_str[fps_len] = (0x30 + (fv % 10)) as u8;
+                    fv = fv / 10;
+                    fps_len = fps_len + 1;
+                }
+                var i: i32 = 0;
+                for i in fps_len / 2 {
+                    let tmp = fps_str[i];
+                    fps_str[i] = fps_str[fps_len - 1 - i];
+                    fps_str[fps_len - 1 - i] = tmp;
+                }
+            }
+            let _ = tb_print(60, status_y, TB_CYAN, TB_DEFAULT, "  FPS: ");
+            let _ = tb_print(67, status_y, TB_WHITE, TB_DEFAULT, fps_str[0..fps_len]);
+        }
+        // Frame time
+        if world.frame_time_ms > 0 {
+            let ft_str: u8[16];
+            var ft_len: i32 = 0;
+            var ft = world.frame_time_ms;
+            while ft > 0 {
+                ft_str[ft_len] = (0x30 + (ft % 10)) as u8;
+                ft = ft / 10;
+                ft_len = ft_len + 1;
+            }
+            var i: i32 = 0;
+            for i in ft_len / 2 {
+                let tmp = ft_str[i];
+                ft_str[i] = ft_str[ft_len - 1 - i];
+                ft_str[ft_len - 1 - i] = tmp;
+            }
+            let _ = tb_print(80, status_y, TB_CYAN, TB_DEFAULT, "  FT: ");
+            let _ = tb_print(85, status_y, TB_WHITE, TB_DEFAULT, ft_str[0..ft_len]);
+            let _ = tb_print(85 + ft_len, status_y, TB_WHITE, TB_DEFAULT, "ms");
+        }
+        // Skip indicator
+        if world.skip_frame != 0 {
+            let _ = tb_print(100, status_y, TB_RED | TB_BOLD, TB_DEFAULT, "  [SKIP]");
+        }
     }
 
     let _ = tb_present();
@@ -482,8 +542,6 @@ fn cgol_handle_key(ev: tb_event&) -> i32 {
         cgol_toggle(world.cx, world.cy);
         return 1;
     }
-
-    // (removed duplicate toggle handler - see below)
 
     // Single step
     if ev.ch == 's' || ev.ch == 'S' || ev.key == TB_KEY_SPACE {
@@ -542,7 +600,7 @@ fn cgol_handle_key(ev: tb_event&) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// Main loop: non-blocking input poll + fixed timestep + frame pacing
+// Main loop: non-blocking input poll + fixed timestep + adaptive frame pacing
 // ---------------------------------------------------------------------------
 
 extern fn tb_adapter_now_ms() -> i64 = "tb_adapter_now_ms";
@@ -563,15 +621,31 @@ fn main() {
     cgol_draw();
     var last_sim_ms: i64 = tb_adapter_now_ms();
     const TARGET_FRAME_MS: i32 = 16;  // ~60 FPS
+    const MAX_FRAME_MS: i32 = 33;    // ~30 FPS minimum
 
     loop {
         let frame_start = tb_adapter_now_ms();
 
-        // Drain ALL pending input (non-blocking)
+        // Process events with adaptive timeout (frame pacing + instant input)
         loop {
+            let now = tb_adapter_now_ms();
+            let elapsed = (now - frame_start) as i32;
+            let remaining = TARGET_FRAME_MS - elapsed;
+            let timeout = if remaining > 0 { remaining } else { 0 };
+
             var ev = tb_event { .. };
-            let rv2 = tb_peek_event(ev, 0);
-            if rv2 != TB_OK { break; }
+            let rv2 = tb_peek_event(ev, timeout);
+            if rv2 != TB_OK {
+                if rv2 == TB_ERR_NO_EVENT {
+                    // Frame budget exhausted - break to sim/draw
+                    break;
+                }
+                // Error
+                print("peek_event error: ", rv2, "\n");
+                return;
+            }
+
+            // Event received - process IMMEDIATELY
             if ev.kind == TB_EVENT_KEY {
                 let should_continue = cgol_handle_key(ev);
                 if should_continue == 0 { return; } // quit
@@ -591,9 +665,10 @@ fn main() {
                     world.cy = clamp_y(world.cy);
                 }
             }
+            // Continue inner loop to check for more events with updated timeout
         }
 
-        // Fixed-timestep simulation advance
+        // Frame budget used up - do simulation step
         if world.running != 0 && world.speed_ms > 0 {
             let now = tb_adapter_now_ms();
             if now - last_sim_ms >= world.speed_ms {
@@ -605,14 +680,29 @@ fn main() {
             cgol_step();
         }
 
-        cgol_draw();
+        // Render (skip if frame already too slow)
+        world.skip_frame = 0;
+        if world.frame_time_ms <= MAX_FRAME_MS {
+            cgol_draw();
+        } else {
+            world.skip_frame = 1;
+        }
 
-        // Frame pacing: sleep for remaining frame time
+        // Frame pacing & FPS tracking
         let frame_end = tb_adapter_now_ms();
         let elapsed = (frame_end - frame_start) as i32;
-        let remaining = TARGET_FRAME_MS - elapsed;
-        if remaining > 0 {
-            tb_adapter_sleep_ms(remaining);
+        world.frame_time_ms = elapsed;
+        world.frame_count = world.frame_count + 1;
+
+        // Update FPS every 500ms
+        let now = tb_adapter_now_ms();
+        if now - world.last_fps_update >= 500 {
+            let dt = now - world.last_fps_update;
+            if dt > 0 {
+                world.current_fps = ((world.frame_count * 1000) / dt) as i32;
+            }
+            world.frame_count = 0;
+            world.last_fps_update = now;
         }
     }
 
