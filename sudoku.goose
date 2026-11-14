@@ -246,37 +246,70 @@ fn generate_puzzle(src: i32[81]&, clues: i32, seed: i32) -> i32 {
     // Start from a solved board
     var solved: i32[81] = src;
 
-    // Build a removal order (shuffled)
+    // Build a removal order (shuffled) with xorshift PRNG for better distribution
     var order: i32[81];
     var j = 0;
     for j in 81 { order[j] = j as i32; }
-    // Simple Fisher-Yates shuffle using game-instance-seeded PRNG
-    var prng_seed: i32 = seed;
+    var prng_state: u64 = seed as u64;
     var k = 80;
     while k > 0 {
-        var sv: i64 = prng_seed;
-        sv = (sv * 1103515245 + 12345) % 2147483648;
-        prng_seed = sv as i32;
-        let r = (prng_seed / 65536) % (k + 1);
+        // xorshift64* - better distribution than LCG
+        prng_state ^= prng_state >> 12;
+        prng_state ^= prng_state << 25;
+        prng_state ^= prng_state >> 27;
+        let r = (prng_state * 0x2545F4914F6CDD1D) % (k + 1) as u64;
         let tmp = order[k];
         order[k] = order[r as i32];
         order[r as i32] = tmp;
         k = k - 1;
     }
 
-    // Try to remove cells
+    // Try to remove cells with 180-degree rotational symmetry
     var removed: i32 = 0;
     var target_removed = 81 - clues;
     var idx2 = 0;
     while removed < target_removed && idx2 < 81 {
         let pos = order[idx2];
+        let sym_pos = 80 - pos;  // 180-degree rotational symmetry
         if solved[pos] != 0 {
             if can_remove(solved, pos) != 0 {
                 solved[pos] = 0;
                 removed = removed + 1;
+                // Also remove symmetric counterpart if different and removable
+                if sym_pos != pos && solved[sym_pos] != 0 {
+                    if can_remove(solved, sym_pos) != 0 {
+                        solved[sym_pos] = 0;
+                        removed = removed + 1;
+                    }
+                }
             }
         }
         idx2 = idx2 + 1;
+    }
+
+    // Phase 2: Enforce minimality - try to remove any remaining redundant clues
+    // (go through all positions again, not just shuffled order)
+    var pass = 0;
+    while pass < 2 {
+        var pos2 = 0;
+        while pos2 < 81 {
+            if solved[pos2] != 0 {
+                if can_remove(solved, pos2 as i32) != 0 {
+                    solved[pos2] = 0;
+                    removed = removed + 1;
+                    // Also remove symmetric counterpart
+                    let sym_pos2 = 80 - pos2;
+                    if sym_pos2 != pos2 && solved[sym_pos2] != 0 {
+                        if can_remove(solved, sym_pos2 as i32) != 0 {
+                            solved[sym_pos2] = 0;
+                            removed = removed + 1;
+                        }
+                    }
+                }
+            }
+            pos2 = pos2 + 1;
+        }
+        pass = pass + 1;
     }
 
     // Copy result back to src
