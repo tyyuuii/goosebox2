@@ -227,6 +227,43 @@ recursive fn solve_puzzle(g: i32[81]&, pos: i32) -> i32 {
     return 0;
 }
 
+// Seeded version: uses PRNG to shuffle digit try order at each step
+recursive fn solve_puzzle_seeded(g: i32[81]&, pos: i32, prng_state: u64&) -> i32 {
+    if pos >= 81 { return 1; }
+    if g[pos] != 0 { return solve_puzzle_seeded(g, pos + 1, prng_state); }
+    let x = pos % 9;
+    let y = pos / 9;
+    // Create shuffled digit order 1-9
+    var digits: i32[9];
+    var d = 0;
+    for d in 9 { digits[d] = (d + 1) as i32; }
+    var k = 8;
+    while k > 0 {
+        let r = (prng_next(prng_state) % (k + 1) as u64) as i32;
+        let tmp = digits[k];
+        digits[k] = digits[r];
+        digits[r] = tmp;
+        k = k - 1;
+    }
+    var v_idx = 0;
+    for v_idx in 9 {
+        let v = digits[v_idx];
+        if can_place(g, x, y, v) != 0 {
+            g[pos] = v;
+            if solve_puzzle_seeded(g, pos + 1, prng_state) != 0 { return 1; }
+            g[pos] = 0;
+        }
+    }
+    return 0;
+}
+
+fn prng_next(state: u64&) -> u32 {
+    state ^= state >> 12;
+    state ^= state << 25;
+    state ^= state >> 27;
+    return (state * 0x2545F4914F6CDD1D) as u32;
+}
+
 // Count solutions up to a limit (used for uniqueness checking).
 recursive fn count_solutions(g: i32[81]&, pos: i32, limit: i32) -> i32 {
     if pos >= 81 { return 1; }
@@ -252,36 +289,48 @@ fn generate_solved_board(g: i32[81]&, seed: i32) -> i32 {
     // Clear the board
     var i = 0;
     for i in 81 { g[i] = 0; }
-    // Fill diagonal 3x3 boxes first (they are independent, so this is fast)
+    // Initialize xorshift PRNG state from seed
+    var prng_state: u64 = seed as u64;
+
+    fn prng_next(state: u64&) -> u32 {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        return (state * 0x2545F4914F6CDD1D) as u32;
+    }
+
+    // Fill diagonal 3x3 boxes first with shuffled digits per box
     var bx = 0;
     for bx in 3 {
         var by = 0;
         for by in 3 {
-            // Fill this 3x3 box with digits 1-9 in random-ish order
-            var used: u16 = 0;
+            // Create a shuffled list of digits 1-9 for this box
+            var digits: i32[9];
+            var d = 0;
+            for d in 9 { digits[d] = (d + 1) as i32; }
+            // Fisher-Yates shuffle using PRNG
+            var k = 8;
+            while k > 0 {
+                let r = (prng_next(prng_state) % (k + 1) as u64) as i32;
+                let tmp = digits[k];
+                digits[k] = digits[r];
+                digits[r] = tmp;
+                k = k - 1;
+            }
+            // Fill box with shuffled digits
+            var idx = 0;
             var dy = 0;
             for dy in 3 {
                 var dx = 0;
                 for dx in 3 {
-                    // Pick a digit not yet used in this box
-                    var tries = 0;
-                    while tries < 9 {
-                        // Pseudo-random digit 1-9, seeded by game instance
-                        let d = ((tries * 7 + bx * 3 + by * 11 + dx * 13 + dy * 17 + seed * 23) % 9) + 1;
-                        let bit: u16 = (1 as u64 << d) as u16;
-                        if used & bit == 0 {
-                            used = used | bit;
-                            g[(by * 3 + dy) * 9 + (bx * 3 + dx)] = d as i32;
-                            break;
-                        }
-                        tries = tries + 1;
-                    }
+                    g[(by * 3 + dy) * 9 + (bx * 3 + dx)] = digits[idx];
+                    idx = idx + 1;
                 }
             }
         }
     }
-    // Solve the rest
-    let ok = solve_puzzle(g, 0);
+    // Solve the rest - use seeded solve order
+    let ok = solve_puzzle_seeded(g, 0, prng_state);
     return ok;
 }
 
