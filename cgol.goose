@@ -568,13 +568,15 @@ fn main() {
     var last_sim_ms: i64 = tb_adapter_now_ms();
 
     loop {
-        var ev = tb_event { .. };
-        // NON-BLOCKING input poll (0ms) - returns immediately
-        let rv2 = tb_peek_event(ev, 0);
-        if rv2 == TB_OK {
+        // Drain ALL pending events (non-blocking)
+        var rv2: i32 = TB_OK;
+        loop {
+            var ev = tb_event { .. };
+            rv2 = tb_peek_event(ev, 0);
+            if rv2 != TB_OK { break; }
             if ev.kind == TB_EVENT_KEY {
                 let should_continue = cgol_handle_key(ev);
-                if should_continue == 0 { break; }
+                if should_continue == 0 { return; } // quit
             } else if ev.kind == TB_EVENT_RESIZE {
                 cgol_resize();
             } else if ev.kind == TB_EVENT_MOUSE {
@@ -591,7 +593,8 @@ fn main() {
                     world.cy = clamp_y(world.cy);
                 }
             }
-        } else if rv2 != TB_ERR_NO_EVENT {
+        }
+        if rv2 != TB_ERR_NO_EVENT && rv2 != TB_OK {
             print("peek_event error: ", rv2, "\n");
             break;
         }
