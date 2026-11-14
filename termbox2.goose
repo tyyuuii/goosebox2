@@ -1384,6 +1384,12 @@ fn tb_present() -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
 
+    // Frame reset: force attribute state to known default so send_attr
+    // re-emits codes for ALL cells this frame (prevents terminal state drift).
+    let _ = outbuf_puts("\x1b[m");
+    g.last_fg = TB_DEFAULT;
+    g.last_bg = TB_DEFAULT;
+
     g.last_x = -1;
     g.last_y = -1;
 
