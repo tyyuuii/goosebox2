@@ -564,7 +564,7 @@ fn tb_init_file(path: const u8[:]) -> i32 {
     for i in path.len { pathbuf.push(path[i]); }
     pathbuf.push(0);
 
-    let fd = tb_adapter_open_tty(pathbuf[0], O_RDWR);
+    let fd = tb_adapter_open_tty(&pathbuf[0], O_RDWR);
     guard fd >= 0 else { return TB_ERR_INIT_OPEN; }
 
     g.fd_owned = 1;
