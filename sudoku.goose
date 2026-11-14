@@ -351,19 +351,19 @@ fn can_remove(g: i32[81]&, pos: i32) -> i32 {
 }
 
 // Generate a puzzle with approximately `clues` given digits.
-// Removes cells one at a time while maintaining a unique solution.
+// Simple, reliable algorithm: shuffle all positions, try removing each,
+// keep removal only if puzzle still has unique solution.
 fn generate_puzzle(src: i32[81]&, clues: i32, seed: i32) -> i32 {
     // Start from a solved board
     var solved: i32[81] = src;
 
-    // Build a removal order (shuffled) with xorshift PRNG for better distribution
+    // Build a removal order (shuffled) with xorshift PRNG
     var order: i32[81];
     var j = 0;
     for j in 81 { order[j] = j as i32; }
     var prng_state: u64 = seed as u64;
     var k = 80;
     while k > 0 {
-        // xorshift64* - better distribution than LCG
         prng_state ^= prng_state >> 12;
         prng_state ^= prng_state << 25;
         prng_state ^= prng_state >> 27;
@@ -374,72 +374,76 @@ fn generate_puzzle(src: i32[81]&, clues: i32, seed: i32) -> i32 {
         k = k - 1;
     }
 
-    // Try to remove cells with 180-degree rotational symmetry
+    // Try to remove cells one by one in shuffled order
     var removed: i32 = 0;
     var target_removed = 81 - clues;
     var idx2 = 0;
     while removed < target_removed && idx2 < 81 {
         let pos = order[idx2];
-        let sym_pos = 80 - pos;  // 180-degree rotational symmetry
         if solved[pos] != 0 {
-            if can_remove(solved, pos) != 0 {
-                solved[pos] = 0;
-                removed = removed + 1;
-                // Also remove symmetric counterpart if different and removable
-                if sym_pos != pos && solved[sym_pos] != 0 {
-                    if can_remove(solved, sym_pos) != 0 {
-                        solved[sym_pos] = 0;
-                        removed = removed + 1;
-                    }
+            // Try removing this cell
+            let saved = solved[pos];
+            solved[pos] = 0;
+            
+            // Check if puzzle still has unique solution
+            if validate_puzzle(solved) != 0 {
+                let cnt = count_solutions(solved, 0, 2);
+                if cnt == 1 {
+                    // Good removal - keep it removed
+                    removed = removed + 1;
+                } else {
+                    // Not unique - restore
+                    solved[pos] = saved;
                 }
-                // Validate after symmetric pair removal
-                if validate_puzzle(solved) == 0 {
-                    // Rollback this pair
-                    solved[pos] = src[pos];
-                    if sym_pos != pos { solved[sym_pos] = src[sym_pos]; }
-                    removed = removed - 1;
-                    if sym_pos != pos && solved[sym_pos] == 0 { removed = removed - 1; }
-                }
+            } else {
+                // Invalid (duplicates) - restore
+                solved[pos] = saved;
             }
         }
         idx2 = idx2 + 1;
     }
 
-    // Phase 2: Enforce minimality - try to remove any remaining redundant clues
-    // (go through all positions again, not just shuffled order)
-    var pass = 0;
-    while pass < 2 {
-        var pos2 = 0;
-        while pos2 < 81 {
-            if solved[pos2] != 0 {
-                if can_remove(solved, pos2 as i32) != 0 {
-                    solved[pos2] = 0;
-                    removed = removed + 1;
-                    // Also remove symmetric counterpart
-                    let sym_pos2 = 80 - pos2;
-                    if sym_pos2 != pos2 && solved[sym_pos2] != 0 {
-                        if can_remove(solved, sym_pos2 as i32) != 0 {
-                            solved[sym_pos2] = 0;
-                            removed = removed + 1;
-                        }
+    // If we couldn't remove enough, try a second pass (different order)
+    if removed < target_removed {
+        // Re-shuffle and try again
+        k = 80;
+        while k > 0 {
+            prng_state ^= prng_state >> 12;
+            prng_state ^= prng_state << 25;
+            prng_state ^= prng_state >> 27;
+            let r = (prng_state * 0x2545F4914F6CDD1D) % (k + 1) as u64;
+            let tmp = order[k];
+            order[k] = order[r as i32];
+            order[r as i32] = tmp;
+            k = k - 1;
+        }
+        idx2 = 0;
+        while removed < target_removed && idx2 < 81 {
+            let pos = order[idx2];
+            if solved[pos] != 0 {
+                let saved = solved[pos];
+                solved[pos] = 0;
+                if validate_puzzle(solved) != 0 {
+                    let cnt = count_solutions(solved, 0, 2);
+                    if cnt == 1 {
+                        removed = removed + 1;
+                    } else {
+                        solved[pos] = saved;
                     }
-                    // Validate after symmetric pair removal
-                    if validate_puzzle(solved) == 0 {
-                        solved[pos2] = src[pos2];
-                        if sym_pos2 != pos2 { solved[sym_pos2] = src[sym_pos2]; }
-                        removed = removed - 1;
-                        if sym_pos2 != pos2 && solved[sym_pos2] == 0 { removed = removed - 1; }
-                    }
+                } else {
+                    solved[pos] = saved;
                 }
             }
-            pos2 = pos2 + 1;
+            idx2 = idx2 + 1;
         }
-        pass = pass + 1;
     }
 
-    // Final validation - retry with different seed if invalid
+    // Final validation
     if validate_puzzle(solved) == 0 {
-        return -1;  // Signal failure
+        return -1;
+    }
+    if count_solutions(solved, 0, 2) != 1 {
+        return -1;
     }
 
     // Copy result back to src
