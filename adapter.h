@@ -49,4 +49,7 @@ int tb_adapter_resize_notify(int fd);
 /* Put the terminal into raw mode (disable canonical mode, echo, signals). */
 int tb_adapter_set_raw_mode(int fd);
 
+/* Current time in milliseconds (monotonic-ish). */
+long long tb_adapter_now_ms(void);
+
 #endif /* TERMBOX2_ADAPTER_H */

@@ -539,8 +539,10 @@ fn cgol_handle_key(ev: tb_event&) -> i32 {
 }
 
 // ---------------------------------------------------------------------------
-// Main loop
+// Main loop (fixed timestep: poll input at ~60Hz, simulate at speed_ms)
 // ---------------------------------------------------------------------------
+
+extern fn tb_adapter_now_ms() -> i64 = "tb_adapter_now_ms";
 
 fn main() {
     let rv = cgol_init();
@@ -555,10 +557,12 @@ fn main() {
     g.inbuf_pos = 0;
 
     cgol_draw();
+    var last_sim_ms: i64 = tb_adapter_now_ms();
 
     loop {
         var ev = tb_event { .. };
-        let rv2 = tb_peek_event(ev, world.speed_ms);
+        // Poll input with short timeout (16ms ~ 60Hz) for responsive controls
+        let rv2 = tb_peek_event(ev, 16);
         if rv2 == TB_OK {
             if ev.kind == TB_EVENT_KEY {
                 let should_continue = cgol_handle_key(ev);
@@ -573,23 +577,26 @@ fn main() {
                     world.cy = clamp_y(world.cy);
                     cgol_toggle(world.cx, world.cy);
                 } else if ev.mod & TB_MOD_MOTION != 0 {
-                    // Mouse drag: update cursor position
                     world.cx = ev.x;
                     world.cy = ev.y;
                     world.cx = clamp_x(world.cx);
                     world.cy = clamp_y(world.cy);
                 }
             }
-        } else if rv2 == TB_ERR_NO_EVENT {
-            // Timeout — advance if running
-        } else {
-            // Error
+        } else if rv2 != TB_ERR_NO_EVENT {
             print("peek_event error: ", rv2, "\n");
             break;
         }
 
-        // Auto-advance if running and no key consumed the frame
-        if world.running != 0 && rv2 != TB_OK {
+        // Fixed-timestep simulation advance
+        if world.running != 0 && world.speed_ms > 0 {
+            let now = tb_adapter_now_ms();
+            if now - last_sim_ms >= world.speed_ms {
+                cgol_step();
+                last_sim_ms = now;
+            }
+        } else if world.running != 0 && world.speed_ms == 0 {
+            // Unlimited: step every frame
             cgol_step();
         }
 

@@ -143,3 +143,10 @@ int tb_adapter_set_raw_mode(int fd) {
     raw.c_cc[VTIME] = 0;
     return tcsetattr(fd, TCSAFLUSH, &raw);
 }
+
+/* Current time in milliseconds using CLOCK_MONOTONIC. */
+long long tb_adapter_now_ms(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
