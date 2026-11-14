@@ -233,9 +233,13 @@ fn count_neighbors(x: i32, y: i32) -> i32 {
     return n;
 }
 
-fn cgol_step() {
+fn cgol_step(dirty_cells: Point[>..]&) {
     let w = world.width;
     let h = world.height;
+    
+    // Track dirty cells: overwrite from start, track valid count
+    var dirty_count: i32 = 0;
+    
     var y: i32 = 0;
     while y < h {
         var x: i32 = 0;
@@ -244,14 +248,30 @@ fn cgol_step() {
             let alive = world.cur[i];
             let n = count_neighbors(x, y);
             // B3/S23: birth at 3, survive at 2 or 3
-            if alive != 0 {
-                world.nxt[i] = if n == 2 || n == 3 { 1 } else { 0 };
+            let new_alive: u8 = if alive != 0 {
+                if n == 2 || n == 3 { 1 } else { 0 }
             } else {
-                world.nxt[i] = if n == 3 { 1 } else { 0 };
+                if n == 3 { 1 } else { 0 }
+            };
+            world.nxt[i] = new_alive;
+            
+            // Track dirty cells (state changed)
+            if new_alive != alive {
+                if dirty_count < dirty_cells.len {
+                    dirty_cells[dirty_count] = Point { x: x, y: y };
+                } else {
+                    dirty_cells.push(Point { x: x, y: y });
+                }
+                dirty_count = dirty_count + 1;
             }
             x = x + 1;
         }
         y = y + 1;
+    }
+
+    // Truncate dirty_cells to valid count
+    while dirty_cells.len > dirty_count {
+        dirty_cells.pop();
     }
 
     // Copy nxt into cur, zero nxt
@@ -269,13 +289,14 @@ fn cgol_step() {
 // Grid manipulation
 // ---------------------------------------------------------------------------
 
-fn cgol_toggle(x: i32, y: i32) {
+fn cgol_toggle(x: i32, y: i32, dirty_cells: Point[>..]&) {
     if !in_bounds(x, y) { return; }
     let i = idx(x, y);
     world.cur[i] = if world.cur[i] != 0 { 0 } else { 1 };
+    dirty_cells.push(Point { x: x, y: y });
 }
 
-fn cgol_clear() {
+fn cgol_clear(dirty_cells: Point[>..]&) {
     let total = world.width * world.height;
     var i: i32 = 0;
     while i < total {
@@ -284,9 +305,20 @@ fn cgol_clear() {
         i = i + 1;
     }
     world.gen = 0;
+    // Mark all cells as dirty for full redraw
+    dirty_cells.clear();
+    var y: i32 = 0;
+    while y < world.height {
+        var x: i32 = 0;
+        while x < world.width {
+            dirty_cells.push(Point { x: x, y: y });
+            x = x + 1;
+        }
+        y = y + 1;
+    }
 }
 
-fn cgol_randomize() {
+fn cgol_randomize(dirty_cells: Point[>..]&) {
     let total = world.width * world.height;
     var seed: u64 = world.gen as u64 + 0x9E3779B97F4A7C15;
     var i: i32 = 0;
@@ -299,9 +331,20 @@ fn cgol_randomize() {
         world.nxt[i] = 0;
     }
     world.gen = 0;
+    // Mark all cells as dirty for full redraw
+    dirty_cells.clear();
+    var y: i32 = 0;
+    while y < world.height {
+        var x: i32 = 0;
+        while x < world.width {
+            dirty_cells.push(Point { x: x, y: y });
+            x = x + 1;
+        }
+        y = y + 1;
+    }
 }
 
-fn cgol_place_pattern(name: const u8[:], px: i32, py: i32) {
+fn cgol_place_pattern(name: const u8[:], px: i32, py: i32, dirty_cells: Point[>..]&) {
     // Build pattern points
     var pts: Point[>..] = [];
 
@@ -334,6 +377,7 @@ fn cgol_place_pattern(name: const u8[:], px: i32, py: i32) {
         let y = py + dy;
         if in_bounds(x, y) {
             world.cur[idx(x, y)] = 1;
+            dirty_cells.push(Point { x: x, y: y });
         }
     }
 }
@@ -376,6 +420,7 @@ fn cgol_resize() {
     // but logically we only use up to 'total' elements
 
     world.gen = 0;
+    // Note: dirty_cells will be cleared in main loop after resize
 
     let _ = tb_invalidate();
 }
@@ -384,27 +429,29 @@ fn cgol_resize() {
 // Rendering
 // ---------------------------------------------------------------------------
 
-fn cgol_draw() {
+fn cgol_draw(dirty_cells: Point[>..]&) {
     let _ = tb_clear();
 
     let w = world.width;
     let h = world.height;
 
-    // Draw alive cells
-    var y: i32 = 0;
-    while y < h {
-        var x: i32 = 0;
-        while x < w {
+    // Draw only dirty cells (O(changed) instead of O(grid))
+    var j: i32 = 0;
+    for j in dirty_cells.len {
+        let x = dirty_cells[j].x;
+        let y = dirty_cells[j].y;
+        if in_bounds(x, y) {
             let i = idx(x, y);
             if world.cur[i] != 0 {
                 let _ = tb_set_cell(x, y, CH_BLOCK, TB_GREEN | TB_BOLD, TB_DEFAULT);
+            } else {
+                // Cell died - draw space
+                let _ = tb_set_cell(x, y, CH_EMPTY, TB_DEFAULT, TB_DEFAULT);
             }
-            x = x + 1;
         }
-        y = y + 1;
     }
 
-    // Draw cursor
+    // Draw cursor (always, as it moves independently)
     if in_bounds(world.cx, world.cy) {
         let i = idx(world.cx, world.cy);
         let ch = if world.cur[i] != 0 { CH_CURSOR_ALIVE } else { CH_CURSOR };
@@ -531,7 +578,7 @@ fn cgol_draw() {
 // Input handling
 // ---------------------------------------------------------------------------
 
-fn cgol_handle_key(ev: tb_event&) -> i32 {
+fn cgol_handle_key(ev: tb_event&, dirty_cells: Point[>..]&) -> i32 {
     // Quit
     if ev.ch == 'q' || ev.ch == 'Q' || ev.key == TB_KEY_ESC {
         return 0;  // signal quit
@@ -539,37 +586,37 @@ fn cgol_handle_key(ev: tb_event&) -> i32 {
 
     // Toggle cell at cursor
     if ev.ch == 'x' || ev.ch == ' ' || ev.key == TB_KEY_MOUSE_LEFT {
-        cgol_toggle(world.cx, world.cy);
+        cgol_toggle(world.cx, world.cy, dirty_cells);
         return 1;
     }
 
     // Single step
     if ev.ch == 's' || ev.ch == 'S' || ev.key == TB_KEY_SPACE {
-        cgol_step();
+        cgol_step(dirty_cells);
         return 1;
     }
 
     // Clear
     if ev.ch == 'c' || ev.ch == 'C' {
-        cgol_clear();
+        cgol_clear(dirty_cells);
         return 1;
     }
 
     // Randomize
     if ev.ch == 'z' || ev.ch == 'Z' {
-        cgol_randomize();
+        cgol_randomize(dirty_cells);
         return 1;
     }
 
     // Patterns
-    if ev.ch == 'g' { cgol_place_pattern("glider", world.cx, world.cy); return 1; }
-    if ev.ch == 'b' { cgol_place_pattern("blinker", world.cx, world.cy); return 1; }
-    if ev.ch == 'B' { cgol_place_pattern("block", world.cx, world.cy); return 1; }
-    if ev.ch == 't' { cgol_place_pattern("toad", world.cx, world.cy); return 1; }
-    if ev.ch == 'o' { cgol_place_pattern("rpent", world.cx, world.cy); return 1; }
-    if ev.ch == 'a' { cgol_place_pattern("acorn", world.cx, world.cy); return 1; }
-    if ev.ch == 'd' { cgol_place_pattern("diehard", world.cx, world.cy); return 1; }
-    if ev.ch == 'l' { cgol_place_pattern("lwss", world.cx, world.cy); return 1; }
+    if ev.ch == 'g' { cgol_place_pattern("glider", world.cx, world.cy, dirty_cells); return 1; }
+    if ev.ch == 'b' { cgol_place_pattern("blinker", world.cx, world.cy, dirty_cells); return 1; }
+    if ev.ch == 'B' { cgol_place_pattern("block", world.cx, world.cy, dirty_cells); return 1; }
+    if ev.ch == 't' { cgol_place_pattern("toad", world.cx, world.cy, dirty_cells); return 1; }
+    if ev.ch == 'o' { cgol_place_pattern("rpent", world.cx, world.cy, dirty_cells); return 1; }
+    if ev.ch == 'a' { cgol_place_pattern("acorn", world.cx, world.cy, dirty_cells); return 1; }
+    if ev.ch == 'd' { cgol_place_pattern("diehard", world.cx, world.cy, dirty_cells); return 1; }
+    if ev.ch == 'l' { cgol_place_pattern("lwss", world.cx, world.cy, dirty_cells); return 1; }
     // Pause/Run
     if ev.ch == 'p' { world.running = if world.running != 0 { 0 } else { 1 }; return 1; }
     if ev.ch == 'r' || ev.key == TB_KEY_ENTER { world.running = 1; return 1; }
@@ -618,7 +665,10 @@ fn main() {
     g.inbuf_len = 0;
     g.inbuf_pos = 0;
 
-    cgol_draw();
+    // Create local dirty_cells buffer for this session
+    var dirty_cells: Point[>..] = [];
+    
+    cgol_draw(dirty_cells);
     var last_sim_ms: i64 = tb_adapter_now_ms();
     const TARGET_FRAME_MS: i32 = 16;  // ~60 FPS
     const MAX_FRAME_MS: i32 = 33;    // ~30 FPS minimum
@@ -647,7 +697,7 @@ fn main() {
 
             // Event received - process IMMEDIATELY
             if ev.kind == TB_EVENT_KEY {
-                let should_continue = cgol_handle_key(ev);
+                let should_continue = cgol_handle_key(ev, dirty_cells);
                 if should_continue == 0 { return; } // quit
             } else if ev.kind == TB_EVENT_RESIZE {
                 cgol_resize();
@@ -657,7 +707,7 @@ fn main() {
                     world.cy = ev.y;
                     world.cx = clamp_x(world.cx);
                     world.cy = clamp_y(world.cy);
-                    cgol_toggle(world.cx, world.cy);
+                    cgol_toggle(world.cx, world.cy, dirty_cells);
                 } else if ev.mod & TB_MOD_MOTION != 0 {
                     world.cx = ev.x;
                     world.cy = ev.y;
@@ -672,18 +722,17 @@ fn main() {
         if world.running != 0 && world.speed_ms > 0 {
             let now = tb_adapter_now_ms();
             if now - last_sim_ms >= world.speed_ms {
-                cgol_step();
+                cgol_step(dirty_cells);
                 last_sim_ms = now;
             }
         } else if world.running != 0 && world.speed_ms == 0 {
             // Unlimited: step every frame
-            cgol_step();
-        }
+            cgol_step(dirty_cells);
 
         // Render (skip if frame already too slow)
         world.skip_frame = 0;
         if world.frame_time_ms <= MAX_FRAME_MS {
-            cgol_draw();
+            cgol_draw(dirty_cells);
         } else {
             world.skip_frame = 1;
         }
@@ -708,4 +757,5 @@ fn main() {
 
     cgol_shutdown();
     print("thanks for playing\n");
-}
+
+    }}
