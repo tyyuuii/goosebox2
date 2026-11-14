@@ -299,16 +299,22 @@ fn generate_solved_board(g: i32[81]&, seed: i32) -> i32 {
         return (state * 0x2545F4914F6CDD1D) as u32;
     }
 
-    // Fill diagonal 3x3 boxes first with shuffled digits per box
-    var bx = 0;
-    for bx in 3 {
-        var by = 0;
-        for by in 3 {
-            // Create a shuffled list of digits 1-9 for this box
+    // Generate a complete solved Sudoku board using backtracking with PRNG
+    // Simple, reliable approach: fill board cell by cell with backtracking
+    // using PRNG to shuffle digit order at each step.
+    recursive fn solve_full_board(g: i32[81]&, prng_state: u64&) -> i32 {
+        var pos = 0;
+        while pos < 81 {
+            if g[pos] != 0 {
+                pos = pos + 1;
+                continue;
+            }
+            let x = (pos % 9) as i32;
+            let y = (pos / 9) as i32;
+            // Create shuffled digit order 1-9
             var digits: i32[9];
             var d = 0;
             for d in 9 { digits[d] = (d + 1) as i32; }
-            // Fisher-Yates shuffle using PRNG
             var k = 8;
             while k > 0 {
                 let r = (prng_next(prng_state) % (k + 1) as u64) as i32;
@@ -317,20 +323,35 @@ fn generate_solved_board(g: i32[81]&, seed: i32) -> i32 {
                 digits[r] = tmp;
                 k = k - 1;
             }
-            // Fill box with shuffled digits
-            var idx = 0;
-            var dy = 0;
-            for dy in 3 {
-                var dx = 0;
-                for dx in 3 {
-                    g[(by * 3 + dy) * 9 + (bx * 3 + dx)] = digits[idx];
-                    idx = idx + 1;
+            var placed = 0;
+            for v_idx in 9 {
+                let v = digits[v_idx];
+                if can_place(g, x, y, v as i32) != 0 {
+                    g[pos] = v;
+                    if solve_full_board(g, prng_state) != 0 {
+                        placed = 1;
+                        break;
+                    }
+                    g[pos] = 0;
                 }
             }
+            if placed == 0 {
+                return 0;
+            }
+            pos = pos + 1;
         }
+        return 1;
     }
-    // Solve the rest - use seeded solve order
-    let ok = solve_puzzle_seeded(g, 0, prng_state);
+
+    // Generate a complete solved Sudoku board using backtracking with PRNG
+    // Simple, reliable approach: fill board from scratch with backtracking
+    // using PRNG to shuffle digit order at each step.
+    var prng_state: u64 = seed as u64;
+    var ok = solve_full_board(g, prng_state);
+    // Validate the generated board
+    if ok != 0 && validate_puzzle(g) == 0 {
+        ok = 0;
+    }
     return ok;
 }
 
