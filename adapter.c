@@ -107,6 +107,14 @@ const char *tb_adapter_ttyname(int fd) {
     return ttyname(fd);
 }
 
+/* Copy terminal name from ttyname() into Goose buffer. */
+int tb_adapter_get_ttyname(char *buf, size_t bufsz, const char *tty_name_ptr) {
+    if (!buf || !tty_name_ptr || bufsz == 0) return -1;
+    strncpy(buf, tty_name_ptr, bufsz - 1);
+    buf[bufsz - 1] = '\0';
+    return (int)strlen(buf);
+}
+
 /* vsnprintf wrapper for tb_printf / tb_sendf. */
 int tb_adapter_vsnprintf(char *buf, size_t bufsz, const char *fmt, va_list ap) {
     return vsnprintf(buf, bufsz, fmt, ap);

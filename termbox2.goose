@@ -295,6 +295,7 @@ root struct tb_global {
     caps: const u8[:][TB_CAP__COUNT],
     cap_trie: cap_trie_node[>..],
     cap_trie_children: i32[>..],
+    term_index: i32,
     inbuf: u8[>..],
     inbuf_pos: i64,
     inbuf_len: i64,
@@ -336,6 +337,7 @@ extern fn tb_adapter_pipe(pipefd: i32[2]&) -> i32;
 extern fn tb_adapter_isatty(fd: i32) -> i32;
 extern fn tb_adapter_errno() -> i32;
 extern fn tb_adapter_ttyname(fd: i32) -> u64;
+extern fn tb_adapter_get_ttyname(buf: u8&, bufsz: i32, tty_name_ptr: u64) -> i32;
 extern fn tb_adapter_vsnprintf(buf: u8[TB_OPT_PRINTF_BUF]&, bufsz: u64, fmt: const u8&, ap: u64) -> i32;
 extern fn tb_adapter_setup_signwinch(pipe_fd: i32) -> i32;
 extern fn tb_adapter_resize_notify(fd: i32) -> i32;
@@ -608,6 +610,37 @@ fn tb_init_rwfd(rfd: i32, wfd: i32) -> i32 {
     g.height = g.winsize[0] | (g.winsize[1] << 8);
     g.width = g.winsize[2] | (g.winsize[3] << 8);
     guard g.width > 0 && g.height > 0 else { return TB_ERR_RESIZE_IOCTL; }
+
+    // Terminal capability detection
+    let tty_name: u8[64];
+    var i = 0;
+    for i in 64 { tty_name[i] = 0; }
+    let tty_name_ptr = tb_adapter_ttyname(rfd);
+    if tty_name_ptr != 0 {
+        let rv = tb_adapter_get_ttyname(tty_name[0], 64, tty_name_ptr);
+        if rv >= 0 {
+            var len = 0;
+            for len in 64 { if tty_name[len] == 0 { break; } }
+            let term_idx = find_builtin_term(tty_name[0..len]);
+            if term_idx >= 0 {
+                g.term_index = term_idx;
+                let entry = builtin_terms[term_idx];
+                g.caps = entry.caps;
+            } else {
+                g.term_index = 0;
+                g.caps = builtin_terms[0].caps;
+            }
+        } else {
+            g.term_index = 0;
+            g.caps = builtin_terms[0].caps;
+        }
+    } else {
+        g.term_index = 0;
+        g.caps = builtin_terms[0].caps;
+    }
+
+    // Build capability trie
+    let _ = cap_trie_build();
 
     // Initialize back and front cell buffers
     let _ = grow_cells(g.back, g.width, g.height);
@@ -956,12 +989,13 @@ fn inbuf_consume(n: i64) {
     guard n > 0 && n <= g.inbuf_len else { return; }
     g.inbuf_pos = g.inbuf_pos + n;
     g.inbuf_len = g.inbuf_len - n;
-    // Compact when position gets too large
-    if g.inbuf_pos > 32 {
+    // Compact when position gets too large or logical end exceeds physical array
+    if g.inbuf_pos > 32 || (g.inbuf_pos + g.inbuf_len) > g.inbuf.len {
         var i: i64 = 0;
         while i < g.inbuf_len {
             let idx = i as i32;
             let src = (g.inbuf_pos + i) as i32;
+            guard src < g.inbuf.len else { break; }
             g.inbuf[idx] = g.inbuf[src];
             i = i + 1;
         }
@@ -979,6 +1013,7 @@ fn tb_peek_event(event: tb_event&, timeout_ms: i32) -> i32 {
         var i: i64 = 0;
         while i < g.inbuf_len && i < 64 {
             let src = (g.inbuf_pos + i) as i32;
+            guard src < g.inbuf.len else { break; }
             let idx = i as i32;
             mbuf[idx] = g.inbuf[src];
             i = i + 1;
@@ -1045,10 +1080,15 @@ fn tb_peek_event(event: tb_event&, timeout_ms: i32) -> i32 {
         return TB_ERR_NO_EVENT;
     }
 
-    // Append new bytes to inbuf
+    // Append new bytes to inbuf at logical end (not physical push)
     var j = 0;
     while j < nread {
-        g.inbuf.push(readbuf[j]);
+        let pos = (g.inbuf_pos + g.inbuf_len + j) as i32;
+        if pos >= g.inbuf.len {
+            g.inbuf.push(readbuf[j]);
+        } else {
+            g.inbuf[pos] = readbuf[j];
+        }
         j = j + 1;
     }
     g.inbuf_len = g.inbuf_len + nread;
@@ -1100,7 +1140,7 @@ fn tb_set_output_mode(mode: i32) -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
     if mode == TB_OUTPUT_CURRENT { return g.output_mode; }
-    guard mode == TB_OUTPUT_NORMAL || mode == TB_OUTPUT_256 || mode == TB_OUTPUT_216 || mode == TB_OUTPUT_GRAYSCALE || mode == TB_OUTPUT_TRUECOLOR else {
+    guard mode != TB_OUTPUT_NORMAL && mode != TB_OUTPUT_256 && mode != TB_OUTPUT_216 && mode != TB_OUTPUT_GRAYSCALE && mode != TB_OUTPUT_TRUECOLOR else {
         return TB_ERR;
     }
     g.output_mode = mode;

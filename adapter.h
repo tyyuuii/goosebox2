@@ -34,6 +34,9 @@ int tb_adapter_errno(void);
 /* ttyname — returns const char* as a numeric pointer. */
 const char *tb_adapter_ttyname(int fd);
 
+/* Copy terminal name from ttyname() into Goose buffer. */
+int tb_adapter_get_ttyname(char *buf, size_t bufsz, const char *tty_name_ptr);
+
 /* vsnprintf wrapper for tb_printf / tb_sendf. */
 int tb_adapter_vsnprintf(char *buf, size_t bufsz, const char *fmt, va_list ap);
 

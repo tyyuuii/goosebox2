@@ -903,8 +903,8 @@ fn main() {
         if rv2 != TB_OK { continue; }
         if ev.kind != TB_EVENT_KEY { draw_all(); continue; }
 
-        // Quit only on 'q' / 'Q'. ESC is deliberately ignored (see top comment).
-        if ev.ch == 'q' || ev.ch == 'Q' { break; }
+        // Quit on 'q' / 'Q' or ESC (defensive: mis-parsed arrows can flood ESC events).
+        if ev.ch == 'q' || ev.ch == 'Q' || ev.key == TB_KEY_ESC { break; }
 
         if ev.ch == ' ' {
             if show_menu(diff) == 0 { break; }
