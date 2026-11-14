@@ -76,6 +76,7 @@ struct Game {
     history_len: i32,
     redo: Move[MAX_HISTORY],
     redo_len: i32,
+    game_instance: i32,
 }
 
 var game: Game;
@@ -192,7 +193,7 @@ recursive fn count_solutions(g: i32[81]&, pos: i32, limit: i32) -> i32 {
 
 // Generate a complete solved Sudoku board using backtracking with some
 // randomization (shuffle the order we try digits).
-fn generate_solved_board(g: i32[81]&) -> i32 {
+fn generate_solved_board(g: i32[81]&, seed: i32) -> i32 {
     // Clear the board
     var i = 0;
     for i in 81 { g[i] = 0; }
@@ -210,8 +211,8 @@ fn generate_solved_board(g: i32[81]&) -> i32 {
                     // Pick a digit not yet used in this box
                     var tries = 0;
                     while tries < 9 {
-                        // Pseudo-random digit 1-9
-                        let d = ((tries * 7 + bx * 3 + by * 11 + dx * 13 + dy * 17) % 9) + 1;
+                        // Pseudo-random digit 1-9, seeded by game instance
+                        let d = ((tries * 7 + bx * 3 + by * 11 + dx * 13 + dy * 17 + seed * 23) % 9) + 1;
                         let bit: u16 = (1 as u64 << d) as u16;
                         if used & bit == 0 {
                             used = used | bit;
@@ -241,7 +242,7 @@ fn can_remove(g: i32[81]&, pos: i32) -> i32 {
 
 // Generate a puzzle with approximately `clues` given digits.
 // Removes cells one at a time while maintaining a unique solution.
-fn generate_puzzle(src: i32[81]&, clues: i32) -> i32 {
+fn generate_puzzle(src: i32[81]&, clues: i32, seed: i32) -> i32 {
     // Start from a solved board
     var solved: i32[81] = src;
 
@@ -249,14 +250,14 @@ fn generate_puzzle(src: i32[81]&, clues: i32) -> i32 {
     var order: i32[81];
     var j = 0;
     for j in 81 { order[j] = j as i32; }
-    // Simple Fisher-Yates shuffle using a deterministic PRNG
-    var seed: i32 = 12345;
+    // Simple Fisher-Yates shuffle using game-instance-seeded PRNG
+    var prng_seed: i32 = seed;
     var k = 80;
     while k > 0 {
-        var sv: i64 = seed;
+        var sv: i64 = prng_seed;
         sv = (sv * 1103515245 + 12345) % 2147483648;
-        seed = sv as i32;
-        let r = (seed / 65536) % (k + 1);
+        prng_seed = sv as i32;
+        let r = (prng_seed / 65536) % (k + 1);
         let tmp = order[k];
         order[k] = order[r as i32];
         order[r as i32] = tmp;
@@ -768,6 +769,10 @@ fn is_solved() -> i32 {
 }
 
 fn init_puzzle(diff: i32) {
+    // Increment game instance for entropy
+    game.game_instance = game.game_instance + 1;
+    let seed: i32 = game.game_instance;
+
     // Map difficulty to clue count
     var clues: i32 = 36;
     if diff == 0 { clues = 36; }      // Easy
@@ -775,17 +780,17 @@ fn init_puzzle(diff: i32) {
     else if diff == 2 { clues = 28; } // Hard
     else { clues = 24; }              // Expert
 
-    // Generate a solved board
+    // Generate a solved board with entropy from game instance
     var src: i32[81] = PUZZLE_EASY;
-    let ok = generate_solved_board(src);
+    let ok = generate_solved_board(src, seed);
     if ok == 0 {
         // Fallback to easy puzzle if generation fails
         src = PUZZLE_EASY;
         clues = 36;
     }
 
-    // Generate puzzle with target clue count (removes cells while keeping unique solution)
-    let _ = generate_puzzle(src, clues);
+    // Generate puzzle with target clue count, seeded by game instance
+    let _ = generate_puzzle(src, clues, seed);
 
     var i2 = 0;
     for i2 in 81 {
