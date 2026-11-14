@@ -405,7 +405,7 @@ fn cgol_draw() {
     let status_y = h - 1;
     if status_y >= 0 {
         let _ = tb_print(0, status_y, TB_YELLOW, TB_DEFAULT,
-            "HJKL:move X:toggle Space:step C:clear Z:rand G:glider B:block b:blink T:toad O:rpent A:acorn D:diehard L:lwss P:pause R:run +/-/0:speed Q:quit");
+            "HJKL:move X:toggle Space:step C:clear Z:rand G:glider B:block b:blink T:toad O:rpent A:acorn D:diehard L:lwss P:pause/run R:run +/-/0:speed Q:quit");
         let _ = tb_print(0, status_y - 1, TB_CYAN, TB_DEFAULT,
             "Gen: ");
         // Print gen number
@@ -483,11 +483,7 @@ fn cgol_handle_key(ev: tb_event&) -> i32 {
         return 1;
     }
 
-    // Toggle auto-run
-    if ev.ch == 'r' || ev.ch == 'R' || ev.key == TB_KEY_ENTER {
-        world.running = if world.running != 0 { 0 } else { 1 };
-        return 1;
-    }
+    // (removed duplicate toggle handler - see below)
 
     // Single step
     if ev.ch == 's' || ev.ch == 'S' || ev.key == TB_KEY_SPACE {
@@ -517,7 +513,7 @@ fn cgol_handle_key(ev: tb_event&) -> i32 {
     if ev.ch == 'd' { cgol_place_pattern("diehard", world.cx, world.cy); return 1; }
     if ev.ch == 'l' { cgol_place_pattern("lwss", world.cx, world.cy); return 1; }
     // Pause/Run
-    if ev.ch == 'p' { world.running = 0; return 1; }
+    if ev.ch == 'p' { world.running = if world.running != 0 { 0 } else { 1 }; return 1; }
     if ev.ch == 'r' || ev.key == TB_KEY_ENTER { world.running = 1; return 1; }
     // Speed control (33ms = ~30 FPS minimum)
     if ev.ch == '+' || ev.ch == '=' { if world.speed_ms > 33 { world.speed_ms = world.speed_ms - 10; } else if world.speed_ms > 0 { world.speed_ms = 33; } return 1; }
@@ -566,13 +562,15 @@ fn main() {
 
     cgol_draw();
     var last_sim_ms: i64 = tb_adapter_now_ms();
+    const TARGET_FRAME_MS: i32 = 16;  // ~60 FPS
 
     loop {
-        // Drain ALL pending events (non-blocking)
-        var rv2: i32 = TB_OK;
+        let frame_start = tb_adapter_now_ms();
+
+        // Drain ALL pending input (non-blocking)
         loop {
             var ev = tb_event { .. };
-            rv2 = tb_peek_event(ev, 0);
+            let rv2 = tb_peek_event(ev, 0);
             if rv2 != TB_OK { break; }
             if ev.kind == TB_EVENT_KEY {
                 let should_continue = cgol_handle_key(ev);
@@ -594,10 +592,6 @@ fn main() {
                 }
             }
         }
-        if rv2 != TB_ERR_NO_EVENT && rv2 != TB_OK {
-            print("peek_event error: ", rv2, "\n");
-            break;
-        }
 
         // Fixed-timestep simulation advance
         if world.running != 0 && world.speed_ms > 0 {
@@ -613,8 +607,13 @@ fn main() {
 
         cgol_draw();
 
-        // Frame pacing: sleep to ~60 FPS (16ms) to not burn CPU
-        tb_adapter_sleep_ms(16);
+        // Frame pacing: sleep for remaining frame time
+        let frame_end = tb_adapter_now_ms();
+        let elapsed = (frame_end - frame_start) as i32;
+        let remaining = TARGET_FRAME_MS - elapsed;
+        if remaining > 0 {
+            tb_adapter_sleep_ms(remaining);
+        }
     }
 
     cgol_shutdown();
