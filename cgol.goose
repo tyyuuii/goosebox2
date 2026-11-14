@@ -192,7 +192,7 @@ fn cgol_init() -> i32 {
     world.running = 1;
     world.cx = world.width / 2;
     world.cy = world.height / 2;
-    world.speed_ms = 0;  // 0 = max FPS (no throttle)
+    world.speed_ms = 60;  // 60ms = ~16 FPS
     world.frame_count = 0;
     world.last_fps_update = tb_adapter_now_ms();
     world.current_fps = 0;
