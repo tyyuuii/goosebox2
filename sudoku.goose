@@ -156,6 +156,61 @@ fn can_place(g: i32[81]&, x: i32, y: i32, val: i32) -> i32 {
     return 1;
 }
 
+// Validate that a puzzle (with clues) follows Sudoku rules:
+// no duplicate non-zero values in any row, column, or box.
+fn validate_puzzle(g: i32[81]&) -> i32 {
+    // Check rows
+    var y = 0;
+    for y in 9 {
+        var seen: u16 = 0;
+        var x = 0;
+        for x in 9 {
+            let val = g[y * 9 + x];
+            if val != 0 {
+                let bit: u16 = (1 as u64 << val) as u16;
+                if seen & bit != 0 { return 0; }
+                seen = seen | bit;
+            }
+        }
+    }
+    // Check columns
+    var x = 0;
+    for x in 9 {
+        var seen: u16 = 0;
+        var y = 0;
+        for y in 9 {
+            let val = g[y * 9 + x];
+            if val != 0 {
+                let bit: u16 = (1 as u64 << val) as u16;
+                if seen & bit != 0 { return 0; }
+                seen = seen | bit;
+            }
+        }
+    }
+    // Check boxes
+    var by = 0;
+    for by in 3 {
+        var bx = 0;
+        for bx in 3 {
+            var seen: u16 = 0;
+            var dy = 0;
+            for dy in 3 {
+                var dx = 0;
+                for dx in 3 {
+                    let pos = (by * 3 + dy) * 9 + (bx * 3 + dx);
+                    let val = g[pos];
+                    if val != 0 {
+                        let bit: u16 = (1 as u64 << val) as u16;
+                        if seen & bit != 0 { return 0; }
+                        seen = seen | bit;
+                    }
+                }
+            }
+        }
+    }
+    return 1;
+}
+
 recursive fn solve_puzzle(g: i32[81]&, pos: i32) -> i32 {
     if pos >= 81 { return 1; }
     if g[pos] != 0 { return solve_puzzle(g, pos + 1); }
@@ -804,7 +859,7 @@ fn is_solved() -> i32 {
 fn init_puzzle(diff: i32) {
     // Increment game instance for entropy
     game.game_instance = game.game_instance + 1;
-    let seed: i32 = game.game_instance;
+    var seed: i32 = game.game_instance;
 
     // Map difficulty to clue count
     var clues: i32 = 36;
@@ -823,7 +878,20 @@ fn init_puzzle(diff: i32) {
     }
 
     // Generate puzzle with target clue count, seeded by game instance
-    let _ = generate_puzzle(src, clues, seed);
+    // Retry with different seed if puzzle is invalid (should be rare)
+    var attempts: i32 = 0;
+    while attempts < 10 {
+        let _ = generate_puzzle(src, clues, seed);
+        if validate_puzzle(src) != 0 { break; }
+        // Invalid puzzle - try next seed
+        seed = seed + 1;
+        attempts = attempts + 1;
+    }
+    if attempts >= 10 {
+        // Last resort: fallback to easy puzzle
+        src = PUZZLE_EASY;
+        clues = 36;
+    }
 
     var i2 = 0;
     for i2 in 81 {
