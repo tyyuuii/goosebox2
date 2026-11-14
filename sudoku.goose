@@ -334,10 +334,16 @@ fn generate_solved_board(g: i32[81]&, seed: i32) -> i32 {
     return ok;
 }
 
-// Check if removing cell at position `pos` still leaves a unique solution.
+// Check if removing cell at position `pos` still leaves a unique solution
+// AND the puzzle remains valid (no duplicates in rows/cols/boxes).
 fn can_remove(g: i32[81]&, pos: i32) -> i32 {
     let saved = g[pos];
     g[pos] = 0;
+    let valid = validate_puzzle(g);
+    if valid == 0 {
+        g[pos] = saved;
+        return 0;
+    }
     let cnt = count_solutions(g, 0, 2);
     g[pos] = saved;
     if cnt == 1 { return 1; }
@@ -386,6 +392,14 @@ fn generate_puzzle(src: i32[81]&, clues: i32, seed: i32) -> i32 {
                         removed = removed + 1;
                     }
                 }
+                // Validate after symmetric pair removal
+                if validate_puzzle(solved) == 0 {
+                    // Rollback this pair
+                    solved[pos] = src[pos];
+                    if sym_pos != pos { solved[sym_pos] = src[sym_pos]; }
+                    removed = removed - 1;
+                    if sym_pos != pos && solved[sym_pos] == 0 { removed = removed - 1; }
+                }
             }
         }
         idx2 = idx2 + 1;
@@ -409,11 +423,23 @@ fn generate_puzzle(src: i32[81]&, clues: i32, seed: i32) -> i32 {
                             removed = removed + 1;
                         }
                     }
+                    // Validate after symmetric pair removal
+                    if validate_puzzle(solved) == 0 {
+                        solved[pos2] = src[pos2];
+                        if sym_pos2 != pos2 { solved[sym_pos2] = src[sym_pos2]; }
+                        removed = removed - 1;
+                        if sym_pos2 != pos2 && solved[sym_pos2] == 0 { removed = removed - 1; }
+                    }
                 }
             }
             pos2 = pos2 + 1;
         }
         pass = pass + 1;
+    }
+
+    // Final validation - retry with different seed if invalid
+    if validate_puzzle(solved) == 0 {
+        return -1;  // Signal failure
     }
 
     // Copy result back to src
@@ -943,8 +969,8 @@ fn init_puzzle(diff: i32) {
     // Retry with different seed if puzzle is invalid
     var attempts: i32 = 0;
     while attempts < 50 {
-        let _ = generate_puzzle(src, clues, seed);
-        if validate_puzzle(src) != 0 { break; }
+        let removed = generate_puzzle(src, clues, seed);
+        if removed >= 0 && validate_puzzle(src) != 0 { break; }
         seed = seed + 4;
         attempts = attempts + 1;
     }
