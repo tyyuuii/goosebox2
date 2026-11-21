@@ -22,9 +22,13 @@ int tb_adapter_open_tty(const char *path, int flags);
 
 /* close, read, write, pipe, isatty — thin wrappers for symmetry. */
 int tb_adapter_close(int fd);
-int tb_adapter_write(int fd, const char *buf, size_t n);
-int tb_adapter_read(int fd, char *buf, size_t n);
+/* Match Goose's i64 return type: use ssize_t (POSIX) or long long. */
+long long tb_adapter_write(int fd, const char *buf, size_t n);
+long long tb_adapter_read(int fd, char *buf, size_t n);
+
 int tb_adapter_poll(int fd, int timeout_ms);
+int tb_adapter_poll_multi(int fd1, int fd2, int timeout_ms);
+int tb_adapter_poll_revents(int idx);
 int tb_adapter_pipe(int *pipefd);
 int tb_adapter_isatty(int fd);
 
@@ -37,11 +41,11 @@ const char *tb_adapter_ttyname(int fd);
 /* Copy terminal name from ttyname() into Goose buffer. */
 int tb_adapter_get_ttyname(char *buf, size_t bufsz, const char *tty_name_ptr);
 
-/* vsnprintf wrapper for tb_printf / tb_sendf. */
-int tb_adapter_vsnprintf(char *buf, size_t bufsz, const char *fmt, va_list ap);
-
 /* SIGWINCH handler setup: installs a handler that writes a byte to pipe_fd. */
 int tb_adapter_setup_signwinch(int pipe_fd);
+
+/* Clear SIGWINCH handler (restore default) and reset pipe fd. */
+void tb_adapter_clear_signwinch(void);
 
 /* Resize pipe notification: write a byte to wake the poll loop. */
 int tb_adapter_resize_notify(int fd);

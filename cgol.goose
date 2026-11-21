@@ -288,7 +288,8 @@ fn cgol_clear() {
 
 fn cgol_randomize() {
     let total = world.width * world.height;
-    var seed: u64 = world.gen as u64 + 0x9E3779B97F4A7C15;
+    // Mix in current time for different boards on each call
+    var seed: u64 = (world.gen as u64 + 0x9E3779B97F4A7C15) ^ (tb_adapter_now_ms() as u64);
     var i: i32 = 0;
     for i in total {
         seed ^= seed >> 12;
@@ -305,7 +306,9 @@ fn cgol_place_pattern(name: const u8[:], px: i32, py: i32) {
     // Build pattern points
     var pts: Point[>..] = [];
 
-    // Match pattern name
+    // Match pattern name (need at least 2 chars for prefix)
+    if name.len < 2 { return; }
+
     if name[0] == 'g' && name[1] == 'l' {        // glider
         pattern_glider(pts);
     } else if name[0] == 'b' && name[1] == 'l' { // block
@@ -330,11 +333,10 @@ fn cgol_place_pattern(name: const u8[:], px: i32, py: i32) {
     for j in pts.len {
         let dx = pts[j].x;
         let dy = pts[j].y;
-        let x = px + dx;
-        let y = py + dy;
-        if in_bounds(x, y) {
-            world.cur[idx(x, y)] = 1;
-        }
+        // Toroidal wrapping to match count_neighbors behavior
+        let x = ((px + dx) % world.width + world.width) % world.width;
+        let y = ((py + dy) % world.height + world.height) % world.height;
+        world.cur[idx(x, y)] = 1;
     }
 }
 
@@ -343,39 +345,54 @@ fn cgol_place_pattern(name: const u8[:], px: i32, py: i32) {
 // ---------------------------------------------------------------------------
 
 fn cgol_resize() {
-    world.width = tb_width();
-    world.height = tb_height();
+    let old_w = world.width;
+    let old_h = world.height;
+    let new_w = tb_width();
+    let new_h = tb_height();
+    let new_total = new_w * new_h;
+
+    // Allocate new grid
+    var new_cur: u8[>..] = [];
+    var i = 0;
+    while i < new_total {
+        new_cur.push(0);
+        i = i + 1;
+    }
+
+    // Copy overlapping region from old to new (preserving pattern)
+    let copy_w = if old_w < new_w { old_w } else { new_w };
+    let copy_h = if old_h < new_h { old_h } else { new_h };
+    var y: i32 = 0;
+    while y < copy_h {
+        var x: i32 = 0;
+        while x < copy_w {
+            new_cur[y * new_w + x] = world.cur[y * old_w + x];
+            x = x + 1;
+        }
+        y = y + 1;
+    }
+
+    // Update dimensions
+    world.width = new_w;
+    world.height = new_h;
 
     // Clamp cursor
     world.cx = clamp_x(world.cx);
     world.cy = clamp_y(world.cy);
 
-    // Reallocate grids to new size
-    let total = world.width * world.height;
-
-    // Zero out existing elements up to the new size (or old size)
-    let old_total = world.cur.len;
-    let min_total = if total < old_total { total } else { old_total };
-    var i: i32 = 0;
-    while i < min_total {
-        world.cur[i] = 0;
+    // Replace grids
+    while world.cur.len < new_total {
+        world.cur.push(0);
+        world.nxt.push(0);
+    }
+    i = 0;
+    while i < new_total {
+        world.cur[i] = new_cur[i];
         world.nxt[i] = 0;
         i = i + 1;
     }
-
-    // If new size is larger, extend
-    if total > old_total {
-        i = old_total as i32;
-        while i < total {
-            world.cur.push(0);
-            world.nxt.push(0);
-            i = i + 1;
-        }
-    }
-    // If new size is smaller, we just leave the extra elements (they're zeroed)
-    // but logically we only use up to 'total' elements
-
-    world.gen = 0;
+    // If smaller, extra elements are left zeroed but logically unused
+    // (borrow checker prevents pop on global resizable arrays)
 
     let _ = tb_invalidate();
 }
@@ -389,10 +406,12 @@ fn cgol_draw() {
 
     let w = world.width;
     let h = world.height;
+    let status_y = h - 1;
+    let grid_h = if status_y >= 1 { status_y - 1 } else { h };
 
-    // Draw alive cells
+    // Draw alive cells (only in grid area, not status rows)
     var y: i32 = 0;
-    while y < h {
+    while y < grid_h {
         var x: i32 = 0;
         while x < w {
             let i = idx(x, y);
@@ -405,7 +424,7 @@ fn cgol_draw() {
     }
 
     // Draw cursor
-    if in_bounds(world.cx, world.cy) {
+    if in_bounds(world.cx, world.cy) && world.cy < grid_h {
         let i = idx(world.cx, world.cy);
         let ch = if world.cur[i] != 0 { CH_CURSOR_ALIVE } else { CH_CURSOR };
         let fg = if world.cur[i] != 0 { TB_BLACK } else { TB_WHITE };
@@ -413,15 +432,12 @@ fn cgol_draw() {
         let _ = tb_set_cell(world.cx, world.cy, ch, fg as u64, bg as u64);
     }
 
-    // Status line at bottom
-    let status_y = h - 1;
-    if status_y >= 0 {
-        let _ = tb_print(0, status_y, TB_YELLOW, TB_DEFAULT,
-            "HJKL:move X:toggle Space:step C:clear Z:rand G:glider B:block b:blink T:toad O:rpent A:acorn D:diehard L:lwss P:pause/run R:run +/-/0:speed Q:quit");
-        let _ = tb_print(0, status_y - 1, TB_CYAN, TB_DEFAULT,
-            "Gen: ");
+    // Status lines at bottom (2 rows: stats on status_y-1, help on status_y)
+    if status_y >= 1 {
+        // Line 1: stats (Gen, Running, Speed, Paused, FPS, FT, Skip)
+        let _ = tb_print(0, status_y - 1, TB_CYAN, TB_DEFAULT, "Gen: ");
         // Print gen number
-        let gen_str: u8[32];
+        var gen_str: u8[32] = [0; 32];
         var len: i32 = 0;
         var v = world.gen;
         if v == 0 {
@@ -442,15 +458,14 @@ fn cgol_draw() {
             }
         }
         let _ = tb_print(5, status_y - 1, TB_WHITE, TB_DEFAULT, gen_str[0..len]);
-        let _ = tb_print(20, status_y - 1, TB_CYAN, TB_DEFAULT,
-            "  Running: ");
+        let _ = tb_print(20, status_y - 1, TB_CYAN, TB_DEFAULT, "  Running: ");
         let _ = tb_print(32, status_y - 1,
             if world.running != 0 { TB_GREEN | TB_BOLD } else { TB_WHITE },
             TB_DEFAULT,
             if world.running != 0 { "ON " } else { "OFF" });
         // Speed
         let _ = tb_print(40, status_y - 1, TB_CYAN, TB_DEFAULT, "  Speed: ");
-        let spd_str: u8[16];
+        var spd_str: u8[16] = [0; 16];
         var spd_len: i32 = 0;
         var sv = world.speed_ms;
         if sv == 0 {
@@ -476,31 +491,26 @@ fn cgol_draw() {
         }
         // FPS
         if world.current_fps > 0 {
-            let fps_str: u8[16];
+            var fps_str: u8[16] = [0; 16];
             var fps_len: i32 = 0;
             var fv = world.current_fps;
-            if fv == 0 {
-                fps_str[0] = 0x30;
-                fps_len = 1;
-            } else {
-                while fv > 0 {
-                    fps_str[fps_len] = (0x30 + (fv % 10)) as u8;
-                    fv = fv / 10;
-                    fps_len = fps_len + 1;
-                }
-                var i: i32 = 0;
-                for i in fps_len / 2 {
-                    let tmp = fps_str[i];
-                    fps_str[i] = fps_str[fps_len - 1 - i];
-                    fps_str[fps_len - 1 - i] = tmp;
-                }
+            while fv > 0 {
+                fps_str[fps_len] = (0x30 + (fv % 10)) as u8;
+                fv = fv / 10;
+                fps_len = fps_len + 1;
             }
-            let _ = tb_print(60, status_y, TB_CYAN, TB_DEFAULT, "  FPS: ");
-            let _ = tb_print(67, status_y, TB_WHITE, TB_DEFAULT, fps_str[0..fps_len]);
+            var i: i32 = 0;
+            for i in fps_len / 2 {
+                let tmp = fps_str[i];
+                fps_str[i] = fps_str[fps_len - 1 - i];
+                fps_str[fps_len - 1 - i] = tmp;
+            }
+            let _ = tb_print(70, status_y - 1, TB_CYAN, TB_DEFAULT, "  FPS: ");
+            let _ = tb_print(77, status_y - 1, TB_WHITE, TB_DEFAULT, fps_str[0..fps_len]);
         }
         // Frame time
         if world.frame_time_ms > 0 {
-            let ft_str: u8[16];
+            var ft_str: u8[16] = [0; 16];
             var ft_len: i32 = 0;
             var ft = world.frame_time_ms;
             while ft > 0 {
@@ -514,14 +524,20 @@ fn cgol_draw() {
                 ft_str[i] = ft_str[ft_len - 1 - i];
                 ft_str[ft_len - 1 - i] = tmp;
             }
-            let _ = tb_print(80, status_y, TB_CYAN, TB_DEFAULT, "  FT: ");
-            let _ = tb_print(85, status_y, TB_WHITE, TB_DEFAULT, ft_str[0..ft_len]);
-            let _ = tb_print(85 + ft_len, status_y, TB_WHITE, TB_DEFAULT, "ms");
+            let _ = tb_print(90, status_y - 1, TB_CYAN, TB_DEFAULT, "  FT: ");
+            let _ = tb_print(95, status_y - 1, TB_WHITE, TB_DEFAULT, ft_str[0..ft_len]);
+            let _ = tb_print(95 + ft_len, status_y - 1, TB_WHITE, TB_DEFAULT, "ms");
         }
         // Skip indicator
         if world.skip_frame != 0 {
-            let _ = tb_print(100, status_y, TB_RED | TB_BOLD, TB_DEFAULT, "  [SKIP]");
+            let _ = tb_print(110, status_y - 1, TB_RED | TB_BOLD, TB_DEFAULT, "  [SKIP]");
         }
+        // Line 2: help text
+        let _ = tb_print(0, status_y, TB_YELLOW, TB_DEFAULT,
+            "HJKL/WASD/Arrows:move  X/Space:toggle  S:step  C:clear  Z:rand  G:glider  B:block  b:blink  T:toad  O:rpent  A:acorn  D:diehard  L:lwss  P:pause  R/Enter:run  +/-/0:speed  Q:quit");
+    } else if status_y == 0 {
+        // Terminal is only 1 row tall - just show minimal help
+        let _ = tb_print(0, 0, TB_YELLOW, TB_DEFAULT, "Q:quit");
     }
 
     let _ = tb_present();
@@ -537,48 +553,7 @@ fn cgol_handle_key(ev: tb_event&) -> i32 {
         return 0;  // signal quit
     }
 
-    // Toggle cell at cursor
-    if ev.ch == 'x' || ev.ch == ' ' || ev.key == TB_KEY_MOUSE_LEFT {
-        cgol_toggle(world.cx, world.cy);
-        return 1;
-    }
-
-    // Single step
-    if ev.ch == 's' || ev.ch == 'S' || ev.key == TB_KEY_SPACE {
-        cgol_step();
-        return 1;
-    }
-
-    // Clear
-    if ev.ch == 'c' || ev.ch == 'C' {
-        cgol_clear();
-        return 1;
-    }
-
-    // Randomize
-    if ev.ch == 'z' || ev.ch == 'Z' {
-        cgol_randomize();
-        return 1;
-    }
-
-    // Patterns
-    if ev.ch == 'g' { cgol_place_pattern("glider", world.cx, world.cy); return 1; }
-    if ev.ch == 'b' { cgol_place_pattern("blinker", world.cx, world.cy); return 1; }
-    if ev.ch == 'B' { cgol_place_pattern("block", world.cx, world.cy); return 1; }
-    if ev.ch == 't' { cgol_place_pattern("toad", world.cx, world.cy); return 1; }
-    if ev.ch == 'o' { cgol_place_pattern("rpent", world.cx, world.cy); return 1; }
-    if ev.ch == 'a' { cgol_place_pattern("acorn", world.cx, world.cy); return 1; }
-    if ev.ch == 'd' { cgol_place_pattern("diehard", world.cx, world.cy); return 1; }
-    if ev.ch == 'l' { cgol_place_pattern("lwss", world.cx, world.cy); return 1; }
-    // Pause/Run
-    if ev.ch == 'p' { world.running = if world.running != 0 { 0 } else { 1 }; return 1; }
-    if ev.ch == 'r' || ev.key == TB_KEY_ENTER { world.running = 1; return 1; }
-    // Speed control (33ms = ~30 FPS minimum)
-    if ev.ch == '+' || ev.ch == '=' { if world.speed_ms > 33 { world.speed_ms = world.speed_ms - 10; } else if world.speed_ms > 0 { world.speed_ms = 33; } return 1; }
-    if ev.ch == '-' { world.speed_ms = world.speed_ms + 10; return 1; }
-    if ev.ch == '0' { world.speed_ms = 0; return 1; }
-
-    // Cursor movement
+    // Cursor movement (HJKL / WASD / Arrow keys) - FIRST to avoid collisions
     if ev.ch == 'h' || ev.ch == 'a' || ev.key == TB_KEY_ARROW_LEFT {
         world.cx = clamp_x(world.cx - 1);
         return 1;
@@ -595,6 +570,59 @@ fn cgol_handle_key(ev: tb_event&) -> i32 {
         world.cx = clamp_x(world.cx + 1);
         return 1;
     }
+
+    // Toggle cell at cursor
+    if ev.ch == 'x' || ev.ch == 'X' || ev.key == TB_KEY_MOUSE_LEFT {
+        cgol_toggle(world.cx, world.cy);
+        return 1;
+    }
+
+    // Single step when paused (Shift+Space or 'S')
+    if ev.ch == 'S' || ev.ch == ' ' {
+        cgol_step();
+        return 1;
+    }
+
+    // Clear
+    if ev.ch == 'c' || ev.ch == 'C' {
+        cgol_clear();
+        return 1;
+    }
+
+    // Randomize
+    if ev.ch == 'z' || ev.ch == 'Z' {
+        cgol_randomize();
+        return 1;
+    }
+
+    // Patterns (uppercase to avoid collision with WASD/HJKL)
+    if ev.ch == 'g' || ev.ch == 'G' { cgol_place_pattern("glider", world.cx, world.cy); return 1; }
+    if ev.ch == 'b' { cgol_place_pattern("blinker", world.cx, world.cy); return 1; }
+    if ev.ch == 'B' { cgol_place_pattern("block", world.cx, world.cy); return 1; }
+    if ev.ch == 't' || ev.ch == 'T' { cgol_place_pattern("toad", world.cx, world.cy); return 1; }
+    if ev.ch == 'o' || ev.ch == 'O' { cgol_place_pattern("rpent", world.cx, world.cy); return 1; }
+    if ev.ch == 'A' { cgol_place_pattern("acorn", world.cx, world.cy); return 1; }
+    if ev.ch == 'D' { cgol_place_pattern("diehard", world.cx, world.cy); return 1; }
+    if ev.ch == 'L' { cgol_place_pattern("lwss", world.cx, world.cy); return 1; }
+
+    // Pause/Run
+    if ev.ch == 'p' || ev.ch == 'P' {
+        world.running = if world.running != 0 { 0 } else { 1 };
+        return 1;
+    }
+    if ev.ch == 'r' || ev.ch == 'R' || ev.key == TB_KEY_ENTER {
+        world.running = 1;
+        return 1;
+    }
+
+    // Speed control (33ms = ~30 FPS minimum)
+    if ev.ch == '+' || ev.ch == '=' {
+        if world.speed_ms > 10 { world.speed_ms = world.speed_ms - 10; }
+        else if world.speed_ms > 0 { world.speed_ms = 0; }
+        return 1;
+    }
+    if ev.ch == '-' { world.speed_ms = world.speed_ms + 10; return 1; }
+    if ev.ch == '0' { world.speed_ms = 0; return 1; }
 
     return 1;
 }
@@ -622,8 +650,9 @@ fn main() {
     var last_sim_ms: i64 = tb_adapter_now_ms();
     const TARGET_FRAME_MS: i32 = 16;  // ~60 FPS
     const MAX_FRAME_MS: i32 = 33;    // ~30 FPS minimum
+    var running: i32 = 1;
 
-    loop {
+    while running != 0 {
         let frame_start = tb_adapter_now_ms();
 
         // Process events with adaptive timeout (frame pacing + instant input)
@@ -642,13 +671,14 @@ fn main() {
                 }
                 // Error
                 print("peek_event error: ", rv2, "\n");
-                return;
+                running = 0;
+                break;
             }
 
             // Event received - process IMMEDIATELY
             if ev.kind == TB_EVENT_KEY {
                 let should_continue = cgol_handle_key(ev);
-                if should_continue == 0 { return; } // quit
+                if should_continue == 0 { running = 0; break; } // quit
             } else if ev.kind == TB_EVENT_RESIZE {
                 cgol_resize();
             } else if ev.kind == TB_EVENT_MOUSE {
@@ -667,6 +697,7 @@ fn main() {
             }
             // Continue inner loop to check for more events with updated timeout
         }
+        if running == 0 { break; }
 
         // Frame budget used up - do simulation step
         if world.running != 0 && world.speed_ms > 0 {

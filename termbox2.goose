@@ -340,6 +340,7 @@ extern fn tb_adapter_ttyname(fd: i32) -> u64;
 extern fn tb_adapter_get_ttyname(buf: u8&, bufsz: i32, tty_name_ptr: u64) -> i32;
 extern fn tb_adapter_vsnprintf(buf: u8[TB_OPT_PRINTF_BUF]&, bufsz: u64, fmt: const u8&, ap: u64) -> i32;
 extern fn tb_adapter_setup_signwinch(pipe_fd: i32) -> i32;
+extern fn tb_adapter_clear_signwinch() -> i32;
 extern fn tb_adapter_resize_notify(fd: i32) -> i32;
 extern fn tb_adapter_set_raw_mode(fd: i32) -> i32;
 
@@ -612,12 +613,10 @@ fn tb_init_rwfd(rfd: i32, wfd: i32) -> i32 {
     guard g.width > 0 && g.height > 0 else { return TB_ERR_RESIZE_IOCTL; }
 
     // Terminal capability detection
-    let tty_name: u8[64];
-    var i = 0;
-    for i in 64 { tty_name[i] = 0; }
+    var tty_name: u8[64] = [0; 64];
     let tty_name_ptr = tb_adapter_ttyname(rfd);
     if tty_name_ptr != 0 {
-        let rv = tb_adapter_get_ttyname(tty_name[0], 64, tty_name_ptr);
+        let rv = tb_adapter_get_ttyname(&tty_name[0], 64, tty_name_ptr);
         if rv >= 0 {
             var len = 0;
             for len in 64 { if tty_name[len] == 0 { break; } }
@@ -662,6 +661,9 @@ fn tb_init_rwfd(rfd: i32, wfd: i32) -> i32 {
 fn tb_shutdown() -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
+
+    // Clear SIGWINCH handler before closing pipe fds
+    tb_adapter_clear_signwinch();
 
     if g.has_orig_tios != 0 {
         let _ = tb_adapter_tcsetattr(g.rfd, 0, g.orig_tios);
@@ -1051,8 +1053,8 @@ fn tb_peek_event(event: tb_event&, timeout_ms: i32) -> i32 {
     // Check resize pipe first
     if tb_adapter_poll_revents(1) != 0 {
         // Drain the resize pipe
-        let rb: u8[1];
-        tb_adapter_read(g.resize_pipefd[0], rb[0], 1);
+        var rb: u8[1] = [0; 1];
+        tb_adapter_read(g.resize_pipefd[0], &rb[0], 1);
         // Re-read terminal size
         let rv = tb_adapter_ioctl_winsize(g.rfd, TIOCGWINSZ, g.winsize);
         if rv == 0 {
@@ -1072,10 +1074,8 @@ fn tb_peek_event(event: tb_event&, timeout_ms: i32) -> i32 {
     }
 
     // Phase 3: Read available bytes from TTY
-    let readbuf: u8[64];
-    var i = 0;
-    for i in 64 { readbuf[i] = 0; }
-    let nread = tb_adapter_read(g.rfd, readbuf[0], 64);
+    var readbuf: u8[64] = [0; 64];
+    let nread = tb_adapter_read(g.rfd, &readbuf[0], 64);
     if nread <= 0 {
         return TB_ERR_NO_EVENT;
     }
@@ -1228,7 +1228,8 @@ fn outbuf_flush(fd: i32) -> i32 {
     var written: i64 = 0;
     while written < g.outbuf_len {
         let off = written as i32;
-        let n = tb_adapter_write(fd, g.outbuf[off], (g.outbuf_len - written) as u64);
+        let remaining = g.outbuf_len - written;
+        let n = tb_adapter_write(fd, &g.outbuf[off], remaining as u64);
         if n > 0 {
             written = written + n;
         } else {

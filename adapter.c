@@ -1,22 +1,30 @@
 #include "adapter.h"
 
+#define _POSIX_C_SOURCE 200809L
+
+#include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 /* The pipe fd that the SIGWINCH handler writes to. */
-static int g_sigwinch_pipe_fd = -1;
+static volatile sig_atomic_t g_sigwinch_pipe_fd = -1;
 
 /* SIGWINCH handler: wake up the poll loop by writing to the resize pipe. */
 static void sigwinch_handler(int signum) {
     (void)signum;
-    if (g_sigwinch_pipe_fd >= 0) {
+    int saved_errno = errno;
+    int fd = g_sigwinch_pipe_fd;
+    if (fd >= 0) {
         const char b = 1;
-        write(g_sigwinch_pipe_fd, &b, 1);
+        ssize_t r = write(fd, &b, 1);
+        (void)r;
     }
+    errno = saved_errno;
 }
 
 /* Termios: hide the platform-specific struct from Goose. */
@@ -51,16 +59,21 @@ int tb_adapter_close(int fd) {
     return close(fd);
 }
 
-int tb_adapter_write(int fd, const char *buf, size_t n) {
+long long tb_adapter_write(int fd, const char *buf, size_t n) {
     return write(fd, buf, n);
 }
 
-int tb_adapter_read(int fd, char *buf, size_t n) {
+long long tb_adapter_read(int fd, char *buf, size_t n) {
     return read(fd, buf, n);
 }
 
 int tb_adapter_pipe(int *pipefd) {
-    return pipe(pipefd);
+    if (pipe(pipefd) != 0) return -1;
+    int f0 = fcntl(pipefd[0], F_GETFL, 0);
+    int f1 = fcntl(pipefd[1], F_GETFL, 0);
+    if (f0 >= 0) fcntl(pipefd[0], F_SETFL, f0 | O_NONBLOCK);
+    if (f1 >= 0) fcntl(pipefd[1], F_SETFL, f1 | O_NONBLOCK);
+    return 0;
 }
 
 int tb_adapter_poll(int fd, int timeout_ms) {
@@ -115,15 +128,25 @@ int tb_adapter_get_ttyname(char *buf, size_t bufsz, const char *tty_name_ptr) {
     return (int)strlen(buf);
 }
 
-/* vsnprintf wrapper for tb_printf / tb_sendf. */
-int tb_adapter_vsnprintf(char *buf, size_t bufsz, const char *fmt, va_list ap) {
-    return vsnprintf(buf, bufsz, fmt, ap);
-}
-
 /* SIGWINCH handler setup: installs a handler that writes a byte to pipe_fd. */
 int tb_adapter_setup_signwinch(int pipe_fd) {
     g_sigwinch_pipe_fd = pipe_fd;
-    return signal(SIGWINCH, sigwinch_handler) == SIG_ERR ? -1 : 0;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = sigwinch_handler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    return sigaction(SIGWINCH, &sa, NULL) == -1 ? -1 : 0;
+}
+
+/* Clear SIGWINCH handler (restore default) and reset pipe fd. */
+void tb_adapter_clear_signwinch(void) {
+    g_sigwinch_pipe_fd = -1;
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = SIG_DFL;
+    sigemptyset(&sa.sa_mask);
+    sigaction(SIGWINCH, &sa, NULL);
 }
 
 /* Resize pipe notification: write a byte to wake the poll loop. */
