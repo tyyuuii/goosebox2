@@ -52,6 +52,7 @@ root struct cgol_world {
     current_fps: i32,
     frame_time_ms: i32,
     skip_frame: i32,
+    last_frame_skipped: i32,
 }
 
 var world: cgol_world;
@@ -150,9 +151,16 @@ fn clamp_x(x: i32) -> i32 {
     return x;
 }
 
+fn grid_height() -> i32 {
+    // Reserve 2 rows for status bar
+    if world.height >= 3 { return world.height - 2; }
+    return world.height;
+}
+
 fn clamp_y(y: i32) -> i32 {
+    let gh = grid_height();
     if y < 0 { return 0; }
-    if y >= world.height { return world.height - 1; }
+    if y >= gh { return gh - 1; }
     return y;
 }
 
@@ -191,7 +199,7 @@ fn cgol_init() -> i32 {
     world.gen = 0;
     world.running = 1;
     world.cx = world.width / 2;
-    world.cy = world.height / 2;
+    world.cy = grid_height() / 2;
     world.speed_ms = 60;  // 60ms = ~16 FPS
     world.frame_count = 0;
     world.last_fps_update = tb_adapter_now_ms();
@@ -311,10 +319,10 @@ fn cgol_place_pattern(name: const u8[:], px: i32, py: i32) {
 
     if name[0] == 'g' && name[1] == 'l' {        // glider
         pattern_glider(pts);
+    } else if name[0] == 'b' && name[1] == 'k' { // blinker (check before block)
+        pattern_blinker(pts);
     } else if name[0] == 'b' && name[1] == 'l' { // block
         pattern_block(pts);
-    } else if name[0] == 'b' && name[1] == 'k' { // blinker
-        pattern_blinker(pts);
     } else if name[0] == 't' && name[1] == 'o' { // toad
         pattern_toad(pts);
     } else if name[0] == 'r' {                   // r-pentomino
@@ -434,9 +442,13 @@ fn cgol_draw() {
 
     // Status lines at bottom (2 rows: stats on status_y-1, help on status_y)
     if status_y >= 1 {
-        // Line 1: stats (Gen, Running, Speed, Paused, FPS, FT, Skip)
-        let _ = tb_print(0, status_y - 1, TB_CYAN, TB_DEFAULT, "Gen: ");
-        // Print gen number
+        // Line 1: stats - build sequentially to avoid overlap/wrap
+        var col: i32 = 0;
+        let w = world.width;
+        
+        // Gen
+        let _ = tb_print(col, status_y - 1, TB_CYAN, TB_DEFAULT, "Gen: ");
+        col = col + 5;
         var gen_str: u8[32] = [0; 32];
         var len: i32 = 0;
         var v = world.gen;
@@ -449,7 +461,6 @@ fn cgol_draw() {
                 v = v / 10;
                 len = len + 1;
             }
-            // Reverse
             var i: i32 = 0;
             for i in len / 2 {
                 let tmp = gen_str[i];
@@ -457,14 +468,21 @@ fn cgol_draw() {
                 gen_str[len - 1 - i] = tmp;
             }
         }
-        let _ = tb_print(5, status_y - 1, TB_WHITE, TB_DEFAULT, gen_str[0..len]);
-        let _ = tb_print(20, status_y - 1, TB_CYAN, TB_DEFAULT, "  Running: ");
-        let _ = tb_print(32, status_y - 1,
+        let _ = tb_print(col, status_y - 1, TB_WHITE, TB_DEFAULT, gen_str[0..len]);
+        col = col + len + 1;
+        
+        // Running
+        let _ = tb_print(col, status_y - 1, TB_CYAN, TB_DEFAULT, "Running: ");
+        col = col + 9;
+        let _ = tb_print(col, status_y - 1,
             if world.running != 0 { TB_GREEN | TB_BOLD } else { TB_WHITE },
             TB_DEFAULT,
-            if world.running != 0 { "ON " } else { "OFF" });
+            if world.running != 0 { "ON" } else { "OFF" });
+        col = col + 3;
+        
         // Speed
-        let _ = tb_print(40, status_y - 1, TB_CYAN, TB_DEFAULT, "  Speed: ");
+        let _ = tb_print(col, status_y - 1, TB_CYAN, TB_DEFAULT, "Speed: ");
+        col = col + 7;
         var spd_str: u8[16] = [0; 16];
         var spd_len: i32 = 0;
         var sv = world.speed_ms;
@@ -483,14 +501,23 @@ fn cgol_draw() {
                 spd_str[spd_len - 1 - i] = tmp;
             }
         }
-        let _ = tb_print(50, status_y - 1, TB_WHITE, TB_DEFAULT, spd_str[0..spd_len]);
-        let _ = tb_print(50 + spd_len, status_y - 1, TB_WHITE, TB_DEFAULT, "ms");
-        // Pause indicator
-        if world.running == 0 {
-            let _ = tb_print(60, status_y - 1, TB_RED | TB_BOLD, TB_DEFAULT, "  [PAUSED]");
+        let _ = tb_print(col, status_y - 1, TB_WHITE, TB_DEFAULT, spd_str[0..spd_len]);
+        col = col + spd_len;
+        if sv > 0 {
+            let _ = tb_print(col, status_y - 1, TB_WHITE, TB_DEFAULT, "ms");
+            col = col + 2;
         }
+        
+        // Pause indicator
+        if world.running == 0 && col + 10 < w {
+            let _ = tb_print(col, status_y - 1, TB_RED | TB_BOLD, TB_DEFAULT, " [PAUSED]");
+            col = col + 9;
+        }
+        
         // FPS
-        if world.current_fps > 0 {
+        if world.current_fps > 0 && col + 10 < w {
+            let _ = tb_print(col, status_y - 1, TB_CYAN, TB_DEFAULT, " FPS: ");
+            col = col + 6;
             var fps_str: u8[16] = [0; 16];
             var fps_len: i32 = 0;
             var fv = world.current_fps;
@@ -505,11 +532,14 @@ fn cgol_draw() {
                 fps_str[i] = fps_str[fps_len - 1 - i];
                 fps_str[fps_len - 1 - i] = tmp;
             }
-            let _ = tb_print(70, status_y - 1, TB_CYAN, TB_DEFAULT, "  FPS: ");
-            let _ = tb_print(77, status_y - 1, TB_WHITE, TB_DEFAULT, fps_str[0..fps_len]);
+            let _ = tb_print(col, status_y - 1, TB_WHITE, TB_DEFAULT, fps_str[0..fps_len]);
+            col = col + fps_len;
         }
+        
         // Frame time
-        if world.frame_time_ms > 0 {
+        if world.frame_time_ms > 0 && col + 8 < w {
+            let _ = tb_print(col, status_y - 1, TB_CYAN, TB_DEFAULT, " FT: ");
+            col = col + 5;
             var ft_str: u8[16] = [0; 16];
             var ft_len: i32 = 0;
             var ft = world.frame_time_ms;
@@ -524,19 +554,21 @@ fn cgol_draw() {
                 ft_str[i] = ft_str[ft_len - 1 - i];
                 ft_str[ft_len - 1 - i] = tmp;
             }
-            let _ = tb_print(90, status_y - 1, TB_CYAN, TB_DEFAULT, "  FT: ");
-            let _ = tb_print(95, status_y - 1, TB_WHITE, TB_DEFAULT, ft_str[0..ft_len]);
-            let _ = tb_print(95 + ft_len, status_y - 1, TB_WHITE, TB_DEFAULT, "ms");
+            let _ = tb_print(col, status_y - 1, TB_WHITE, TB_DEFAULT, ft_str[0..ft_len]);
+            col = col + ft_len;
+            let _ = tb_print(col, status_y - 1, TB_WHITE, TB_DEFAULT, "ms");
+            col = col + 2;
         }
-        // Skip indicator
-        if world.skip_frame != 0 {
-            let _ = tb_print(110, status_y - 1, TB_RED | TB_BOLD, TB_DEFAULT, "  [SKIP]");
+        
+        // Skip indicator (show if last frame was skipped)
+        if world.last_frame_skipped != 0 && col + 8 < w {
+            let _ = tb_print(col, status_y - 1, TB_RED | TB_BOLD, TB_DEFAULT, " [SKIP]");
         }
-        // Line 2: help text
+        
+        // Line 2: help text - shortened to fit 80 cols
         let _ = tb_print(0, status_y, TB_YELLOW, TB_DEFAULT,
-            "HJKL/WASD/Arrows:move  X/Space:toggle  S:step  C:clear  Z:rand  G:glider  B:block  b:blink  T:toad  O:rpent  A:acorn  D:diehard  L:lwss  P:pause  R/Enter:run  +/-/0:speed  Q:quit");
+            "HJKL/WASD/Arrows:move X/Space:toggle S:step C:clear Z:rand G:glider B:block b:blink T:toad O:rpent A:acorn D:diehard L:lwss P:pause R/Enter:run +/-/0:speed Q:quit");
     } else if status_y == 0 {
-        // Terminal is only 1 row tall - just show minimal help
         let _ = tb_print(0, 0, TB_YELLOW, TB_DEFAULT, "Q:quit");
     }
 
@@ -572,13 +604,13 @@ fn cgol_handle_key(ev: tb_event&) -> i32 {
     }
 
     // Toggle cell at cursor
-    if ev.ch == 'x' || ev.ch == 'X' || ev.key == TB_KEY_MOUSE_LEFT {
+    if ev.ch == 'x' || ev.ch == 'X' || ev.ch == ' ' || ev.key == TB_KEY_MOUSE_LEFT {
         cgol_toggle(world.cx, world.cy);
         return 1;
     }
 
-    // Single step when paused (Shift+Space or 'S')
-    if ev.ch == 'S' || ev.ch == ' ' {
+    // Single step when paused (S or Shift+S)
+    if ev.ch == 'S' || ev.ch == 's' {
         cgol_step();
         return 1;
     }
@@ -610,7 +642,7 @@ fn cgol_handle_key(ev: tb_event&) -> i32 {
         world.running = if world.running != 0 { 0 } else { 1 };
         return 1;
     }
-    if ev.ch == 'r' || ev.ch == 'R' || ev.key == TB_KEY_ENTER {
+    if ev.ch == 'r' || ev.ch == 'R' || ev.ch == TB_KEY_ENTER || ev.ch == 0x0a {
         world.running = 1;
         return 1;
     }
@@ -718,6 +750,8 @@ fn main() {
         } else {
             world.skip_frame = 1;
         }
+        // Track if last frame was skipped for [SKIP] indicator
+        world.last_frame_skipped = world.skip_frame;
 
         // Frame pacing & FPS tracking
         let frame_end = tb_adapter_now_ms();

@@ -1,8 +1,9 @@
-#include "adapter.h"
-
 #define _POSIX_C_SOURCE 200809L
 
+#include "adapter.h"
+
 #include <errno.h>
+#include <stdlib.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
@@ -117,13 +118,26 @@ int tb_adapter_errno(void) {
 
 /* ttyname — returns const char* as a numeric pointer. */
 const char *tb_adapter_ttyname(int fd) {
-    return ttyname(fd);
+    static __thread char buf[64];
+    int result = ttyname_r(fd, buf, sizeof(buf));
+    if (result == 0) return buf;
+    return NULL;
 }
 
 /* Copy terminal name from ttyname() into Goose buffer. */
 int tb_adapter_get_ttyname(char *buf, size_t bufsz, const char *tty_name_ptr) {
     if (!buf || !tty_name_ptr || bufsz == 0) return -1;
     strncpy(buf, tty_name_ptr, bufsz - 1);
+    buf[bufsz - 1] = '\0';
+    return (int)strlen(buf);
+}
+
+/* Get TERM environment variable into buffer. */
+int tb_adapter_get_term(char *buf, size_t bufsz) {
+    if (!buf || bufsz == 0) return -1;
+    const char *term = getenv("TERM");
+    if (!term) return -1;
+    strncpy(buf, term, bufsz - 1);
     buf[bufsz - 1] = '\0';
     return (int)strlen(buf);
 }
@@ -140,13 +154,13 @@ int tb_adapter_setup_signwinch(int pipe_fd) {
 }
 
 /* Clear SIGWINCH handler (restore default) and reset pipe fd. */
-void tb_adapter_clear_signwinch(void) {
+int tb_adapter_clear_signwinch(void) {
     g_sigwinch_pipe_fd = -1;
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = SIG_DFL;
     sigemptyset(&sa.sa_mask);
-    sigaction(SIGWINCH, &sa, NULL);
+    return sigaction(SIGWINCH, &sa, NULL) == -1 ? -1 : 0;
 }
 
 /* Resize pipe notification: write a byte to wake the poll loop. */
@@ -170,13 +184,16 @@ int tb_adapter_set_raw_mode(int fd) {
 /* Current time in milliseconds using CLOCK_MONOTONIC. */
 long long tb_adapter_now_ms(void) {
     struct timespec ts;
-    clock_gettime(CLOCK_MONOTONIC, &ts);
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0) return 0;
     return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
 }
 
 void tb_adapter_sleep_ms(int ms) {
-    struct timespec ts;
+    if (ms <= 0) return;
+    struct timespec ts, rem;
     ts.tv_sec = ms / 1000;
     ts.tv_nsec = (long)(ms % 1000) * 1000000L;
-    nanosleep(&ts, NULL);
+    while (nanosleep(&ts, &rem) == -1 && errno == EINTR) {
+        ts = rem;
+    }
 }

@@ -3,7 +3,6 @@
 
 #include <sys/ioctl.h>
 #include <termios.h>
-#include <stdarg.h>
 #include <stddef.h>
 
 /* Termios: hide the platform-specific struct from Goose. */
@@ -45,7 +44,7 @@ int tb_adapter_get_ttyname(char *buf, size_t bufsz, const char *tty_name_ptr);
 int tb_adapter_setup_signwinch(int pipe_fd);
 
 /* Clear SIGWINCH handler (restore default) and reset pipe fd. */
-void tb_adapter_clear_signwinch(void);
+int tb_adapter_clear_signwinch(void);
 
 /* Resize pipe notification: write a byte to wake the poll loop. */
 int tb_adapter_resize_notify(int fd);
@@ -58,5 +57,8 @@ long long tb_adapter_now_ms(void);
 
 /* Sleep for milliseconds. */
 void tb_adapter_sleep_ms(int ms);
+
+/* Get TERM environment variable into buffer. */
+int tb_adapter_get_term(char *buf, size_t bufsz);
 
 #endif /* TERMBOX2_ADAPTER_H */
