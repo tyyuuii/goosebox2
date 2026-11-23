@@ -25,9 +25,6 @@ import termbox2;
 // Layout
 // ---------------------------------------------------------------------------
 
-const BOARD_X: i32 = 4;    // left edge (outer border)
-const BOARD_Y: i32 = 2;    // top edge (outer border)
-const STATUS_Y: i32 = 16;  // first status line
 const MAX_HISTORY: i32 = 500;
 
 // Box-drawing glyphs
@@ -477,12 +474,29 @@ fn generate_puzzle(src: i32[81]&, clues: i32, seed: i32) -> i32 {
 // Coordinate helpers
 // ---------------------------------------------------------------------------
 
+fn board_x() -> i32 {
+    let w = tb_width();
+    if w >= 35 { return 4; }
+    if w >= 33 { return 2; }
+    return 1;
+}
+
+fn board_y() -> i32 {
+    if tb_height() >= 19 { return 2; }
+    return 1;
+}
+
+fn status_y() -> i32 {
+    if tb_height() >= 19 { return board_y() + 14; }
+    return board_y() + 13;
+}
+
 fn cell_sx(x: i32) -> i32 {
-    return BOARD_X + 1 + x * 3 + x / 3;
+    return board_x() + 1 + x * 3 + x / 3;
 }
 
 fn cell_sy(y: i32) -> i32 {
-    return BOARD_Y + 1 + y + y / 3;
+    return board_y() + 1 + y + y / 3;
 }
 
 fn idx(x: i32, y: i32) -> i32 {
@@ -533,9 +547,12 @@ fn put_num(x: i32, y: i32, n: i32, fg: u64, bg: u64) -> i32 {
 }
 
 fn clear_line(y: i32) {
+    let w = tb_width();
+    let h = tb_height();
+    if y < 0 || y >= h || w <= 0 { return; }
     var i = 0;
-    for i in 80 {
-        put(i as i32, y, ' ', TB_DEFAULT, TB_DEFAULT);
+    for i in w {
+        put(i, y, ' ', TB_DEFAULT, TB_DEFAULT);
     }
 }
 
@@ -544,32 +561,35 @@ fn clear_line(y: i32) {
 // ---------------------------------------------------------------------------
 
 fn draw_hline(y: i32, l: u32, m: u32, r: u32) {
-    put(BOARD_X, y, l, TB_WHITE, TB_DEFAULT);
+    let bx = board_x();
+    put(bx, y, l, TB_WHITE, TB_DEFAULT);
     var i = 0;
-    for i in 9 { put(BOARD_X + 1 + (i as i32), y, CH_H, TB_WHITE, TB_DEFAULT); }
-    put(BOARD_X + 10, y, m, TB_WHITE, TB_DEFAULT);
+    for i in 9 { put(bx + 1 + (i as i32), y, CH_H, TB_WHITE, TB_DEFAULT); }
+    put(bx + 10, y, m, TB_WHITE, TB_DEFAULT);
     var j = 0;
-    for j in 9 { put(BOARD_X + 11 + (j as i32), y, CH_H, TB_WHITE, TB_DEFAULT); }
-    put(BOARD_X + 20, y, m, TB_WHITE, TB_DEFAULT);
+    for j in 9 { put(bx + 11 + (j as i32), y, CH_H, TB_WHITE, TB_DEFAULT); }
+    put(bx + 20, y, m, TB_WHITE, TB_DEFAULT);
     var k = 0;
-    for k in 9 { put(BOARD_X + 21 + (k as i32), y, CH_H, TB_WHITE, TB_DEFAULT); }
-    put(BOARD_X + 30, y, r, TB_WHITE, TB_DEFAULT);
+    for k in 9 { put(bx + 21 + (k as i32), y, CH_H, TB_WHITE, TB_DEFAULT); }
+    put(bx + 30, y, r, TB_WHITE, TB_DEFAULT);
 }
 
 fn draw_borders() {
-    draw_hline(BOARD_Y,      CH_TL, CH_TT, CH_TR);
-    draw_hline(BOARD_Y + 4,  CH_LT, CH_X,  CH_RT);
-    draw_hline(BOARD_Y + 8,  CH_LT, CH_X,  CH_RT);
-    draw_hline(BOARD_Y + 12, CH_BL, CH_BT, CH_BR);
+    let bx = board_x();
+    let by = board_y();
+    draw_hline(by,      CH_TL, CH_TT, CH_TR);
+    draw_hline(by + 4,  CH_LT, CH_X,  CH_RT);
+    draw_hline(by + 8,  CH_LT, CH_X,  CH_RT);
+    draw_hline(by + 12, CH_BL, CH_BT, CH_BR);
 
     var yy = 0;
     for yy in 11 {
         if yy == 3 || yy == 7 { continue; }  // skip horizontal-border rows
-        let y = BOARD_Y + 1 + (yy as i32);
-        put(BOARD_X,       y, CH_V, TB_WHITE, TB_DEFAULT);
-        put(BOARD_X + 10,  y, CH_V, TB_WHITE, TB_DEFAULT);
-        put(BOARD_X + 20,  y, CH_V, TB_WHITE, TB_DEFAULT);
-        put(BOARD_X + 30,  y, CH_V, TB_WHITE, TB_DEFAULT);
+        let y = by + 1 + (yy as i32);
+        put(bx,       y, CH_V, TB_WHITE, TB_DEFAULT);
+        put(bx + 10,  y, CH_V, TB_WHITE, TB_DEFAULT);
+        put(bx + 20,  y, CH_V, TB_WHITE, TB_DEFAULT);
+        put(bx + 30,  y, CH_V, TB_WHITE, TB_DEFAULT);
     }
 }
 
@@ -578,14 +598,16 @@ fn draw_borders() {
 // ---------------------------------------------------------------------------
 
 fn draw_labels() {
+    let bx = board_x();
+    let by = board_y();
     var x = 0;
     for x in 9 {
-        put(cell_sx(x as i32) + 1, BOARD_Y - 1, (0x31 + (x as i32)) as u32,
+        put(cell_sx(x as i32) + 1, by - 1, (0x31 + (x as i32)) as u32,
             TB_CYAN, TB_DEFAULT);
     }
     var y = 0;
     for y in 9 {
-        put(BOARD_X - 2, cell_sy(y as i32), (0x31 + (y as i32)) as u32,
+        put(bx - 2, cell_sy(y as i32), (0x31 + (y as i32)) as u32,
             TB_CYAN, TB_DEFAULT);
     }
 }
@@ -695,44 +717,103 @@ fn draw_cell(x: i32, y: i32) {
 // ---------------------------------------------------------------------------
 
 fn draw_status() {
-    clear_line(STATUS_Y);
-    clear_line(STATUS_Y + 1);
+    let w = tb_width();
+    let h = tb_height();
+    let sy = status_y();
+    let c = cell_ref(game.cursor_x, game.cursor_y);
 
-    put_str(0, STATUS_Y, TB_YELLOW, TB_DEFAULT,
-        "HJKL/WASD:move  1-9:fill  0:clear  N:notes  ?:hint");
-    put_str(0, STATUS_Y + 1, TB_YELLOW, TB_DEFAULT,
-        "U:undo  R:redo  Space:new  Q:quit");
+    clear_line(sy);
+    clear_line(sy + 1);
+    clear_line(sy + 2);
 
-    // Mode
-    put_str(62, STATUS_Y, TB_CYAN, TB_DEFAULT, "Notes:");
-    if game.notes_mode != 0 {
-        put_str(69, STATUS_Y, TB_GREEN | TB_BOLD, TB_DEFAULT, "ON ");
-    } else {
-        put_str(69, STATUS_Y, TB_WHITE, TB_DEFAULT, "OFF");
+    if sy >= h { return; }
+
+    if w >= 74 {
+        put_str(0, sy, TB_YELLOW, TB_DEFAULT,
+            "HJKL/WASD:move  1-9:fill  0:clear  N:notes  ?:hint");
+        put_str(62, sy, TB_CYAN, TB_DEFAULT, "Notes:");
+        if game.notes_mode != 0 {
+            put_str(69, sy, TB_GREEN | TB_BOLD, TB_DEFAULT, "ON ");
+        } else {
+            put_str(69, sy, TB_WHITE, TB_DEFAULT, "OFF");
+        }
+
+        if sy + 1 < h {
+            put_str(0, sy + 1, TB_YELLOW, TB_DEFAULT,
+                "U:undo  R:redo  Space:new  Q:quit");
+            put_str(62, sy + 1, TB_CYAN, TB_DEFAULT, "Moves:");
+            put_num(69, sy + 1, game.moves, TB_WHITE, TB_DEFAULT);
+        }
+
+        if sy + 2 < h {
+            put_str(0, sy + 2, TB_CYAN, TB_DEFAULT, "Cell R");
+            put_num(6, sy + 2, game.cursor_y + 1, TB_WHITE, TB_DEFAULT);
+            put_str(7, sy + 2, TB_CYAN, TB_DEFAULT, " C");
+            put_num(9, sy + 2, game.cursor_x + 1, TB_WHITE, TB_DEFAULT);
+            if c.value == 0 && c.notes != 0 {
+                put_str(15, sy + 2, TB_CYAN, TB_DEFAULT, "Notes:");
+                var col2: i32 = 0;
+                var n2: i32 = 1;
+                for n2 in 1..10 {
+                    let bit2: u16 = (1 as u64 << n2) as u16;
+                    if c.notes & bit2 != 0 {
+                        put(22 + col2, sy + 2, (0x30 + n2) as u32,
+                            TB_MAGENTA, TB_DEFAULT);
+                        col2 = col2 + 1;
+                    }
+                }
+            }
+        }
+        return;
     }
 
-    // Move count
-    put_str(62, STATUS_Y + 1, TB_CYAN, TB_DEFAULT, "Moves:");
-    put_num(69, STATUS_Y + 1, game.moves, TB_WHITE, TB_DEFAULT);
+    // Compact Termux layout (width < 74): keep cell info, Notes, and Moves inside viewport
+    put_str(0, sy, TB_CYAN, TB_DEFAULT, "Cell R");
+    put_num(6, sy, game.cursor_y + 1, TB_WHITE, TB_DEFAULT);
+    put_str(7, sy, TB_CYAN, TB_DEFAULT, " C");
+    put_num(9, sy, game.cursor_x + 1, TB_WHITE, TB_DEFAULT);
 
-    // Focus cell coordinates and notes
-    clear_line(STATUS_Y + 2);
-    put_str(0, STATUS_Y + 2, TB_CYAN, TB_DEFAULT, "Cell R");
-    put_num(6, STATUS_Y + 2, game.cursor_y + 1, TB_WHITE, TB_DEFAULT);
-    put_str(7, STATUS_Y + 2, TB_CYAN, TB_DEFAULT, " C");
-    put_num(9, STATUS_Y + 2, game.cursor_x + 1, TB_WHITE, TB_DEFAULT);
-    let c = cell_ref(game.cursor_x, game.cursor_y);
-    if c.value == 0 && c.notes != 0 {
-        put_str(15, STATUS_Y + 2, TB_CYAN, TB_DEFAULT, "Notes:");
-        var col2: i32 = 0;
-        var n2: i32 = 1;
-        for n2 in 1..10 {
-            let bit2: u16 = (1 as u64 << n2) as u16;
-            if c.notes & bit2 != 0 {
-                put(22 + col2, STATUS_Y + 2, (0x30 + n2) as u32,
-                    TB_MAGENTA, TB_DEFAULT);
-                col2 = col2 + 1;
+    put_str(12, sy, TB_CYAN, TB_DEFAULT, "Notes:");
+    if game.notes_mode != 0 {
+        put_str(18, sy, TB_GREEN | TB_BOLD, TB_DEFAULT, "ON ");
+    } else {
+        put_str(18, sy, TB_WHITE, TB_DEFAULT, "OFF");
+    }
+    put_str(22, sy, TB_CYAN, TB_DEFAULT, "Mv:");
+    put_num(25, sy, game.moves, TB_WHITE, TB_DEFAULT);
+
+    if sy + 1 < h {
+        if w >= 50 {
+            put_str(0, sy + 1, TB_YELLOW, TB_DEFAULT,
+                "HJKL/WASD:move  1-9:fill  0:clear  N:notes  ?:hint");
+        } else if w >= 39 {
+            put_str(0, sy + 1, TB_YELLOW, TB_DEFAULT,
+                "HJKL:move 1-9:fill 0:clr N:note ?:hint");
+        } else {
+            put_str(0, sy + 1, TB_YELLOW, TB_DEFAULT,
+                "HJKL:mv 1-9:set 0:clr N:n ?:h");
+        }
+    }
+
+    if sy + 2 < h {
+        if c.value == 0 && c.notes != 0 {
+            put_str(0, sy + 2, TB_CYAN, TB_DEFAULT, "Nts:");
+            var col3: i32 = 0;
+            var n3: i32 = 1;
+            for n3 in 1..10 {
+                let bit3: u16 = (1 as u64 << n3) as u16;
+                if c.notes & bit3 != 0 {
+                    put(4 + col3, sy + 2, (0x30 + n3) as u32,
+                        TB_MAGENTA, TB_DEFAULT);
+                    col3 = col3 + 1;
+                }
             }
+            if w >= 34 {
+                put_str(14, sy + 2, TB_YELLOW, TB_DEFAULT, "U:un R:re Sp:new Q");
+            }
+        } else if w >= 33 {
+            put_str(0, sy + 2, TB_YELLOW, TB_DEFAULT,
+                "U:undo R:redo Space:new Q:quit");
         }
     }
 }
@@ -741,7 +822,45 @@ fn draw_status() {
 // Full redraw
 // ---------------------------------------------------------------------------
 
+fn draw_too_small(min_w: i32, min_h: i32) {
+    let w = tb_width();
+    let h = tb_height();
+    let _ = tb_clear();
+    if h >= 1 && w >= 6 {
+        put_str(0, 0, TB_CYAN | TB_BOLD, TB_DEFAULT, "SUDOKU");
+    }
+    if h >= 2 && w >= 12 {
+        put_str(0, 1, TB_YELLOW, TB_DEFAULT, "Zoom out to fit");
+    }
+    if h >= 3 && w >= 16 {
+        var cx: i32 = 0;
+        put_str(cx, 2, TB_WHITE, TB_DEFAULT, "Need ");
+        cx = 5 + put_num(5, 2, min_w, TB_WHITE, TB_DEFAULT);
+        put(cx, 2, 'x', TB_WHITE, TB_DEFAULT);
+        cx = cx + 1;
+        let _ = put_num(cx, 2, min_h, TB_WHITE, TB_DEFAULT);
+    }
+    if h >= 4 && w >= 14 {
+        var cx2: i32 = 0;
+        put_str(cx2, 3, TB_CYAN, TB_DEFAULT, "Now: ");
+        cx2 = 5 + put_num(5, 3, w, TB_CYAN, TB_DEFAULT);
+        put(cx2, 3, 'x', TB_CYAN, TB_DEFAULT);
+        cx2 = cx2 + 1;
+        let _ = put_num(cx2, 3, h, TB_CYAN, TB_DEFAULT);
+    }
+    if h >= 5 && w >= 8 {
+        put_str(0, 4, TB_YELLOW, TB_DEFAULT, "Q:quit");
+    }
+    let _ = tb_present();
+}
+
 fn draw_all() {
+    let w = tb_width();
+    let h = tb_height();
+    if w < 33 || h < 14 {
+        draw_too_small(33, 14);
+        return;
+    }
     let _ = tb_clear();
     draw_labels();
     draw_borders();
@@ -1030,18 +1149,42 @@ fn init_puzzle(diff: i32) {
 // Menu / win screen
 // ---------------------------------------------------------------------------
 
-fn show_menu(diff: i32&) -> i32 {
+fn draw_menu() {
+    let w = tb_width();
+    let h = tb_height();
     let _ = tb_clear();
-    put_str(8, 3, TB_CYAN | TB_BOLD, TB_DEFAULT, "===================");
-    put_str(8, 4, TB_CYAN | TB_BOLD, TB_DEFAULT, "      SUDOKU       ");
-    put_str(8, 5, TB_CYAN | TB_BOLD, TB_DEFAULT, "===================");
-    put_str(8, 7, TB_WHITE, TB_DEFAULT, "Select difficulty:");
-    put_str(8, 9,  TB_YELLOW, TB_DEFAULT, "1. Easy");
-    put_str(8, 10, TB_YELLOW, TB_DEFAULT, "2. Medium");
-    put_str(8, 11, TB_YELLOW, TB_DEFAULT, "3. Hard");
-    put_str(8, 12, TB_YELLOW, TB_DEFAULT, "4. Expert");
-    put_str(8, 14, TB_CYAN, TB_DEFAULT, "Press 1-4   (Q to quit)");
+    if w < 24 || h < 10 {
+        if h >= 1 && w >= 6 { put_str(0, 0, TB_CYAN | TB_BOLD, TB_DEFAULT, "SUDOKU"); }
+        if h >= 2 && w >= 14 { put_str(0, 1, TB_YELLOW, TB_DEFAULT, "1-4:Play Q:Quit"); }
+        let _ = tb_present();
+        return;
+    }
+
+    let mx: i32 = if w >= 34 { 8 } else { 1 };
+    if h >= 16 {
+        put_str(mx, 3, TB_CYAN | TB_BOLD, TB_DEFAULT, "===================");
+        put_str(mx, 4, TB_CYAN | TB_BOLD, TB_DEFAULT, "      SUDOKU       ");
+        put_str(mx, 5, TB_CYAN | TB_BOLD, TB_DEFAULT, "===================");
+        put_str(mx, 7, TB_WHITE, TB_DEFAULT, "Select difficulty:");
+        put_str(mx, 9,  TB_YELLOW, TB_DEFAULT, "1. Easy");
+        put_str(mx, 10, TB_YELLOW, TB_DEFAULT, "2. Medium");
+        put_str(mx, 11, TB_YELLOW, TB_DEFAULT, "3. Hard");
+        put_str(mx, 12, TB_YELLOW, TB_DEFAULT, "4. Expert");
+        put_str(mx, 14, TB_CYAN, TB_DEFAULT, "Press 1-4   (Q to quit)");
+    } else {
+        put_str(mx, 0, TB_CYAN | TB_BOLD, TB_DEFAULT, "=== SUDOKU ===");
+        put_str(mx, 2, TB_WHITE, TB_DEFAULT, "Select difficulty:");
+        put_str(mx, 4, TB_YELLOW, TB_DEFAULT, "1. Easy");
+        put_str(mx, 5, TB_YELLOW, TB_DEFAULT, "2. Medium");
+        put_str(mx, 6, TB_YELLOW, TB_DEFAULT, "3. Hard");
+        put_str(mx, 7, TB_YELLOW, TB_DEFAULT, "4. Expert");
+        put_str(mx, 9, TB_CYAN, TB_DEFAULT, "1-4:Start  Q:Quit");
+    }
     let _ = tb_present();
+}
+
+fn show_menu(diff: i32&) -> i32 {
+    draw_menu();
 
     // Clear input buffer to prevent rapid key press glitches
     let g = gbl();
@@ -1051,7 +1194,12 @@ fn show_menu(diff: i32&) -> i32 {
     loop {
         var ev = tb_event { .. };
         let rv = tb_poll_event(ev);
+        if rv == TB_ERR_READ { return 0; }
         if rv != TB_OK { continue; }
+        if ev.kind == TB_EVENT_RESIZE {
+            draw_menu();
+            continue;
+        }
         if ev.kind != TB_EVENT_KEY { continue; }
         if ev.ch == '1' { diff = 0; return 1; }
         if ev.ch == '2' { diff = 1; return 1; }
@@ -1061,21 +1209,44 @@ fn show_menu(diff: i32&) -> i32 {
     }
 }
 
+fn draw_win() {
+    let w = tb_width();
+    let h = tb_height();
+    let _ = tb_clear();
+    if w < 28 || h < 9 {
+        if h >= 1 && w >= 7 { put_str(0, 0, TB_GREEN | TB_BOLD, TB_DEFAULT, "SOLVED!"); }
+        if h >= 2 && w >= 14 { put_str(0, 1, TB_YELLOW, TB_DEFAULT, "Sp:New M:Menu Q"); }
+        let _ = tb_present();
+        return;
+    }
+
+    let wx: i32 = if w >= 44 { 8 } else { 1 };
+    let bx: i32 = if w >= 38 { 10 } else { 1 };
+    if h >= 14 {
+        put_str(bx, 4, TB_GREEN | TB_BOLD, TB_DEFAULT,
+            "===========================");
+        put_str(bx, 5, TB_GREEN | TB_BOLD, TB_DEFAULT,
+            "     PUZZLE SOLVED!     ");
+        put_str(bx, 6, TB_GREEN | TB_BOLD, TB_DEFAULT,
+            "===========================");
+        put_str(wx + 3, 8, TB_WHITE, TB_DEFAULT, "Moves: ");
+        put_num(wx + 10, 8, game.moves, TB_WHITE, TB_DEFAULT);
+        put_str(wx, 10, TB_YELLOW, TB_DEFAULT, "Space: new puzzle (same difficulty)");
+        put_str(wx, 11, TB_YELLOW, TB_DEFAULT, "M: main menu (new difficulty)");
+        put_str(wx, 12, TB_YELLOW, TB_DEFAULT, "Q: quit");
+    } else {
+        put_str(wx, 1, TB_GREEN | TB_BOLD, TB_DEFAULT, "PUZZLE SOLVED!");
+        put_str(wx, 3, TB_WHITE, TB_DEFAULT, "Moves: ");
+        put_num(wx + 7, 3, game.moves, TB_WHITE, TB_DEFAULT);
+        put_str(wx, 5, TB_YELLOW, TB_DEFAULT, "Space: new puzzle");
+        put_str(wx, 6, TB_YELLOW, TB_DEFAULT, "M: menu  Q: quit");
+    }
+    let _ = tb_present();
+}
+
 fn show_win() -> i32 {
     // Returns: 0 = quit, 1 = play again (same difficulty), 2 = new game (menu)
-    let _ = tb_clear();
-    put_str(10, 4, TB_GREEN | TB_BOLD, TB_DEFAULT,
-        "===========================");
-    put_str(10, 5, TB_GREEN | TB_BOLD, TB_DEFAULT,
-        "     PUZZLE SOLVED!     ");
-    put_str(10, 6, TB_GREEN | TB_BOLD, TB_DEFAULT,
-        "===========================");
-    put_str(13, 8, TB_WHITE, TB_DEFAULT, "Moves: ");
-    put_num(20, 8, game.moves, TB_WHITE, TB_DEFAULT);
-    put_str(8, 10, TB_YELLOW, TB_DEFAULT, "Space: new puzzle (same difficulty)");
-    put_str(8, 11, TB_YELLOW, TB_DEFAULT, "M: main menu (new difficulty)");
-    put_str(8, 12, TB_YELLOW, TB_DEFAULT, "Q: quit");
-    let _ = tb_present();
+    draw_win();
 
     // Clear input buffer to prevent rapid key press glitches
     let g = gbl();
@@ -1085,7 +1256,12 @@ fn show_win() -> i32 {
     loop {
         var ev = tb_event { .. };
         let rv = tb_poll_event(ev);
+        if rv == TB_ERR_READ { return 0; }
         if rv != TB_OK { continue; }
+        if ev.kind == TB_EVENT_RESIZE {
+            draw_win();
+            continue;
+        }
         if ev.kind != TB_EVENT_KEY { continue; }
         if ev.ch == ' ' { return 1; }
         if ev.ch == 'm' || ev.ch == 'M' { return 2; }
@@ -1117,7 +1293,9 @@ fn main() {
     loop {
         var ev = tb_event { .. };
         let rv2 = tb_poll_event(ev);
+        if rv2 == TB_ERR_READ { break; }
         if rv2 != TB_OK { continue; }
+        if ev.kind == TB_EVENT_RESIZE { draw_all(); continue; }
         if ev.kind != TB_EVENT_KEY { draw_all(); continue; }
 
         // Quit on 'q' / 'Q' or ESC (defensive: mis-parsed arrows can flood ESC events).

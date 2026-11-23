@@ -585,6 +585,57 @@ fn grow_cells(buf: cellbuf&, width: i32, height: i32) -> i32 {
     return TB_OK;
 }
 
+fn resize_back_cellbuf(buf: cellbuf&, new_w: i32, new_h: i32, fg: uintattr_t, bg: uintattr_t) {
+    let old_w = buf.width;
+    let old_h = buf.height;
+    let _ = grow_cells(buf, new_w, new_h);
+    let min_w = if old_w < new_w { old_w } else { new_w };
+    let min_h = if old_h < new_h { old_h } else { new_h };
+
+    if new_w < old_w {
+        var y = 0;
+        for y in min_h {
+            var x = 0;
+            for x in min_w {
+                buf.cells[y * new_w + x] = buf.cells[y * old_w + x];
+            }
+        }
+    } else if new_w > old_w {
+        var y = min_h - 1;
+        while y >= 0 {
+            var x = min_w - 1;
+            while x >= 0 {
+                buf.cells[y * new_w + x] = buf.cells[y * old_w + x];
+                x = x - 1;
+            }
+            var cx = min_w;
+            while cx < new_w {
+                let idx = y * new_w + cx;
+                buf.cells[idx].ch = 0x20;
+                buf.cells[idx].fg = fg;
+                buf.cells[idx].bg = bg;
+                cx = cx + 1;
+            }
+            y = y - 1;
+        }
+    }
+
+    if new_h > old_h {
+        var y = old_h;
+        while y < new_h {
+            var x = 0;
+            while x < new_w {
+                let idx = y * new_w + x;
+                buf.cells[idx].ch = 0x20;
+                buf.cells[idx].fg = fg;
+                buf.cells[idx].bg = bg;
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+    }
+}
+
 fn reset_cellbuf(buf: cellbuf&, ch: u32, fg: uintattr_t, bg: uintattr_t) {
     var y = 0;
     for y in buf.height {
@@ -1424,10 +1475,17 @@ fn drain_resize_and_fill(event: tb_event&) -> i32 {
         if new_w > 0 && new_h > 0 && (new_w != g.width || new_h != g.height) {
             g.width = new_w;
             g.height = new_h;
-            let _ = grow_cells(g.back, g.width, g.height);
+            resize_back_cellbuf(g.back, g.width, g.height, g.fg, g.bg);
             let _ = grow_cells(g.front, g.width, g.height);
         }
     }
+    // Invalidate front buffer and cached output state so next tb_present()
+    // repaints every visible cell cleanly after terminal reflow/zoom.
+    reset_cellbuf(g.front, 0xffffffff, 0xffffffffffffffff, 0xffffffffffffffff);
+    g.last_fg = 0xffffffffffffffff;
+    g.last_bg = 0xffffffffffffffff;
+    g.last_x = -1;
+    g.last_y = -1;
     event.kind = TB_EVENT_RESIZE;
     event.mod = 0;
     event.key = 0;
@@ -2033,7 +2091,9 @@ fn tb_present() -> i32 {
         }
     }
 
-    if g.cursor_x >= 0 && g.cursor_y >= 0 && (g.cursor_x != g.last_x + 1 || g.cursor_y != g.last_y) {
+    if g.cursor_x >= 0 && g.cursor_x < g.front.width &&
+       g.cursor_y >= 0 && g.cursor_y < g.front.height &&
+       (g.cursor_x != g.last_x + 1 || g.cursor_y != g.last_y) {
         let _ = send_cursor_if(g.cursor_x, g.cursor_y);
         g.last_x = g.cursor_x;
         g.last_y = g.cursor_y;
