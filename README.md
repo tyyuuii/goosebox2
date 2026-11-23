@@ -18,8 +18,8 @@ C.
 `goosebox2` brings termbox2's double-buffered cell rendering, extended grapheme
 clusters (`TB_OPT_EGC = 1`), binary terminfo parsing, keyboard/mouse escape
 sequence decoding, and `SIGWINCH` resize handling to Goose, along with working
-interactive TUI applications (`demo`, Conway's Game of Life `cgol`, and
-`sudoku`) and an automated test suite (`test_termbox2.goose`).
+interactive TUI applications (`demo`, Conway's Game of Life `cgol`,
+`sudoku`, and `fbw` — Fractal Block World) and an automated test suite (`test_termbox2.goose`).
 
 ### Implemented features
 
@@ -90,7 +90,9 @@ goosebox2/
 ├── cgol.goose                    # Conway's Game of Life TUI app
 ├── cgol.build                    # Sidecar config for cgol.goose
 ├── sudoku.goose                  # Interactive Sudoku TUI game
-└── sudoku.build                  # Sidecar config for sudoku.goose
+├── sudoku.build                  # Sidecar config for sudoku.goose
+├── fbw.goose                     # Fractal Block World 3D recursive-scale FPS/explorer
+└── fbw.build                     # Sidecar config for fbw.goose
 ```
 
 ---
@@ -109,6 +111,7 @@ goose check test_termbox2.goose
 goose check demo.goose
 goose check cgol.goose
 goose check sudoku.goose
+goose check fbw.goose
 ```
 
 ### Verify C adapter independently
@@ -152,6 +155,10 @@ goose build cgol.goose -o cgol
 # Interactive Sudoku (adaptive Termux zoom/resize layout, mouse + keyboard)
 goose build sudoku.goose -o sudoku
 ./sudoku
+
+# Fractal Block World (24-bit Truecolor half-block 3D DDA raycaster + infinite scale)
+goose build fbw.goose -o fbw
+./fbw   # Windows: goose build fbw.goose -o fbw.exe && .\fbw.exe
 ```
 
 ---
