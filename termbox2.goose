@@ -178,6 +178,9 @@ const TB_STRIKEOUT            = 0x0000000100000000;
 const TB_UNDERLINE_2          = 0x0000000200000000;
 const TB_OVERLINE             = 0x0000000400000000;
 const TB_INVISIBLE            = 0x0000000800000000;
+const TB_STYLE_MASK: uintattr_t =
+    TB_BOLD | TB_UNDERLINE | TB_REVERSE | TB_ITALIC | TB_BLINK |
+    TB_DIM | TB_STRIKEOUT | TB_UNDERLINE_2 | TB_OVERLINE | TB_INVISIBLE;
 
 // --- Event types ---
 const TB_EVENT_KEY    = 1;
@@ -466,10 +469,10 @@ fn tb_utf8_unicode_to_char(out: u8[7]&, c: u32) -> i32 {
 
 // Return 1 if `ch` is printable (excludes C0/C1 controls, DEL, surrogates, and nonchars).
 fn tb_iswprint(ch: u32) -> i32 {
+    if ch >= 0x20 && ch <= 0x7e { return 1; }
     if ch < 0x20 { return 0; }
     if ch >= 0x7f && ch <= 0x9f { return 0; }
     if (ch & 0xffff) == 0xfffe || (ch & 0xffff) == 0xffff { return 0; }
-    if ch >= 0x20 && ch <= 0x7e { return 1; }
     if ch >= 0xa0 && ch <= 0xd7ff { return 1; }
     if ch >= 0xe000 && ch <= 0xfdcf { return 1; }
     if ch >= 0xfdf0 && ch <= 0xfffd { return 1; }
@@ -480,6 +483,8 @@ fn tb_iswprint(ch: u32) -> i32 {
 // Return display column width of `ch`: 0 (NUL/combining/ZWJ), 1 (normal), 2 (wide CJK/emoji),
 // or -1 (C0/C1 control).
 fn tb_wcwidth(ch: u32) -> i32 {
+    if ch >= 0x20 && ch <= 0x7e { return 1; }
+    if ch >= 0x2500 && ch <= 0x25ff { return 1; }
     if ch == 0 { return 0; }
     if ch < 0x20 || (ch >= 0x7f && ch < 0xa0) { return -1; }
 
@@ -645,19 +650,17 @@ fn tb_clear() -> i32 {
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
     let fg = g.fg;
     let bg = g.bg;
-    var y = 0;
-    for y in g.height {
-        var x = 0;
-        for x in g.width {
-            let idx = y * g.width + x;
-            g.back.cells[idx].ch = 0x20;
-            g.back.cells[idx].fg = fg;
-            g.back.cells[idx].bg = bg;
-            if g.back_ech_head[idx] >= 0 {
-                egc_free_chain(g.back_ech_head[idx]);
-                g.back_ech_head[idx] = -1;
-            }
+    let tot = g.width * g.height;
+    var idx = 0;
+    while idx < tot {
+        g.back.cells[idx].ch = 0x20;
+        g.back.cells[idx].fg = fg;
+        g.back.cells[idx].bg = bg;
+        if g.back_ech_head[idx] >= 0 {
+            egc_free_chain(g.back_ech_head[idx]);
+            g.back_ech_head[idx] = -1;
         }
+        idx = idx + 1;
     }
     return TB_OK;
 }
@@ -682,11 +685,14 @@ fn tb_set_cell_ex(x: i32, y: i32, ch: const u32&, nch: i64, fg: uintattr_t, bg: 
         g.back_ech_head[idx] = -1;
     }
     // If overwriting the trailing cell of a wide character, clear the orphaned lead cell
-    if x > 0 && tb_wcwidth(g.back.cells[idx - 1].ch) == 2 {
-        g.back.cells[idx - 1].ch = 0x20;
-        if g.back_ech_head[idx - 1] >= 0 {
-            egc_free_chain(g.back_ech_head[idx - 1]);
-            g.back_ech_head[idx - 1] = -1;
+    if x > 0 {
+        let prev_ch = g.back.cells[idx - 1].ch;
+        if prev_ch >= 0x1100 && (prev_ch < 0x2500 || prev_ch > 0x25ff) && tb_wcwidth(prev_ch) == 2 {
+            g.back.cells[idx - 1].ch = 0x20;
+            if g.back_ech_head[idx - 1] >= 0 {
+                egc_free_chain(g.back_ech_head[idx - 1]);
+                g.back_ech_head[idx - 1] = -1;
+            }
         }
     }
     g.back.cells[idx].ch = if nch > 0 { ch } else { 0x20 };
@@ -2450,18 +2456,22 @@ fn tb_hide_cursor() -> i32 {
 // OUTPUT BUFFER
 // ===========================================================================
 
+fn outbuf_push_byte(g: tb_global&, b: u8) {
+    let pos = g.outbuf_len;
+    if pos < g.outbuf.len {
+        g.outbuf[pos as i32] = b;
+    } else {
+        g.outbuf.push(b);
+    }
+    g.outbuf_len = pos + 1;
+}
+
 fn outbuf_puts(str: const u8[:]) -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
     var i: i64 = 0;
     while i < str.len {
-        let pos = g.outbuf_len;
-        if pos < g.outbuf.len {
-            g.outbuf[pos as i32] = str[i as i32];
-        } else {
-            g.outbuf.push(str[i as i32]);
-        }
-        g.outbuf_len = g.outbuf_len + 1;
+        outbuf_push_byte(g, str[i as i32]);
         i = i + 1;
     }
     return TB_OK;
@@ -2564,111 +2574,70 @@ fn send_num(num: u64) {
     let _ = outbuf_puts(nbuf[0..len]);
 }
 
+fn outbuf_push_u8_dec(g: tb_global&, v: u64) {
+    if v >= 100 {
+        outbuf_push_byte(g, (0x30 + (v / 100)) as u8);
+        outbuf_push_byte(g, (0x30 + ((v / 10) % 10)) as u8);
+        outbuf_push_byte(g, (0x30 + (v % 10)) as u8);
+    } else if v >= 10 {
+        outbuf_push_byte(g, (0x30 + (v / 10)) as u8);
+        outbuf_push_byte(g, (0x30 + (v % 10)) as u8);
+    } else {
+        outbuf_push_byte(g, (0x30 + v) as u8);
+    }
+}
+
+fn outbuf_push_pos_dec(g: tb_global&, v: i32) {
+    if v >= 0 && v <= 255 {
+        outbuf_push_u8_dec(g, v as u64);
+    } else {
+        send_num(v as u64);
+    }
+}
+
 // ===========================================================================
 // OUTPUT / PRESENT
 // ===========================================================================
 
-fn send_sgr_color_fg(fg: uintattr_t, mode: i32) {
-    if mode == TB_OUTPUT_NORMAL {
-        var idx = fg & 0xff;
-        var bright: i32 = if (fg & TB_BRIGHT) != 0 { 1 } else { 0 };
-        if (fg & TB_HI_BLACK) != 0 && idx == 0 {
-            idx = 1;
-            bright = 1;
-        }
-        if idx >= 1 && idx <= 8 {
-            let base: u64 = if bright != 0 { 90 } else { 30 };
-            let _ = outbuf_puts("\x1b[");
-            send_num(base + idx - 1);
-            let _ = outbuf_puts("m");
-        }
-    } else if mode == TB_OUTPUT_256 {
-        let idx = fg & 0xff;
-        if idx != 0 || (fg & TB_HI_BLACK) != 0 {
-            let _ = outbuf_puts("\x1b[38;5;");
-            send_num(idx);
-            let _ = outbuf_puts("m");
-        }
-    } else if mode == TB_OUTPUT_216 {
-        let idx = fg & 0xff;
-        if idx >= 1 && idx <= 216 {
-            let _ = outbuf_puts("\x1b[38;5;");
-            send_num(15 + idx);
-            let _ = outbuf_puts("m");
-        }
-    } else if mode == TB_OUTPUT_GRAYSCALE {
-        let idx = fg & 0xff;
-        if idx >= 1 && idx <= 24 {
-            let _ = outbuf_puts("\x1b[38;5;");
-            send_num(231 + idx);
-            let _ = outbuf_puts("m");
-        }
-    } else if mode == TB_OUTPUT_TRUECOLOR {
-        let rgb = fg & 0xffffff;
-        if rgb != 0 || (fg & TB_HI_BLACK) != 0 {
-            let r = (rgb >> 16) & 0xff;
-            let gch = (rgb >> 8) & 0xff;
-            let b = rgb & 0xff;
-            let _ = outbuf_puts("\x1b[38;2;");
-            send_num(r);
-            let _ = outbuf_puts(";");
-            send_num(gch);
-            let _ = outbuf_puts(";");
-            send_num(b);
-            let _ = outbuf_puts("m");
-        }
+fn eff_color(c: uintattr_t, mode: i32) -> uintattr_t {
+    if mode == TB_OUTPUT_TRUECOLOR {
+        let rgb = c & 0xffffff;
+        if rgb != 0 { return rgb; }
+        if (c & TB_HI_BLACK) != 0 { return 0; }
+        return 0x1000000;
     }
+    if mode == TB_OUTPUT_256 {
+        let idx = c & 0xff;
+        if idx != 0 || (c & TB_HI_BLACK) != 0 { return idx; }
+        return 0x1000000;
+    }
+    if mode == TB_OUTPUT_216 {
+        let idx = c & 0xff;
+        if idx >= 1 && idx <= 216 { return 15 + idx; }
+        return 0x1000000;
+    }
+    if mode == TB_OUTPUT_GRAYSCALE {
+        let idx = c & 0xff;
+        if idx >= 1 && idx <= 24 { return 231 + idx; }
+        return 0x1000000;
+    }
+    // TB_OUTPUT_NORMAL
+    var idx = c & 0xff;
+    var bright: i32 = if (c & TB_BRIGHT) != 0 { 1 } else { 0 };
+    if (c & TB_HI_BLACK) != 0 && idx == 0 {
+        idx = 1;
+        bright = 1;
+    }
+    if idx >= 1 && idx <= 8 {
+        let base: uintattr_t = if bright != 0 { 90 } else { 30 };
+        return base + idx - 1;
+    }
+    return 0x1000000;
 }
 
-fn send_sgr_color_bg(bg: uintattr_t, mode: i32) {
-    if mode == TB_OUTPUT_NORMAL {
-        var idx = bg & 0xff;
-        var bright: i32 = if (bg & TB_BRIGHT) != 0 { 1 } else { 0 };
-        if (bg & TB_HI_BLACK) != 0 && idx == 0 {
-            idx = 1;
-            bright = 1;
-        }
-        if idx >= 1 && idx <= 8 {
-            let base: u64 = if bright != 0 { 100 } else { 40 };
-            let _ = outbuf_puts("\x1b[");
-            send_num(base + idx - 1);
-            let _ = outbuf_puts("m");
-        }
-    } else if mode == TB_OUTPUT_256 {
-        let idx = bg & 0xff;
-        if idx != 0 || (bg & TB_HI_BLACK) != 0 {
-            let _ = outbuf_puts("\x1b[48;5;");
-            send_num(idx);
-            let _ = outbuf_puts("m");
-        }
-    } else if mode == TB_OUTPUT_216 {
-        let idx = bg & 0xff;
-        if idx >= 1 && idx <= 216 {
-            let _ = outbuf_puts("\x1b[48;5;");
-            send_num(15 + idx);
-            let _ = outbuf_puts("m");
-        }
-    } else if mode == TB_OUTPUT_GRAYSCALE {
-        let idx = bg & 0xff;
-        if idx >= 1 && idx <= 24 {
-            let _ = outbuf_puts("\x1b[48;5;");
-            send_num(231 + idx);
-            let _ = outbuf_puts("m");
-        }
-    } else if mode == TB_OUTPUT_TRUECOLOR {
-        let rgb = bg & 0xffffff;
-        if rgb != 0 || (bg & TB_HI_BLACK) != 0 {
-            let r = (rgb >> 16) & 0xff;
-            let gch = (rgb >> 8) & 0xff;
-            let b = rgb & 0xff;
-            let _ = outbuf_puts("\x1b[48;2;");
-            send_num(r);
-            let _ = outbuf_puts(";");
-            send_num(gch);
-            let _ = outbuf_puts(";");
-            send_num(b);
-            let _ = outbuf_puts("m");
-        }
+fn emit_sgr_sep(g: tb_global&, first_param: i32) {
+    if first_param == 0 {
+        outbuf_push_byte(g, ';');
     }
 }
 
@@ -2676,21 +2645,107 @@ fn send_attr(fg: uintattr_t, bg: uintattr_t) -> i32 {
     let g = gbl();
     if fg == g.last_fg && bg == g.last_bg { return TB_OK; }
 
-    let _ = outbuf_puts("\x1b[m");
+    let mode = g.output_mode;
+    let force_reset: i32 = if g.last_fg == 0xffffffffffffffff || g.last_bg == 0xffffffffffffffff { 1 } else { 0 };
+    let new_style = fg & TB_STYLE_MASK;
+    let old_style = if force_reset != 0 { 0 } else { g.last_fg & TB_STYLE_MASK };
 
-    if fg & TB_BOLD        != 0 { let _ = outbuf_puts("\x1b[1m");  }
-    if fg & TB_DIM         != 0 { let _ = outbuf_puts("\x1b[2m");  }
-    if fg & TB_ITALIC      != 0 { let _ = outbuf_puts("\x1b[3m");  }
-    if fg & TB_UNDERLINE   != 0 { let _ = outbuf_puts("\x1b[4m");  }
-    if fg & TB_BLINK       != 0 { let _ = outbuf_puts("\x1b[5m");  }
-    if fg & TB_REVERSE     != 0 { let _ = outbuf_puts("\x1b[7m");  }
-    if fg & TB_INVISIBLE   != 0 { let _ = outbuf_puts("\x1b[8m");  }
-    if fg & TB_STRIKEOUT   != 0 { let _ = outbuf_puts(TB_HARDCAP_STRIKEOUT); }
-    if fg & TB_UNDERLINE_2 != 0 { let _ = outbuf_puts(TB_HARDCAP_UNDERLINE_2); }
-    if fg & TB_OVERLINE    != 0 { let _ = outbuf_puts(TB_HARDCAP_OVERLINE); }
+    let new_fg = eff_color(fg, mode);
+    let old_fg = if force_reset != 0 { 0x1000000 } else { eff_color(g.last_fg, mode) };
+    let new_bg = eff_color(bg, mode);
+    let old_bg = if force_reset != 0 { 0x1000000 } else { eff_color(g.last_bg, mode) };
 
-    send_sgr_color_fg(fg, g.output_mode);
-    send_sgr_color_bg(bg, g.output_mode);
+    if force_reset == 0 && new_style == old_style && new_fg == old_fg && new_bg == old_bg {
+        g.last_fg = fg;
+        g.last_bg = bg;
+        return TB_OK;
+    }
+
+    let need_reset: i32 =
+        if force_reset != 0 ||
+           (old_style & ~new_style) != 0 ||
+           (new_fg == 0x1000000 && old_fg != 0x1000000) ||
+           (new_bg == 0x1000000 && old_bg != 0x1000000) { 1 } else { 0 };
+
+    let emit_style: uintattr_t = if need_reset != 0 { new_style } else { new_style & ~old_style };
+    let emit_fg: i32 = if new_fg != 0x1000000 && (need_reset != 0 || new_fg != old_fg) { 1 } else { 0 };
+    let emit_bg: i32 = if new_bg != 0x1000000 && (need_reset != 0 || new_bg != old_bg) { 1 } else { 0 };
+
+    if need_reset != 0 && emit_style == 0 && emit_fg == 0 && emit_bg == 0 {
+        outbuf_push_byte(g, 0x1b);
+        outbuf_push_byte(g, '[');
+        outbuf_push_byte(g, 'm');
+    } else {
+        outbuf_push_byte(g, 0x1b);
+        outbuf_push_byte(g, '[');
+        var first_param: i32 = 1;
+        if need_reset != 0 {
+            outbuf_push_byte(g, '0');
+            first_param = 0;
+        }
+        if emit_style != 0 {
+            if (emit_style & TB_BOLD) != 0        { emit_sgr_sep(g, first_param); outbuf_push_byte(g, '1'); first_param = 0; }
+            if (emit_style & TB_DIM) != 0         { emit_sgr_sep(g, first_param); outbuf_push_byte(g, '2'); first_param = 0; }
+            if (emit_style & TB_ITALIC) != 0      { emit_sgr_sep(g, first_param); outbuf_push_byte(g, '3'); first_param = 0; }
+            if (emit_style & TB_UNDERLINE) != 0   { emit_sgr_sep(g, first_param); outbuf_push_byte(g, '4'); first_param = 0; }
+            if (emit_style & TB_BLINK) != 0       { emit_sgr_sep(g, first_param); outbuf_push_byte(g, '5'); first_param = 0; }
+            if (emit_style & TB_REVERSE) != 0     { emit_sgr_sep(g, first_param); outbuf_push_byte(g, '7'); first_param = 0; }
+            if (emit_style & TB_INVISIBLE) != 0   { emit_sgr_sep(g, first_param); outbuf_push_byte(g, '8'); first_param = 0; }
+            if (emit_style & TB_STRIKEOUT) != 0   { emit_sgr_sep(g, first_param); outbuf_push_byte(g, '9'); first_param = 0; }
+            if (emit_style & TB_UNDERLINE_2) != 0 { emit_sgr_sep(g, first_param); outbuf_push_byte(g, '2'); outbuf_push_byte(g, '1'); first_param = 0; }
+            if (emit_style & TB_OVERLINE) != 0    { emit_sgr_sep(g, first_param); outbuf_push_byte(g, '5'); outbuf_push_byte(g, '3'); first_param = 0; }
+        }
+        if emit_fg != 0 {
+            emit_sgr_sep(g, first_param);
+            first_param = 0;
+            if mode == TB_OUTPUT_TRUECOLOR {
+                outbuf_push_byte(g, '3');
+                outbuf_push_byte(g, '8');
+                outbuf_push_byte(g, ';');
+                outbuf_push_byte(g, '2');
+                outbuf_push_byte(g, ';');
+                outbuf_push_u8_dec(g, (new_fg >> 16) & 0xff);
+                outbuf_push_byte(g, ';');
+                outbuf_push_u8_dec(g, (new_fg >> 8) & 0xff);
+                outbuf_push_byte(g, ';');
+                outbuf_push_u8_dec(g, new_fg & 0xff);
+            } else if mode == TB_OUTPUT_NORMAL {
+                outbuf_push_u8_dec(g, new_fg);
+            } else {
+                outbuf_push_byte(g, '3');
+                outbuf_push_byte(g, '8');
+                outbuf_push_byte(g, ';');
+                outbuf_push_byte(g, '5');
+                outbuf_push_byte(g, ';');
+                outbuf_push_u8_dec(g, new_fg);
+            }
+        }
+        if emit_bg != 0 {
+            emit_sgr_sep(g, first_param);
+            if mode == TB_OUTPUT_TRUECOLOR {
+                outbuf_push_byte(g, '4');
+                outbuf_push_byte(g, '8');
+                outbuf_push_byte(g, ';');
+                outbuf_push_byte(g, '2');
+                outbuf_push_byte(g, ';');
+                outbuf_push_u8_dec(g, (new_bg >> 16) & 0xff);
+                outbuf_push_byte(g, ';');
+                outbuf_push_u8_dec(g, (new_bg >> 8) & 0xff);
+                outbuf_push_byte(g, ';');
+                outbuf_push_u8_dec(g, new_bg & 0xff);
+            } else if mode == TB_OUTPUT_NORMAL {
+                outbuf_push_u8_dec(g, new_bg + 10);
+            } else {
+                outbuf_push_byte(g, '4');
+                outbuf_push_byte(g, '8');
+                outbuf_push_byte(g, ';');
+                outbuf_push_byte(g, '5');
+                outbuf_push_byte(g, ';');
+                outbuf_push_u8_dec(g, new_bg);
+            }
+        }
+        outbuf_push_byte(g, 'm');
+    }
 
     g.last_fg = fg;
     g.last_bg = bg;
@@ -2704,11 +2759,13 @@ fn cell_cmp(a: tb_cell&, b: tb_cell&) -> i32 {
 
 fn send_cursor_if(x: i32, y: i32) -> i32 {
     if x < 0 || y < 0 { return TB_OK; }
-    let _ = outbuf_puts("\x1b[");
-    send_num((y + 1) as u64);
-    let _ = outbuf_puts(";");
-    send_num((x + 1) as u64);
-    let _ = outbuf_puts("H");
+    let g = gbl();
+    outbuf_push_byte(g, 0x1b);
+    outbuf_push_byte(g, '[');
+    outbuf_push_pos_dec(g, y + 1);
+    outbuf_push_byte(g, ';');
+    outbuf_push_pos_dec(g, x + 1);
+    outbuf_push_byte(g, 'H');
     return TB_OK;
 }
 
@@ -2718,6 +2775,26 @@ fn send_char(ch: u32) -> i32 {
     return outbuf_puts(buf[0..len]);
 }
 
+fn send_char_fast(g: tb_global&, ch: u32) {
+    if ch < 0x80 {
+        outbuf_push_byte(g, ch as u8);
+        return;
+    }
+    if ch == 0x2580 {
+        outbuf_push_byte(g, 0xe2);
+        outbuf_push_byte(g, 0x96);
+        outbuf_push_byte(g, 0x80);
+        return;
+    }
+    if ch == 0x2588 {
+        outbuf_push_byte(g, 0xe2);
+        outbuf_push_byte(g, 0x96);
+        outbuf_push_byte(g, 0x88);
+        return;
+    }
+    let _ = send_char(ch);
+}
+
 // Diff back buffer against front buffer, emit minimal ANSI cursor/SGR/UTF-8 sequences,
 // emit EGC combining codepoints, clip wide characters at the right edge, position cursor,
 // and flush to `wfd`.
@@ -2725,17 +2802,49 @@ fn tb_present() -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
 
+    let fw = g.front.width;
+    let fh = g.front.height;
+    let bw = g.back.width;
     var any_dirty: i32 = 0;
     var y = 0;
-    for y in g.front.height {
+    for y in fh {
         var x: i32 = 0;
-        while x < g.front.width {
-            let back_idx = y * g.back.width + x;
-            let front_idx = y * g.front.width + x;
+        let back_row = y * bw;
+        let front_row = y * fw;
+        while x < fw {
+            let back_idx = back_row + x;
+            let front_idx = front_row + x;
             let back = g.back.cells[back_idx];
             let front = g.front.cells[front_idx];
             let back_ech = g.back_ech_head[back_idx];
             let front_ech = g.front_ech_head[front_idx];
+
+            // Fast path for ASCII and block glyphs with no EGC chains
+            if back_ech < 0 && front_ech < 0 &&
+               ((back.ch >= 0x20 && back.ch <= 0x7e) || back.ch == 0x2580 || back.ch == 0x2588) {
+                if back.ch != front.ch || back.fg != front.fg || back.bg != front.bg {
+                    if any_dirty == 0 {
+                        let _ = outbuf_puts("\x1b[?2026h\x1b[m");
+                        g.last_fg = TB_DEFAULT;
+                        g.last_bg = TB_DEFAULT;
+                        g.last_x = -1;
+                        g.last_y = -1;
+                        any_dirty = 1;
+                    }
+                    g.front.cells[front_idx] = back;
+                    if back.fg != g.last_fg || back.bg != g.last_bg {
+                        let _ = send_attr(back.fg, back.bg);
+                    }
+                    if x != g.last_x + 1 || y != g.last_y {
+                        let _ = send_cursor_if(x, y);
+                    }
+                    send_char_fast(g, back.ch);
+                    g.last_x = x;
+                    g.last_y = y;
+                }
+                x = x + 1;
+                continue;
+            }
 
             let safe_ch: u32 = if back.ch == 0 || tb_iswprint(back.ch) == 0 { 0x20 } else { back.ch };
             let w = tb_wcwidth(safe_ch);
@@ -2743,7 +2852,7 @@ fn tb_present() -> i32 {
 
             if cell_cmp(back, front) != 0 || egc_cmp_chains(back_ech, front_ech) != 0 {
                 if any_dirty == 0 {
-                    let _ = outbuf_puts("\x1b[m");
+                    let _ = outbuf_puts("\x1b[?2026h\x1b[m");
                     g.last_fg = TB_DEFAULT;
                     g.last_bg = TB_DEFAULT;
                     g.last_x = -1;
@@ -2764,20 +2873,20 @@ fn tb_present() -> i32 {
                     let _ = send_cursor_if(x, y);
                 }
 
-                if w2 > 1 && x >= g.front.width - (w2 - 1) {
+                if w2 > 1 && x >= fw - (w2 - 1) {
                     var i = x;
-                    while i < g.front.width {
-                        let _ = send_char(0x20);
+                    while i < fw {
+                        outbuf_push_byte(g, ' ');
                         i = i + 1;
                     }
-                    g.last_x = g.front.width - 1;
+                    g.last_x = fw - 1;
                 } else {
-                    let _ = send_char(safe_ch);
+                    send_char_fast(g, safe_ch);
                     var cur_ech = back_ech;
                     while cur_ech >= 0 {
                         let ech_ch = g.egc_pool[cur_ech].ch;
                         if tb_iswprint(ech_ch) != 0 {
-                            let _ = send_char(ech_ch);
+                            send_char_fast(g, ech_ch);
                         }
                         cur_ech = g.egc_pool[cur_ech].next;
                     }
@@ -2789,8 +2898,8 @@ fn tb_present() -> i32 {
                 var wi_off = 1;
                 while wi_off < w2 {
                     let wi = x + wi_off;
-                    if wi < g.front.width {
-                        let wide_idx = y * g.front.width + wi;
+                    if wi < fw {
+                        let wide_idx = front_row + wi;
                         g.front.cells[wide_idx].ch = 0xffffffff;
                         g.front.cells[wide_idx].fg = 0xffffffffffffffff;
                         g.front.cells[wide_idx].bg = 0xffffffffffffffff;
@@ -2806,12 +2915,16 @@ fn tb_present() -> i32 {
         }
     }
 
-    if g.cursor_x >= 0 && g.cursor_x < g.front.width &&
-       g.cursor_y >= 0 && g.cursor_y < g.front.height &&
+    if g.cursor_x >= 0 && g.cursor_x < fw &&
+       g.cursor_y >= 0 && g.cursor_y < fh &&
        (g.cursor_x != g.last_x + 1 || g.cursor_y != g.last_y) {
         let _ = send_cursor_if(g.cursor_x, g.cursor_y);
         g.last_x = g.cursor_x;
         g.last_y = g.cursor_y;
+    }
+
+    if any_dirty != 0 {
+        let _ = outbuf_puts("\x1b[?2026l");
     }
 
     return outbuf_flush(g.wfd);
