@@ -16,12 +16,39 @@ fn expect(cond: i32, name: const u8[:]) {
     }
 }
 
-fn test_tutorial_and_fractal_scaling() {
-    init_new_game();
+fn count_hostiles() -> i32 {
     let st = core();
+    var cnt: i32 = 0;
+    var i: i32 = 0;
+    while i < MAX_ENTITIES {
+        if st.entities[i].active != 0 && st.entities[i].kind >= ENT_RAT && st.entities[i].kind <= ENT_SINGULARITY {
+            cnt = cnt + 1;
+        }
+        i = i + 1;
+    }
+    return cnt;
+}
+
+fn count_shrink_rings() -> i32 {
+    let st = core();
+    var cnt: i32 = 0;
+    var i: i32 = 0;
+    while i < MAX_ENTITIES {
+        if st.entities[i].active != 0 && (st.entities[i].kind == ENT_RING_GREEN || st.entities[i].kind == ENT_RING_PINK) {
+            cnt = cnt + 1;
+        }
+        i = i + 1;
+    }
+    return cnt;
+}
+
+fn test_tutorial_and_fractal_scaling() {
+    let st = core();
+    st.genesis_mode = 0;
+    init_new_game();
     st.screen = SCREEN_PLAY;
     expect(if st.depth == 0 { 1 } else { 0 }, "starts at depth 0");
-    expect(if st.stack[MACRO_OFFSET].biome == BIOME_TUTORIAL { 1 } else { 0 }, "starts in BIOME_TUTORIAL");
+    expect(if get_frame(0).biome == BIOME_TUTORIAL { 1 } else { 0 }, "starts in BIOME_TUTORIAL");
     expect(if point_collides(st.px, st.py, st.pz) == 0 { 1 } else { 0 }, "spawn is collision-free");
     expect(if get_block(8, 2, 9) == BLK_BLACK_CUBE { 1 } else { 0 }, "Tutorial Black Cube ahead");
 
@@ -34,7 +61,7 @@ fn test_tutorial_and_fractal_scaling() {
         step = step + 1;
     }
     expect(if st.depth == 1 { 1 } else { 0 }, "touching Tutorial Black Cube shrinks to depth 1");
-    expect(if st.stack[1 + MACRO_OFFSET].biome == BIOME_YING_FOREST { 1 } else { 0 }, "Tutorial Black Cube opens Ying Forest");
+    expect(if get_frame(1).biome == BIOME_YING_FOREST { 1 } else { 0 }, "Tutorial Black Cube opens Ying Forest");
     expect(if point_collides(st.px, st.py, st.pz) == 0 { 1 } else { 0 }, "Ying Forest spawn is collision-free");
 
     // 2) Test all 6 chunk-boundary exits grow back to depth 0 at the right face!
@@ -61,7 +88,7 @@ fn test_tutorial_and_fractal_scaling() {
     st.ring_cd_ms = 0;
     grow_out_axis(8.5, 16.5, 8.5);
     expect(if st.depth == -1 { 1 } else { 0 }, "exiting depth 0 reaches Outer Space depth -1");
-    expect(if st.stack[-1 + MACRO_OFFSET].biome == BIOME_SPACE { 1 } else { 0 }, "depth -1 biome is BIOME_SPACE");
+    expect(if get_frame(-1).biome == BIOME_SPACE { 1 } else { 0 }, "depth -1 biome is BIOME_SPACE");
     expect(if get_block(13, 8, 12) == BLK_MYLANTIS_M { 1 } else { 0 }, "Mylantis M block exists in Outer Space");
     expect(if point_collides(st.px, st.py, st.pz) == 0 { 1 } else { 0 }, "Outer Space exit is collision-free outside Ying Planet");
 
@@ -71,10 +98,96 @@ fn test_tutorial_and_fractal_scaling() {
     expect(if st.depth == 1 { 1 } else { 0 }, "2-step 256x shrink from -1 lands at depth 1");
 }
 
-fn test_weapons_and_physics() {
-    init_new_game();
+fn test_infinite_depth_and_early_peacefulness() {
     let st = core();
+    st.genesis_mode = 0;
+    init_new_game();
     st.screen = SCREEN_PLAY;
+
+    // 1) Authentic early-game peacefulness (0 enemies in Tutorial, Space -1, Ying Forest 1, Alpha Cube 2)
+    expect(if count_hostiles() == 0 { 1 } else { 0 }, "Tutorial (depth 0) is peaceful (0 enemies)");
+
+    st.ring_cd_ms = 0;
+    grow_out_axis(8.5, 16.5, 8.5);
+    expect(if st.depth == -1 && count_hostiles() == 0 { 1 } else { 0 }, "Space (depth -1) is peaceful (0 enemies)");
+
+    init_new_game();
+    st.screen = SCREEN_PLAY;
+    st.ring_cd_ms = 0;
+    shrink_into(8, 2, 9, BLK_BLACK_CUBE, -1, 1);
+    expect(if cur_biome() == BIOME_YING_FOREST && count_hostiles() == 0 { 1 } else { 0 }, "Early Ying Forest (depth 1) is peaceful");
+
+    st.ring_cd_ms = 0;
+    shrink_into(5, 2, 4, BLK_WHITE_FLOWER, -1, 1);
+    expect(if cur_biome() == BIOME_WHITE_FLOWER && count_hostiles() == 0 { 1 } else { 0 }, "Early Alpha Cube (depth 2) is peaceful");
+
+    // 2) Mid-game debut: Yellow Flower & Mylantis spawn enemies (Goblins/Rats/etc.)
+    st.ring_cd_ms = 0;
+    shrink_into(8, 2, 8, BLK_ALPHA_CUBE, -1, 1);
+    expect(if cur_biome() == BIOME_YELLOW_FLOWER && count_hostiles() >= 2 { 1 } else { 0 }, "Mid-game Yellow Flower spawns enemies");
+
+    st.ring_cd_ms = 0;
+    shrink_into(4, 2, 8, BLK_MYLANTIS_M, -1, 1);
+    expect(if cur_biome() == BIOME_MYLANTIS && count_hostiles() >= 2 { 1 } else { 0 }, "Mid-game Mylantis spawns enemies");
+
+    // 3) Inner Core still permits shrinking deeper (never dead-ends at depth 6!)
+    st.ring_cd_ms = 0;
+    shrink_into(4, 2, 8, BLK_CORE_GATE, BIOME_INNER_CORE, 1);
+    expect(if cur_biome() == BIOME_INNER_CORE { 1 } else { 0 }, "Core Gate enters Inner Core");
+    expect(if count_shrink_rings() >= 2 { 1 } else { 0 }, "Inner Core keeps Green/Pink Shrink Rings");
+
+    // 4) Unbounded Deep Shrinking: dive 250 levels deep, verify Long Marker & growing back!
+    init_new_game();
+    st.screen = SCREEN_PLAY;
+    var d: i32 = 0;
+    while d < 250 {
+        st.ring_cd_ms = 0;
+        shrink_targeted_block();
+        d = d + 1;
+    }
+    expect(if st.depth == 250 && st.max_depth_reached == 250 { 1 } else { 0 }, "Can shrink continuously to depth 250");
+    let seed_250 = cur_seed();
+    st.px = 7.7; st.py = 3.5; st.pz = 9.1;
+    drop_marker(1);
+    st.ring_cd_ms = 0;
+    grow_out_axis(8.0, 16.5, 8.0);
+    expect(if st.depth == 249 { 1 } else { 0 }, "Growing out from depth 250 decrements cleanly to 249");
+    let warped = warp_to_marker(st.active_marker);
+    expect(if warped == 1 && st.depth == 250 && cur_seed() == seed_250 { 1 } else { 0 }, "Deep Marker at depth 250 restores exact fractal stack");
+
+    // Can reach deep scale ceiling (3000) cleanly without overflowing
+    st.ring_cd_ms = 0;
+    shrink_into(8, 2, 8, BLK_BLACK_CUBE, -1, 2800);
+    expect(if st.depth == MAX_POS_DEPTH { 1 } else { 0 }, "Deep shrinking supports up to MAX_POS_DEPTH (3000)");
+
+    // 5) Genesis Mode removes all enemies everywhere
+    st.genesis_mode = 1;
+    init_new_game();
+    st.screen = SCREEN_PLAY;
+    st.ring_cd_ms = 0;
+    shrink_into(8, 2, 9, BLK_BLACK_CUBE, -1, 1);
+    st.ring_cd_ms = 0;
+    shrink_into(8, 5, 12, BLK_FLOWER_Y_CORE, BIOME_YELLOW_FLOWER, 1);
+    expect(if cur_biome() == BIOME_YELLOW_FLOWER && count_hostiles() == 0 { 1 } else { 0 }, "Genesis Mode has 0 enemies even in Yellow Flower");
+    st.ring_cd_ms = 0;
+    shrink_into(4, 2, 8, BLK_CORE_GATE, BIOME_INNER_CORE, 1);
+    expect(if cur_biome() == BIOME_INNER_CORE && count_hostiles() == 0 { 1 } else { 0 }, "Genesis Mode has 0 enemies in Inner Core");
+    st.genesis_mode = 0;
+}
+
+fn test_weapons_and_physics() {
+    let st = core();
+    st.genesis_mode = 0;
+    init_new_game();
+    st.screen = SCREEN_PLAY;
+
+    // 0) Classic progression starts with ONLY 1:Plasma unlocked; Weapon Modules unlock the rest
+    expect(if st.wep_unlocked[WEP_PLASMA] == 1 && st.wep_unlocked[WEP_RAILGUN] == 0 { 1 } else { 0 }, "Starts with Plasma unlocked and Railgun locked");
+    st.weapon = WEP_RAILGUN;
+    let rail_before = st.ammo[WEP_RAILGUN];
+    fire_weapon(0);
+    expect(if st.ammo[WEP_RAILGUN] == rail_before { 1 } else { 0 }, "Locked Railgun cannot fire until unlocked");
+    unlock_all_weapons();
 
     // 1) Rocket Mode low drag vs Standard drag + Brake
     st.rocket_mode = 0;
@@ -147,8 +260,9 @@ fn test_weapons_and_physics() {
 }
 
 fn test_economy_markers_and_respawn() {
-    init_new_game();
     let st = core();
+    st.genesis_mode = 0;
+    init_new_game();
     st.screen = SCREEN_PLAY;
 
     // Gold cap 1,000,000
@@ -163,10 +277,10 @@ fn test_economy_markers_and_respawn() {
     handle_sell_action(1); // Sell 25 HP for +20 Gold
     expect(if st.gold == 105 && st.hp == 65 { 1 } else { 0 }, "Sell Station converts HP to Gold");
 
-    // Black Market discounted Railgun
+    // Black Market discounted Railgun unlocks & adds ammo
     let r_before = st.ammo[WEP_RAILGUN];
     handle_black_market_action(1);
-    expect(if st.gold == 85 && st.ammo[WEP_RAILGUN] > r_before { 1 } else { 0 }, "Black Market sells discounted Railgun ammo");
+    expect(if st.gold == 85 && st.wep_unlocked[WEP_RAILGUN] == 1 && st.ammo[WEP_RAILGUN] > r_before { 1 } else { 0 }, "Black Market unlocks & sells discounted Railgun ammo");
 
     // Upgrade block collection & persistence
     collect_upgrade_block(3, 2, 12, BLK_UPG_HP);
@@ -204,6 +318,7 @@ extern fn exit_proc(code: i32) = "exit";
 
 fn main() {
     test_tutorial_and_fractal_scaling();
+    test_infinite_depth_and_early_peacefulness();
     test_weapons_and_physics();
     test_economy_markers_and_respawn();
 

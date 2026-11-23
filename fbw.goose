@@ -265,10 +265,15 @@ fn render_3d_world() {
     let ph = st.ph;
     if pw <= 0 || ph <= 0 { return; }
 
-    let sidx = st.depth + MACRO_OFFSET;
-    let biome = st.stack[sidx].biome;
-    let sky_top = biome_sky_top(biome);
-    let sky_bot = biome_sky_bot(biome);
+    let biome = cur_biome();
+    var sky_top = biome_sky_top(biome);
+    var sky_bot = biome_sky_bot(biome);
+    var deep256: i32 = 256;
+    if st.depth >= 500 {
+        deep256 = 256 - clamp_i(((st.depth - 500) * 184) / 1500, 0, 184);
+        sky_top = scale_rgb(sky_top, deep256 / 256.0);
+        sky_bot = scale_rgb(sky_bot, deep256 / 256.0);
+    }
     let star_sky = if biome == BIOME_SPACE || biome == BIOME_BLACK_CUBE || biome == BIOME_INNER_CORE || biome == BIOME_TUTORIAL { 1 } else { 0 };
     let star_col: u32 = pack_rgb(235, 242, 255) & 0xfcfcfc;
 
@@ -421,6 +426,12 @@ fn render_3d_world() {
                 let hy = ppy + rdy * hit_t;
                 let hz = ppz + rdz * hit_t;
                 out_col = shade_hit_block(hit_blk, hit_axis, hit_t, hx, hy, hz, row_sky);
+                if deep256 < 256 {
+                    let dr = ((((out_col >> 16) & 0xff) as! i32) * deep256) >> 8;
+                    let dg = ((((out_col >> 8) & 0xff) as! i32) * deep256) >> 8;
+                    let db = (((out_col & 0xff) as! i32) * deep256) >> 8;
+                    out_col = (((dr & 0xfc) as u32) << 16) | (((dg & 0xfc) as u32) << 8) | ((db & 0xfc) as u32);
+                }
                 out_z = hit_t;
             } else if allow_star != 0 {
                 let sh = ((px * 73856093) ^ (py * 19349663)) & 0x7fffffff;
@@ -499,7 +510,7 @@ fn render_3d_world() {
             else if k == ENT_RING_PINK { set_target_name("Pink Deep Dive Ring (256x)", 0, 0); }
             else if k == ENT_RAT { set_target_name("Rat", st.entities[ei].hp, st.entities[ei].max_hp); }
             else if k == ENT_SPIDER { set_target_name("Spider", st.entities[ei].hp, st.entities[ei].max_hp); }
-            else if k == ENT_GOON { set_target_name("Goon", st.entities[ei].hp, st.entities[ei].max_hp); }
+            else if k == ENT_GOBLIN { set_target_name("Goblin", st.entities[ei].hp, st.entities[ei].max_hp); }
             else if k == ENT_MARINE { set_target_name("Marine", st.entities[ei].hp, st.entities[ei].max_hp); }
             else if k == ENT_PIRATE { set_target_name("Pirate", st.entities[ei].hp, st.entities[ei].max_hp); }
             else if k == ENT_YINYANG { set_target_name("Yin Yang", st.entities[ei].hp, st.entities[ei].max_hp); }
@@ -818,15 +829,15 @@ fn draw_hud() {
     } else if st.near_prompt_len > 0 {
         let _ = tb_print(1, hud_y, ui_green() | TB_BOLD, ui_bg(), st.near_prompt[0..st.near_prompt_len]);
     } else {
-        let hint = if w >= 98 {
-            "WASD/Space/C:Fly | Q/E:Roll U:TrueUp | Tab:Rocket X:Brake | F:Use T:TK | R/RMB:2ndFire | F1-F5:Info"
+        let hint = if w >= 106 {
+            "WASD/Spc/C:Fly | Q/E:Roll U:TrueUp | Tab:Rkt X:Brk | F:Use B:Shrink H:ShrkAny | R/RMB:2nd | F1-F5"
         } else {
-            "WASD/Spc/C:Fly Q/E:Roll Tab:Rkt F:Use R:2ndFire G:Map F1-F5:Info"
+            "WASD/Spc/C:Fly Q/E:Roll F:Use B/H:Shrink R:2nd G:Map F1-F5"
         };
         let _ = tb_print(1, hud_y, ui_muted(), ui_bg(), hint);
     }
 
-    // Row 2: HP (+Regen), Armor, Gold, Keys, Depth, Biome, Coords, Active Marker
+    // Row 2: HP (+Regen), Armor, Gold, Keys, Depth, Biome, Coords, Active Mode Flags
     var sbuf: u8[160] = [0; 160];
     var slen: i32 = 0;
     buf_put_str(sbuf, slen, "HP:");
@@ -846,8 +857,7 @@ fn draw_hud() {
     buf_put_str(sbuf, slen, " | LVL:");
     buf_put_int(sbuf, slen, st.depth);
     buf_put_str(sbuf, slen, " [");
-    let sidx = st.depth + MACRO_OFFSET;
-    buf_put_str(sbuf, slen, biome_name(st.stack[sidx].biome));
+    buf_put_str(sbuf, slen, biome_name(cur_biome()));
     buf_put_str(sbuf, slen, "] (");
     buf_put_int(sbuf, slen, ffloor(st.px));
     buf_put_ch(sbuf, slen, ',');
@@ -857,6 +867,8 @@ fn draw_hud() {
     buf_put_ch(sbuf, slen, ')');
     if st.rocket_mode != 0 { buf_put_str(sbuf, slen, " RKT"); }
     if st.true_up == 0 { buf_put_str(sbuf, slen, " FREE-ROLL"); }
+    if st.shrink_any != 0 { buf_put_str(sbuf, slen, " SHRK-ANY"); }
+    if st.genesis_mode != 0 { buf_put_str(sbuf, slen, " GENESIS"); }
     if st.k_rescued != 0 { buf_put_str(sbuf, slen, " K:OK"); }
     let hp_col = if st.hp <= 25 { ui_red() | TB_BOLD } else { ui_white() | TB_BOLD };
     let _ = tb_print(1, hud_y + 1, hp_col, ui_bg(), sbuf[0..slen]);
@@ -867,12 +879,15 @@ fn draw_hud() {
     while wi < NUM_WEAPONS && cx + 8 < w {
         let tag = weapon_short_tag(wi);
         let is_cur = if wi == st.weapon { 1 } else { 0 };
-        let has_ammo = if wi == WEP_PLASMA || st.ammo[wi] > 0 { 1 } else { 0 };
+        let unlocked = st.wep_unlocked[wi];
+        let has_ammo = if unlocked != 0 && (wi == WEP_PLASMA || st.ammo[wi] > 0) { 1 } else { 0 };
         let fg: uintattr_t =
             if is_cur != 0 { ui_bg() | TB_BOLD }
             else if has_ammo != 0 { ui_white() }
             else { ui_muted() };
-        let bg: uintattr_t = if is_cur != 0 { ui_green() } else { ui_bg() };
+        let bg: uintattr_t =
+            if is_cur != 0 { if unlocked != 0 { ui_green() } else { ui_red() } }
+            else { ui_bg() };
         let _ = tb_print(cx, hud_y + 2, fg, bg, tag);
         cx = cx + (tag.len as! i32) + 1;
         wi = wi + 1;
@@ -880,12 +895,16 @@ fn draw_hud() {
 
     var abuf: u8[160] = [0; 160];
     var alen: i32 = 0;
-    buf_put_str(abuf, alen, "| Ammo:");
-    if st.weapon == WEP_PLASMA { buf_put_str(abuf, alen, "INF"); }
-    else {
-        buf_put_int(abuf, alen, st.ammo[st.weapon]);
-        buf_put_ch(abuf, alen, '/');
-        buf_put_int(abuf, alen, st.max_ammo[st.weapon]);
+    if st.wep_unlocked[st.weapon] == 0 {
+        buf_put_str(abuf, alen, "| LOCKED(Module/Buy)");
+    } else {
+        buf_put_str(abuf, alen, "| Ammo:");
+        if st.weapon == WEP_PLASMA { buf_put_str(abuf, alen, "INF"); }
+        else {
+            buf_put_int(abuf, alen, st.ammo[st.weapon]);
+            buf_put_ch(abuf, alen, '/');
+            buf_put_int(abuf, alen, st.max_ammo[st.weapon]);
+        }
     }
     if st.active_marker >= 0 && st.markers[st.active_marker].used != 0 {
         buf_put_str(abuf, alen, " M");
@@ -923,26 +942,27 @@ fn draw_title_screen() {
         y = y + 1;
     }
 
-    let mw = if w >= 72 { 70 } else { w - 2 };
-    let mh = if h >= 22 { 21 } else { h - 2 };
+    let mw = if w >= 74 { 72 } else { w - 2 };
+    let mh = if h >= 23 { 22 } else { h - 2 };
     let cx = (w - mw) / 2;
     let cy = (h - mh) / 2;
     draw_rect(cx, cy, mw, mh, ui_cyan() | TB_BOLD, ui_panel_bg());
 
     let _ = tb_print(cx + 3, cy + 2, ui_yellow() | TB_BOLD, ui_panel_bg(), "FRACTAL BLOCK WORLD (XAR) — TERMINAL EDITION");
-    let _ = tb_print(cx + 3, cy + 3, ui_green(), ui_panel_bg(),           "16x16x16 Recursive Fractal World (termbox2.goose)");
-    let _ = tb_print(cx + 3, cy + 5, ui_white(), ui_panel_bg(),           "Start in the Tutorial Room: fly into the Black Cube to");
-    let _ = tb_print(cx + 3, cy + 6, ui_white(), ui_panel_bg(),           "shrink into Ying Forest, or exit any of the 6 chunk");
-    let _ = tb_print(cx + 3, cy + 7, ui_white(), ui_panel_bg(),           "faces to grow 16x outward into Outer Space & Mylantis!");
-    let _ = tb_print(cx + 3, cy + 8, ui_magenta(), ui_panel_bg(),         "Explore Small White/Yellow Flowers, I2 & Core to rescue K.");
+    let _ = tb_print(cx + 3, cy + 3, ui_green(), ui_panel_bg(),           "16x16x16 Recursive World — Shrink Up to 3,000 Levels Deep!");
+    let _ = tb_print(cx + 3, cy + 5, ui_white(), ui_panel_bg(),           "Early game (Tutorial, Space -1, Ying Forest 1, Alpha Cube) is");
+    let _ = tb_print(cx + 3, cy + 6, ui_white(), ui_panel_bg(),           "peaceful: unlock Weapons 2..0 via Modules & Buy Stations, then");
+    let _ = tb_print(cx + 3, cy + 7, ui_white(), ui_panel_bg(),           "brave Yellow Flowers, Mylantis & I2 Menger Lattice -> Core!");
+    let _ = tb_print(cx + 3, cy + 8, ui_magenta(), ui_panel_bg(),         "Shrink into Portals, Green/Pink Rings, [B] Block or [H] ShrinkAny.");
 
     let _ = tb_print(cx + 3, cy + 10, ui_cyan() | TB_BOLD, ui_panel_bg(), "WASD / Space / C(Z): 6-DOF Flight | Q/E: Roll | U: TrueUp");
     let _ = tb_print(cx + 3, cy + 11, ui_white(), ui_panel_bg(),          "Arrows/IJKL/Mouse: Aim | LMB/Enter: Fire | R/RMB: 2nd Fire");
     let _ = tb_print(cx + 3, cy + 12, ui_white(), ui_panel_bg(),          "1-9,0: 10 Weapons (Recoil Boost!) | Tab: Rocket | X: Brake");
-    let _ = tb_print(cx + 3, cy + 13, ui_white(), ui_panel_bg(),          "F: Use Station/Tome/Key | T: Telekinesis | M/N: Markers");
-    let _ = tb_print(cx + 3, cy + 14, ui_white(), ui_panel_bg(),          "F1-F5: Controls/Stats/Weapons/Markers/Lore | P/Esc: Pause");
+    let _ = tb_print(cx + 3, cy + 13, ui_white(), ui_panel_bg(),          "F: Use | B: Shrink Block | H: ShrinkAny | T: TK | M/N: Markers");
+    let _ = tb_print(cx + 3, cy + 14, ui_white(), ui_panel_bg(),          "F1-F5: Controls/Stats/Weapons/Markers/Lore | O: 2x | P: Pause");
 
-    let _ = tb_print(cx + 3, cy + 17, ui_green() | TB_BOLD, ui_panel_bg(), ">>> Press [ENTER] or [SPACE] to Enter Xar  ([Q] Quit) <<<");
+    let _ = tb_print(cx + 3, cy + 17, ui_green() | TB_BOLD, ui_panel_bg(),  "[ENTER / SPACE] Classic Xar Mode   ([Q] Quit)");
+    let _ = tb_print(cx + 3, cy + 18, ui_cyan() | TB_BOLD, ui_panel_bg(),   "[G]             Genesis Mode (Peaceful Exploration, 0 Enemies)");
     let _ = tb_present();
 }
 
@@ -1051,7 +1071,7 @@ fn draw_tome_modal() {
 fn draw_info_f1() {
     let st = core();
     let mw = if st.term_w >= 68 { 66 } else { st.term_w - 4 };
-    let mh: i32 = 17;
+    let mh: i32 = 18;
     let mx = (st.term_w - mw) / 2;
     let my = (st.term_h - mh) / 2;
     draw_rect(mx, my, mw, mh, ui_cyan() | TB_BOLD, ui_panel_bg());
@@ -1062,11 +1082,12 @@ fn draw_info_f1() {
     let _ = tb_print(mx + 2, my + 6, ui_white(), ui_panel_bg(), "Tab / X           : Toggle Rocket Mode (Low Drag) / Brake");
     let _ = tb_print(mx + 2, my + 7, ui_white(), ui_panel_bg(), "Arrows/IJKL/Mouse : Look Yaw & Pitch");
     let _ = tb_print(mx + 2, my + 8, ui_white(), ui_panel_bg(), "LMB / Enter       : Primary Fire  | RMB / R : Secondary Fire");
-    let _ = tb_print(mx + 2, my + 9, ui_white(), ui_panel_bg(), "1..9, 0 / Wheel   : Select 10 Weapons");
+    let _ = tb_print(mx + 2, my + 9, ui_white(), ui_panel_bg(), "1..9, 0 / Wheel   : Select 10 Weapons (Start w/ Plasma)");
     let _ = tb_print(mx + 2, my + 10, ui_white(), ui_panel_bg(), "F / T             : Use (Stations/Doors/K) / Telekinesis");
-    let _ = tb_print(mx + 2, my + 11, ui_white(), ui_panel_bg(), "M / N             : Drop Short Marker / Long Marker");
-    let _ = tb_print(mx + 2, my + 12, ui_white(), ui_panel_bg(), "G / O / V / P     : Minimap / Fast 2x / 24-bit Color / Pause");
-    let _ = tb_print(mx + 2, my + 14, ui_green() | TB_BOLD, ui_panel_bg(), "Press [F1] or [ESC] to close");
+    let _ = tb_print(mx + 2, my + 11, ui_white(), ui_panel_bg(), "B / H             : Shrink Targeted Block / Toggle ShrinkAny");
+    let _ = tb_print(mx + 2, my + 12, ui_white(), ui_panel_bg(), "M / N             : Drop Short Marker / Long Marker");
+    let _ = tb_print(mx + 2, my + 13, ui_white(), ui_panel_bg(), "G / O / V / P     : Minimap / Fast 2x / 24-bit Color / Pause");
+    let _ = tb_print(mx + 2, my + 15, ui_green() | TB_BOLD, ui_panel_bg(), "Press [F1] or [ESC] to close");
 }
 
 fn draw_info_f2() {
@@ -1186,22 +1207,22 @@ fn draw_info_f4() {
 
 fn draw_info_f5() {
     let st = core();
-    let mw = if st.term_w >= 70 { 68 } else { st.term_w - 4 };
+    let mw = if st.term_w >= 72 { 70 } else { st.term_w - 4 };
     let mh: i32 = 17;
     let mx = (st.term_w - mw) / 2;
     let my = (st.term_h - mh) / 2;
     draw_rect(mx, my, mw, mh, ui_orange() | TB_BOLD, ui_panel_bg());
     let _ = tb_print(mx + 2, my + 1, ui_orange() | TB_BOLD, ui_panel_bg(), "[F5] XAR BIOME PROGRESSION & MONSTER MANUAL");
 
-    let _ = tb_print(mx + 2, my + 3, ui_cyan(), ui_panel_bg(),  "Space (LVL -1): Mylantis 'M', Ying Planet, Ice/Desert Worlds");
-    let _ = tb_print(mx + 2, my + 4, ui_cyan(), ui_panel_bg(),  "Tutorial (0)  : Black Cube -> Ying Forest | White Flower -> Alpha");
-    let _ = tb_print(mx + 2, my + 5, ui_cyan(), ui_panel_bg(),  "Deep Fractals : Yellow Flower -> Mylantis -> I2 Menger -> Core");
-    let _ = tb_print(mx + 2, my + 7, ui_white(), ui_panel_bg(), "Rats & Spiders : Fast close-range cave swarmers");
-    let _ = tb_print(mx + 2, my + 8, ui_white(), ui_panel_bg(), "Goons/Marines  : Ranged soldiers dropping Gold & Ammo");
-    let _ = tb_print(mx + 2, my + 9, ui_white(), ui_panel_bg(), "Pirates/Menaces: Heavy space & flower patrols");
-    let _ = tb_print(mx + 2, my + 10, ui_white(), ui_panel_bg(), "YinYangs/Demons: Ying Forest & Mylantis/I2 elites");
-    let _ = tb_print(mx + 2, my + 11, ui_white(), ui_panel_bg(), "Guardians      : Pool-ball tanks (freeze w/ Laser 2nd or EMP!)");
-    let _ = tb_print(mx + 2, my + 12, ui_magenta() | TB_BOLD, ui_panel_bg(), "The Singularity: Inner Core boss protecting Friend K");
+    let _ = tb_print(mx + 2, my + 3, ui_cyan(), ui_panel_bg(),  "Early (Peaceful): Tutorial (0) <-> Space (-1) & Ying Forest (1)");
+    let _ = tb_print(mx + 2, my + 4, ui_cyan(), ui_panel_bg(),  "Alpha Cube (2)  : Weapon Modules & upgrades before combat starts");
+    let _ = tb_print(mx + 2, my + 5, ui_cyan(), ui_panel_bg(),  "Mid->Deep (3000): Yellow Flower -> Mylantis -> I2 Menger -> Core");
+    let _ = tb_print(mx + 2, my + 7, ui_white(), ui_panel_bg(), "Rats & Spiders  : Fast cave swarmers (Yellow Flower / Mylantis)");
+    let _ = tb_print(mx + 2, my + 8, ui_white(), ui_panel_bg(), "Goblins/Marines : First ranged enemy patrols dropping Gold/Ammo");
+    let _ = tb_print(mx + 2, my + 9, ui_white(), ui_panel_bg(), "Pirates/Menaces : Heavy deep-space & flower defenders");
+    let _ = tb_print(mx + 2, my + 10, ui_white(), ui_panel_bg(), "YinYangs/Demons : Deep Ying Forest (LVL 3+) & Mylantis elites");
+    let _ = tb_print(mx + 2, my + 11, ui_white(), ui_panel_bg(), "Guardians       : Pool-ball tanks (freeze w/ Laser 2nd or EMP!)");
+    let _ = tb_print(mx + 2, my + 12, ui_magenta() | TB_BOLD, ui_panel_bg(), "The Singularity : Inner Core boss protecting Friend K");
     let _ = tb_print(mx + 2, my + 14, ui_green() | TB_BOLD, ui_panel_bg(), "Press [F5] or [ESC] to close");
 }
 
@@ -1298,6 +1319,12 @@ fn handle_key(ev: tb_event&) -> i32 {
     if st.screen == SCREEN_TITLE {
         if key == TB_KEY_ESC || ch == 'q' || ch == 'Q' { return 0; }
         if key == TB_KEY_ENTER || key == TB_KEY_SPACE || ch == ' ' {
+            st.genesis_mode = 0;
+            init_new_game();
+            st.screen = SCREEN_PLAY;
+        } else if ch == 'g' || ch == 'G' {
+            st.genesis_mode = 1;
+            init_new_game();
             st.screen = SCREEN_PLAY;
         }
         return 1;
@@ -1396,8 +1423,20 @@ fn handle_key(ev: tb_event&) -> i32 {
     }
 
     // 10 Weapons: 1..9 -> slots 0..8, 0 -> slot 9 (Dark Hole / Quasar)
-    if ch >= '1' && ch <= '9' { st.weapon = (ch - '1') as! i32; return 1; }
-    if ch == '0' { st.weapon = WEP_DARKHOLE; return 1; }
+    if ch >= '1' && ch <= '9' {
+        st.weapon = (ch - '1') as! i32;
+        if st.wep_unlocked[st.weapon] == 0 {
+            set_status_msg("Weapon locked! Find Weapon Module or Buy Station to unlock.", 1400);
+        }
+        return 1;
+    }
+    if ch == '0' {
+        st.weapon = WEP_DARKHOLE;
+        if st.wep_unlocked[st.weapon] == 0 {
+            set_status_msg("Weapon locked! Find Weapon Module or Buy Station to unlock.", 1400);
+        }
+        return 1;
+    }
 
     // Camera Roll (Q/E) & True Up (U)
     if ch == 'q' || ch == 'Q' { st.roll = wrap_angle(st.roll - 0.14); return 1; }
@@ -1408,8 +1447,14 @@ fn handle_key(ev: tb_event&) -> i32 {
         return 1;
     }
 
-    // Use / Telekinesis / Brake / Markers / Fire
+    // Use / Shrink Target / ShrinkAny / Telekinesis / Brake / Markers / Fire
     if ch == 'f' || ch == 'F' { use_nearest(); return 1; }
+    if ch == 'b' || ch == 'B' { shrink_targeted_block(); return 1; }
+    if ch == 'h' || ch == 'H' {
+        st.shrink_any = if st.shrink_any != 0 { 0 } else { 1 };
+        set_status_msg(if st.shrink_any != 0 { "ShrinkAny ON: Fly into ANY solid block to shrink 16x!" } else { "ShrinkAny OFF (Normal fractal portals)" }, 1600);
+        return 1;
+    }
     if ch == 't' || ch == 'T' { trigger_telekinesis(); return 1; }
     if ch == 'x' || ch == 'X' { apply_brake(); return 1; }
     if ch == 'm' || ch == 'M' { drop_marker(0); return 1; }

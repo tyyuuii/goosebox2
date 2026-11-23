@@ -8,8 +8,8 @@ const HALF_PI: f64 = 1.57079632679489661923;
 const CHUNK_DIM: i32 = 16;
 const CHUNK_VOL: i32 = 4096;
 
-const MACRO_OFFSET: i32 = 8;
-const MAX_STACK: i32 = 64;
+const MAX_POS_DEPTH: i32 = 3000;
+const MAX_NEG_DEPTH: i32 = -128;
 
 const MAX_ENTITIES: i32 = 96;
 const MAX_SHOTS: i32 = 72;
@@ -89,6 +89,7 @@ const BLK_UPG_ROF: u8 = 40;
 const BLK_UPG_AMMO: u8 = 41;
 const BLK_UPG_SPEED: u8 = 42;
 const BLK_KEY_BLOCK: u8 = 43;
+const BLK_UPG_WEP: u8 = 44;
 
 // Entity kinds
 const ENT_NONE: i32 = 0;
@@ -101,6 +102,7 @@ const ENT_RING_PINK: i32 = 4;   // Deep Dive 256x (2 levels)
 const ENT_RAT: i32 = 5;
 const ENT_SPIDER: i32 = 6;
 const ENT_GOON: i32 = 7;
+const ENT_GOBLIN: i32 = 7;
 const ENT_MARINE: i32 = 8;
 const ENT_PIRATE: i32 = 9;
 const ENT_YINYANG: i32 = 10;
@@ -201,7 +203,10 @@ struct Marker {
     py: f64,
     pz: f64,
     biome: i32,
-    stack: ScaleFrame[MAX_STACK],
+    pos_off: i32,
+    pos_cnt: i32,
+    neg_off: i32,
+    neg_cnt: i32,
 }
 
 root struct fbw_state {
@@ -216,10 +221,15 @@ root struct fbw_state {
     render_scale: i32,
     is_termux: i32,
     modal_bg_ready: i32,
+    genesis_mode: i32, // 1 = Peaceful Genesis Mode (no monsters)
+    shrink_any: i32,   // 1 = Shrink into ANY touched block (Xar 'shrinkany')
 
-    // Recursive 16x16x16 world stack
+    // Unbounded recursive 16x16x16 world stack (-128..3000)
     blocks: u8[CHUNK_VOL],
-    stack: ScaleFrame[MAX_STACK],
+    pos_stack: ScaleFrame[>..],
+    neg_stack: ScaleFrame[>..],
+    marker_frames: ScaleFrame[>..],
+    marker_frames_len: i32,
     depth: i32, // 0 = Tutorial Island, <0 = Outer Space, >0 = Deep Fractals
     max_depth_reached: i32,
     min_depth_reached: i32,
@@ -254,6 +264,7 @@ root struct fbw_state {
 
     // 10 Weapons & Upgrade levels
     weapon: i32,
+    wep_unlocked: i32[NUM_WEAPONS],
     ammo: i32[NUM_WEAPONS],
     max_ammo: i32[NUM_WEAPONS],
     dmg_lvl: i32,
@@ -526,10 +537,47 @@ fn set_block(x: i32, y: i32, z: i32, b: u8) {
     st.blocks[b_idx(x, y, z)] = b;
 }
 
+fn ensure_depth_slot(d: i32) {
+    if d >= 0 {
+        while (st.pos_stack.len as! i32) <= d {
+            st.pos_stack.push(ScaleFrame {
+                bx: 8, by: 6, bz: 8,
+                biome: BIOME_BLACK_CUBE, parent_block: BLK_BLACK_CUBE, seed: 0
+            });
+        }
+    } else {
+        let ni = (-d) - 1;
+        while (st.neg_stack.len as! i32) <= ni {
+            st.neg_stack.push(ScaleFrame {
+                bx: 8, by: 6, bz: 8,
+                biome: BIOME_SPACE, parent_block: BLK_YING_PLANET, seed: 0
+            });
+        }
+    }
+}
+
+fn get_frame(d: i32) -> ScaleFrame {
+    ensure_depth_slot(d);
+    if d >= 0 { return st.pos_stack[d]; }
+    return st.neg_stack[(-d) - 1];
+}
+
+fn set_frame(d: i32, f: ScaleFrame) {
+    ensure_depth_slot(d);
+    if d >= 0 { st.pos_stack[d] = f; }
+    else { st.neg_stack[(-d) - 1] = f; }
+}
+
+fn cur_biome() -> i32 {
+    return get_frame(st.depth).biome;
+}
+
+fn cur_seed() -> u64 {
+    return get_frame(st.depth).seed;
+}
+
 fn record_block_delta(bx: i32, by: i32, bz: i32, b: u8) {
-    let sidx = st.depth + MACRO_OFFSET;
-    if sidx < 0 || sidx >= MAX_STACK { return; }
-    let seed = st.stack[sidx].seed;
+    let seed = cur_seed();
     var i: i32 = 0;
     while i < MAX_DELTAS {
         if st.deltas[i].used != 0 &&
@@ -567,7 +615,7 @@ fn is_block_shrinkable(b: u8) -> i32 {
 }
 
 fn is_block_upgrade(b: u8) -> i32 {
-    if b >= BLK_UPG_HP && b <= BLK_KEY_BLOCK { return 1; }
+    if b >= BLK_UPG_HP && b <= BLK_UPG_WEP { return 1; }
     return 0;
 }
 
@@ -611,11 +659,13 @@ fn block_label(b: u8) -> const u8[:] {
     if b == BLK_ICE_WORLD { return "Ice World Block (Shrink)"; }
     if b == BLK_DESERT_WORLD { return "Desert Pyramid (Shrink)"; }
     if b == BLK_CORE_GATE { return "Core Gate (Shrink to Singularity)"; }
+    if b == BLK_UPG_WEP { return "Weapon Arsenal Module"; }
     if b == BLK_BUY_STATION { return "Buy Station [F]"; }
     if b == BLK_SELL_STATION { return "Sell Station [F]"; }
     if b == BLK_BLACK_MARKET { return "Black Market [F]"; }
     if b == BLK_TOME { return "Xar Manual Tome [F]"; }
     if b == BLK_LOCKED_DOOR { return "Locked Vault Door [F: Key]"; }
+    if st.shrink_any != 0 { return "Solid Block (ShrinkAny ON: Fly/Press B)"; }
     return "";
 }
 
@@ -658,6 +708,7 @@ fn block_base_rgb(b: u8) -> u32 {
     if b == BLK_UPG_AMMO { return pack_rgb(168, 85, 247); }
     if b == BLK_UPG_SPEED { return pack_rgb(34, 211, 238); }
     if b == BLK_KEY_BLOCK { return pack_rgb(253, 224, 71); }
+    if b == BLK_UPG_WEP { return pack_rgb(34, 230, 148); }
     return pack_rgb(128, 128, 128);
 }
 
@@ -763,25 +814,25 @@ fn pick_biome_for_entry(depth: i32, parent_blk: u8, forced_biome: i32, seed: u64
     if forced_biome >= 0 { return forced_biome; }
     if depth < 0 { return BIOME_SPACE; }
     if depth == 0 { return BIOME_TUTORIAL; }
+    if parent_blk == BLK_CORE_GATE { return BIOME_INNER_CORE; }
     if parent_blk == BLK_WHITE_FLOWER { return BIOME_WHITE_FLOWER; }
-    if parent_blk == BLK_ALPHA_CUBE { return BIOME_YELLOW_FLOWER; }
-    if parent_blk == BLK_FLOWER_Y_CORE { return BIOME_YELLOW_FLOWER; }
+    if parent_blk == BLK_ALPHA_CUBE || parent_blk == BLK_FLOWER_Y_CORE || parent_blk == BLK_DESERT_WORLD {
+        return BIOME_YELLOW_FLOWER;
+    }
     if parent_blk == BLK_YING_PLANET { return BIOME_YING_FOREST; }
-    if parent_blk == BLK_MYLANTIS_M { return BIOME_MYLANTIS; }
-    if parent_blk == BLK_ICE_WORLD { return BIOME_MYLANTIS; }
-    if parent_blk == BLK_DESERT_WORLD { return BIOME_YELLOW_FLOWER; }
-    if parent_blk == BLK_CORE_GATE || depth >= 6 { return BIOME_INNER_CORE; }
+    if parent_blk == BLK_MYLANTIS_M || parent_blk == BLK_ICE_WORLD { return BIOME_MYLANTIS; }
     if parent_blk == BLK_BLACK_CUBE {
-        // Famous FBW rule: Black Cube in Tutorial -> Ying Forest! Deeper Black Cubes -> I1/I2/I3 Menger Lattice!
+        // Tutorial Black Cube -> Ying Forest! Deeper Black Cubes -> I1/I2/I3 Menger Lattice forever!
         if depth == 1 { return BIOME_YING_FOREST; }
         return BIOME_BLACK_CUBE;
     }
-    let r = (splitmix64(seed) % 4) as! i32;
     if depth == 1 { return BIOME_YING_FOREST; }
     if depth == 2 { return BIOME_YELLOW_FLOWER; }
-    if depth == 3 { return BIOME_MYLANTIS; }
-    if depth == 4 || depth == 5 || r == 3 { return BIOME_BLACK_CUBE; }
-    return BIOME_INNER_CORE;
+    let r = (splitmix64(seed) % 5) as! i32;
+    if r == 0 { return BIOME_YING_FOREST; }
+    if r == 1 { return BIOME_YELLOW_FLOWER; }
+    if r == 2 { return BIOME_MYLANTIS; }
+    return BIOME_BLACK_CUBE;
 }
 
 fn build_ying_tree(tx: i32, tz: i32, base_y: i32, h: i32, has_fruit: i32) {
@@ -815,9 +866,8 @@ fn build_ying_tree(tx: i32, tz: i32, base_y: i32, h: i32, has_fruit: i32) {
     }
 }
 
-fn generate_space_chunk() {
-    // Outer Space Level 0: Floating macro worlds (Ying World, Mylantis M, Ice World, Desert, Black Cube)
-    // Ying World Planet (center-south)
+fn generate_space_chunk(depth: i32) {
+    // Outer Space: Floating macro worlds (Ying World, Mylantis M, Ice World, Desert, Black Cube)
     var dz: i32 = -1;
     while dz <= 1 {
         var dy: i32 = -1;
@@ -848,14 +898,19 @@ fn generate_space_chunk() {
     set_block(12, 4, 4, BLK_BLACK_CUBE);
     set_block(12, 5, 4, BLK_BLACK_CUBE);
 
-    let _ = spawn_entity(ENT_RING_GREEN, 8.5, 8.2, 8.5, 1, BIOME_TUTORIAL, BLK_YING_PLANET);
-    let _ = spawn_entity(ENT_MENACE, 5.5, 8.0, 6.5, 65, -1, 0);
-    let _ = spawn_entity(ENT_PIRATE, 11.5, 7.5, 8.0, 55, -1, 0);
+    let _ = spawn_entity(ENT_RING_GREEN, 8.5, 8.2, 8.5, 1, if depth == -1 { BIOME_TUTORIAL } else { BIOME_YING_FOREST }, BLK_YING_PLANET);
+    let _ = spawn_entity(ENT_RING_RED, 8.5, 13.8, 8.5, 1, BIOME_SPACE, BLK_AIR);
     let _ = spawn_entity(ENT_GOLD, 8.5, 8.5, 11.5, 1, -1, 0);
+
+    // Outer Space Level -1 right outside Tutorial is peaceful; deep cosmic void (-3+) has space raiders
+    if depth <= -3 && st.genesis_mode == 0 {
+        let _ = spawn_entity(ENT_MENACE, 5.5, 8.0, 6.5, 65, -1, 0);
+        let _ = spawn_entity(ENT_PIRATE, 11.5, 7.5, 8.0, 55, -1, 0);
+    }
 }
 
 fn generate_tutorial_island() {
-    // Tutorial Island floor (y=1 grass, y=0 dirt)
+    // Peaceful Tutorial Island (0 enemies — pure Xar movement, rings, tome & shop intro)
     var z: i32 = 2;
     while z <= 13 {
         var x: i32 = 2;
@@ -867,7 +922,7 @@ fn generate_tutorial_island() {
         z = z + 1;
     }
 
-    // Tutorial Room enclosure around (x=5..11, y=2..6, z=3..11) with open front-top skylight & east exit
+    // Tutorial Room enclosure around (x=5..11, y=2..6, z=3..11) with skylight & east doorway
     var ry: i32 = 2;
     while ry <= 6 {
         var rz: i32 = 3;
@@ -876,7 +931,6 @@ fn generate_tutorial_island() {
             while rx <= 11 {
                 let wall = if rx == 5 || rx == 11 || rz == 3 || rz == 11 || ry == 6 { 1 } else { 0 };
                 if wall != 0 {
-                    // Leave east doorway (rx==11, rz=6..8, ry=2..4) and central ceiling skylight (rx=7..9, rz=6..8)
                     let is_door = if rx == 11 && rz >= 6 && rz <= 8 && ry >= 2 && ry <= 4 { 1 } else { 0 };
                     let is_sky = if ry == 6 && rx >= 7 && rx <= 9 && rz >= 6 && rz <= 8 { 1 } else { 0 };
                     if is_door == 0 && is_sky == 0 {
@@ -890,14 +944,14 @@ fn generate_tutorial_island() {
         ry = ry + 1;
     }
 
-    // Iconic Tutorial Black Cube straight ahead at (8, 2..3, 9) — shrinking into it leads directly to Ying Forest!
+    // Iconic Tutorial Black Cube straight ahead at (8, 2..3, 9) — shrinking into it leads to Ying Forest!
     set_block(8, 2, 9, BLK_BLACK_CUBE);
     set_block(8, 3, 9, BLK_BLACK_CUBE);
-    set_block(6, 2, 7, BLK_TOME);       // Xar Tutorial Tome
+    set_block(6, 2, 7, BLK_TOME);        // Xar Tutorial Tome
     set_block(10, 2, 7, BLK_BUY_STATION); // Tutorial Buy Station
     set_block(6, 2, 9, BLK_CRATE);        // Destructible crate with starting Gold
 
-    // Outside Tutorial Room on the Island: Small White Flower (leads to Alpha Cube!) + Ying Tree + Grow Ring
+    // Outside Tutorial Room: Small White Flower (Alpha Cube), HP Upgrade, Sell Station
     set_block(13, 2, 8, BLK_WOOD);
     set_block(13, 3, 8, BLK_PETAL_W);
     set_block(12, 3, 8, BLK_PETAL_W);
@@ -905,19 +959,15 @@ fn generate_tutorial_island() {
     set_block(13, 4, 8, BLK_WHITE_FLOWER);
     let _ = spawn_entity(ENT_RING_GREEN, 13.5, 4.9, 8.5, 1, BIOME_WHITE_FLOWER, BLK_WHITE_FLOWER);
 
-    // Health Upgrade + Sell Station outside
     set_block(3, 2, 12, BLK_UPG_HP);
     set_block(13, 2, 3, BLK_SELL_STATION);
 
-    // Floating Red Grow Ring above skylight -> Outer Space Level 0
+    // Floating Red Grow Ring above skylight -> Outer Space LVL -1
     let _ = spawn_entity(ENT_RING_RED, 8.5, 11.5, 7.5, 1, BIOME_SPACE, BLK_AIR);
-
-    // Friendly early Goon & Gold pickup
-    let _ = spawn_entity(ENT_GOON, 13.0, 2.6, 12.0, 25, -1, 0);
     let _ = spawn_entity(ENT_GOLD, 8.5, 2.5, 6.5, 1, -1, 0);
 }
 
-fn generate_ying_forest(seed: u64) {
+fn generate_ying_forest(depth: i32, seed: u64) {
     var z: i32 = 0;
     while z < CHUNK_DIM {
         var x: i32 = 0;
@@ -937,13 +987,13 @@ fn generate_ying_forest(seed: u64) {
     build_ying_tree(12, 12, 2, 4, 0);
     build_ying_tree(13, 3, 2, 5, 1);
 
-    // Totem Pole + Health House
+    // Totem Pole + Health Regen House
     set_block(3, 2, 4, BLK_WOOD);
     set_block(3, 3, 4, BLK_STONE);
     set_block(3, 4, 4, BLK_WOOD);
     set_block(3, 5, 4, BLK_UPG_REGEN);
 
-    // Jumbo Yellow Flower at (8, 2..5, 12)
+    // Jumbo Yellow Flower -> Mid-Game Yellow Flower Labyrinth
     set_block(8, 2, 12, BLK_WOOD);
     set_block(8, 3, 12, BLK_WOOD);
     var fz: i32 = 10;
@@ -973,27 +1023,30 @@ fn generate_ying_forest(seed: u64) {
     set_block(13, 3, 9, BLK_BLACK_CUBE);
     let _ = spawn_entity(ENT_RING_PINK, 13.5, 4.2, 9.5, 1, BIOME_BLACK_CUBE, BLK_BLACK_CUBE);
 
-    // Buy/Sell & Crates
+    // Buy Station, Crates, Damage Upgrade & Early Weapon Module (2:Cannon + 3:Laser)
     set_block(10, 2, 6, BLK_BUY_STATION);
     set_block(6, 2, 8, BLK_CRATE);
     set_block(11, 2, 8, BLK_UPG_DMG);
+    set_block(7, 2, 5, BLK_UPG_WEP);
 
-    // Blue Ring shortcut to Mylantis
+    // Blue Ring shortcut to Mylantis & Red Grow Ring
     let _ = spawn_entity(ENT_RING_BLUE, 3.5, 3.2, 8.5, 1, BIOME_MYLANTIS, BLK_MYLANTIS_M);
     let _ = spawn_entity(ENT_RING_RED, 8.5, 12.5, 8.5, 1, -1, BLK_AIR);
 
-    // Xar Enemies: Yin Yang, Goon, Marine, Spider
-    let _ = spawn_entity(ENT_YINYANG, 6.5, 3.2, 10.5, 45, -1, 0);
-    let _ = spawn_entity(ENT_GOON, 10.5, 2.6, 10.5, 35, -1, 0);
-    let _ = spawn_entity(ENT_SPIDER, 4.5, 2.5, 7.5, 28, -1, 0);
-    if (seed & 1) == 0 {
-        let _ = spawn_entity(ENT_MARINE, 11.5, 2.6, 5.5, 48, -1, 0);
+    // Early Ying Forest (depth <= 2) is peaceful exploration; deep Ying Forests (depth >= 3) have YinYangs/Goblins!
+    if depth >= 3 && st.genesis_mode == 0 {
+        let hp_scale = 35 + depth * 12;
+        let _ = spawn_entity(ENT_YINYANG, 6.5, 3.2, 10.5, hp_scale + 10, -1, 0);
+        let _ = spawn_entity(ENT_GOBLIN, 10.5, 2.6, 10.5, hp_scale, -1, 0);
+        if (seed & 1) == 0 {
+            let _ = spawn_entity(ENT_SPIDER, 4.5, 2.5, 7.5, hp_scale - 6, -1, 0);
+        }
     }
     let _ = spawn_entity(ENT_GOLD, 8.5, 2.6, 7.5, 1, -1, 0);
     let _ = spawn_entity(ENT_AMMO, 5.5, 2.6, 8.5, 1, -1, 0);
 }
 
-fn generate_white_flower_alpha(seed: u64) {
+fn generate_white_flower_alpha(depth: i32, seed: u64) {
     // Small White Flower interior housing the randomized Alpha Cube!
     var ls = seed;
     var y: i32 = 0;
@@ -1019,11 +1072,12 @@ fn generate_white_flower_alpha(seed: u64) {
         y = y + 1;
     }
 
-    // Central Alpha Cube pedestal + random fractal pillars
+    // Central Alpha Cube pedestal + Weapon Module (6:Minigun) + random fractal pillars
     set_block(8, 2, 8, BLK_ALPHA_CUBE);
     set_block(8, 3, 8, BLK_ALPHA_CUBE);
     set_block(5, 1, 8, BLK_UPG_HP);
     set_block(11, 1, 8, BLK_UPG_ARMOR);
+    set_block(5, 1, 11, BLK_UPG_WEP);
     set_block(8, 1, 11, BLK_SELL_STATION);
     set_block(8, 1, 4, BLK_TOME);
 
@@ -1041,9 +1095,15 @@ fn generate_white_flower_alpha(seed: u64) {
     }
 
     let _ = spawn_entity(ENT_RING_GREEN, 8.5, 4.2, 8.5, 1, BIOME_YELLOW_FLOWER, BLK_ALPHA_CUBE);
+    let _ = spawn_entity(ENT_RING_PINK, 11.5, 3.2, 5.5, 1, BIOME_BLACK_CUBE, BLK_BLACK_CUBE);
     let _ = spawn_entity(ENT_RING_RED, 8.0, 12.2, 8.0, 1, -1, BLK_AIR);
-    let _ = spawn_entity(ENT_RAT, 4.5, 2.5, 5.5, 22, -1, 0);
-    let _ = spawn_entity(ENT_GOON, 11.5, 2.5, 11.5, 36, -1, 0);
+
+    // Early Small White Flower / Alpha Cube is a peaceful treasure pocket; deep depths add guardians
+    if depth >= 3 && st.genesis_mode == 0 {
+        let hp_scale = 22 + depth * 10;
+        let _ = spawn_entity(ENT_RAT, 4.5, 2.5, 5.5, hp_scale, -1, 0);
+        let _ = spawn_entity(ENT_GOBLIN, 11.5, 2.5, 11.5, hp_scale + 12, -1, 0);
+    }
     let _ = spawn_entity(ENT_GOLD, 6.5, 2.5, 9.5, 1, -1, 0);
     let _ = spawn_entity(ENT_HEALTH, 9.5, 2.5, 6.5, 1, -1, 0);
 }
@@ -1127,7 +1187,7 @@ fn generate_interior_biome(biome: i32, depth: i32, seed: u64) {
     set_block(11, 1, 8, BLK_SELL_STATION);
     set_block(4, 1, 4, BLK_CRATE);
     set_block(11, 1, 4, BLK_GOLD_ORE);
-    if depth >= 2 { set_block(11, 1, 11, BLK_SPAWNER); }
+    if depth >= 3 { set_block(11, 1, 11, BLK_SPAWNER); }
     if biome == BIOME_MYLANTIS || biome == BIOME_BLACK_CUBE {
         set_block(4, 1, 12, BLK_BLACK_MARKET);
         set_block(12, 2, 12, BLK_LOCKED_DOOR);
@@ -1137,56 +1197,65 @@ fn generate_interior_biome(biome: i32, depth: i32, seed: u64) {
     if biome == BIOME_YELLOW_FLOWER {
         set_block(8, 1, 4, BLK_UPG_HP);
         set_block(8, 1, 12, BLK_KEY_BLOCK);
+        set_block(5, 1, 12, BLK_UPG_WEP);
         set_block(4, 2, 8, BLK_MYLANTIS_M);
     } else if biome == BIOME_MYLANTIS {
         set_block(8, 1, 4, BLK_UPG_ROF);
         set_block(8, 1, 12, BLK_UPG_SPEED);
+        set_block(4, 1, 10, BLK_UPG_WEP);
         set_block(4, 2, 8, BLK_BLACK_CUBE);
     } else if biome == BIOME_BLACK_CUBE {
         set_block(8, 1, 4, BLK_UPG_DMG);
         set_block(8, 1, 12, BLK_TOME);
+        set_block(4, 1, 10, BLK_UPG_WEP);
         set_block(4, 2, 8, BLK_CORE_GATE);
+        set_block(12, 2, 8, BLK_BLACK_CUBE);
     } else if biome == BIOME_INNER_CORE {
         set_block(8, 1, 4, BLK_UPG_ARMOR);
         set_block(8, 1, 12, BLK_UPG_HP);
+        set_block(4, 2, 8, BLK_BLACK_CUBE);
     }
 
-    // Rings
+    // Rings: ALWAYS spawn Green (16x) and Pink (256x) Shrink Rings at every depth so players can shrink forever!
     let _ = spawn_entity(ENT_RING_RED, 8.0, 12.2, 8.0, 1, -1, BLK_AIR);
     let next_biome: i32 =
         if biome == BIOME_YELLOW_FLOWER { BIOME_MYLANTIS }
         else if biome == BIOME_MYLANTIS { BIOME_BLACK_CUBE }
-        else { BIOME_INNER_CORE };
+        else { BIOME_BLACK_CUBE };
     let next_blk: u8 =
         if biome == BIOME_YELLOW_FLOWER { BLK_MYLANTIS_M }
-        else if biome == BIOME_MYLANTIS { BLK_BLACK_CUBE }
-        else { BLK_CORE_GATE };
-    if biome != BIOME_INNER_CORE {
-        let _ = spawn_entity(ENT_RING_GREEN, 4.5, 3.2, 8.0, 1, next_biome, next_blk);
-        let _ = spawn_entity(ENT_RING_PINK, 12.0, 3.2, 4.5, 1, BIOME_BLACK_CUBE, BLK_BLACK_CUBE);
+        else { BLK_BLACK_CUBE };
+    let _ = spawn_entity(ENT_RING_GREEN, 4.5, 3.2, 8.0, 1, next_biome, next_blk);
+    let _ = spawn_entity(ENT_RING_PINK, 12.0, 3.2, 4.5, 1, BIOME_BLACK_CUBE, BLK_BLACK_CUBE);
+
+    // Mid-Game -> Late-Game Xar Monster Manual Enemies (disabled in Peaceful Genesis Mode)
+    if st.genesis_mode == 0 {
+        let d_cap = clamp_i(depth, 1, 40);
+        let scale_hp = 30 + d_cap * 18;
+        if biome == BIOME_YELLOW_FLOWER {
+            // Mid-game entry: Goblins & Rats first, Marines/Pirates deeper!
+            let _ = spawn_entity(ENT_GOBLIN, 4.5, 2.6, 11.5, scale_hp, -1, 0);
+            let _ = spawn_entity(ENT_RAT, 11.5, 2.5, 4.5, scale_hp - 8, -1, 0);
+            if depth >= 3 {
+                let _ = spawn_entity(ENT_PIRATE, 8.0, 7.5, 12.0, scale_hp + 15, -1, 0);
+            }
+        } else if biome == BIOME_MYLANTIS {
+            let _ = spawn_entity(ENT_SPIDER, 4.5, 2.5, 11.5, scale_hp, -1, 0);
+            let _ = spawn_entity(ENT_MARINE, 5.5, 5.5, 5.5, scale_hp + 15, -1, 0);
+            let _ = spawn_entity(ENT_DEMON, 11.5, 3.5, 11.5, scale_hp + 30, -1, 0);
+        } else if biome == BIOME_BLACK_CUBE {
+            let _ = spawn_entity(ENT_GUARDIAN, 4.5, 5.0, 11.5, scale_hp + 85, -1, 0);
+            let _ = spawn_entity(ENT_DEMON, 11.5, 3.5, 5.5, scale_hp + 45, -1, 0);
+            let _ = spawn_entity(ENT_MENACE, 12.0, 8.5, 12.0, scale_hp + 30, -1, 0);
+        } else {
+            // Inner Core: The Singularity + Guardians
+            let _ = spawn_entity(ENT_SINGULARITY, 8.0, 6.8, 11.8, 320 + d_cap * 35, -1, 0);
+            let _ = spawn_entity(ENT_GUARDIAN, 4.2, 3.2, 11.5, scale_hp + 70, -1, 0);
+        }
     }
 
-    // Xar Monster Manual Enemies scaled by depth
-    let scale_hp = 35 + depth * 28;
-    if biome == BIOME_YELLOW_FLOWER {
-        let _ = spawn_entity(ENT_PIRATE, 4.5, 2.6, 11.5, scale_hp, -1, 0);
-        let _ = spawn_entity(ENT_MARINE, 11.5, 2.6, 4.5, scale_hp + 10, -1, 0);
-        let _ = spawn_entity(ENT_MENACE, 8.0, 7.5, 12.0, scale_hp + 15, -1, 0);
-    } else if biome == BIOME_MYLANTIS {
-        let _ = spawn_entity(ENT_SPIDER, 4.5, 2.5, 11.5, scale_hp, -1, 0);
-        let _ = spawn_entity(ENT_DEMON, 11.5, 3.5, 11.5, scale_hp + 30, -1, 0);
-        let _ = spawn_entity(ENT_MARINE, 5.5, 5.5, 5.5, scale_hp + 15, -1, 0);
-    } else if biome == BIOME_BLACK_CUBE {
-        let _ = spawn_entity(ENT_GUARDIAN, 4.5, 5.0, 11.5, scale_hp + 85, -1, 0);
-        let _ = spawn_entity(ENT_DEMON, 11.5, 3.5, 5.5, scale_hp + 45, -1, 0);
-        let _ = spawn_entity(ENT_MENACE, 12.0, 8.5, 12.0, scale_hp + 30, -1, 0);
-    } else {
-        // Inner Core: The Singularity + Guardians + Friend K!
-        let _ = spawn_entity(ENT_SINGULARITY, 8.0, 6.8, 11.8, 320 + depth * 45, -1, 0);
-        let _ = spawn_entity(ENT_GUARDIAN, 4.2, 3.2, 11.5, scale_hp + 70, -1, 0);
-        if st.k_rescued == 0 {
-            let _ = spawn_entity(ENT_FRIEND_K, 8.0, 2.6, 13.6, 1, -1, 0);
-        }
+    if biome == BIOME_INNER_CORE && st.k_rescued == 0 {
+        let _ = spawn_entity(ENT_FRIEND_K, 8.0, 2.6, 13.6, 1, -1, 0);
     }
 
     let _ = spawn_entity(ENT_GOLD, 6.5, 2.4, 5.5, 1, -1, 0);
@@ -1202,18 +1271,18 @@ fn load_current_chunk() {
     }
     clear_entities_and_shots();
 
-    let sidx = st.depth + MACRO_OFFSET;
-    let biome = st.stack[sidx].biome;
-    let seed = st.stack[sidx].seed;
+    let cf = get_frame(st.depth);
+    let biome = cf.biome;
+    let seed = cf.seed;
 
     if biome == BIOME_SPACE {
-        generate_space_chunk();
+        generate_space_chunk(st.depth);
     } else if biome == BIOME_TUTORIAL {
         generate_tutorial_island();
     } else if biome == BIOME_YING_FOREST {
-        generate_ying_forest(seed);
+        generate_ying_forest(st.depth, seed);
     } else if biome == BIOME_WHITE_FLOWER {
-        generate_white_flower_alpha(seed);
+        generate_white_flower_alpha(st.depth, seed);
     } else {
         generate_interior_biome(biome, st.depth, seed);
     }
@@ -1242,22 +1311,19 @@ fn shrink_into(bx: i32, by: i32, bz: i32, target_blk: u8, forced_biome: i32, ste
 
     while d < steps {
         let next_depth = st.depth + 1;
-        let next_idx = next_depth + MACRO_OFFSET;
-        if next_idx >= MAX_STACK {
-            set_status_msg("Max fractal recursion depth reached!", 1600);
+        if next_depth > MAX_POS_DEPTH {
+            set_status_msg("Max Xar fractal scale depth (3000) reached!", 1600);
             break;
         }
-        let cur_idx = st.depth + MACRO_OFFSET;
-        let pseed = st.stack[cur_idx].seed;
+        let pseed = get_frame(st.depth).seed;
         let nseed = hash_block_seed(pseed, cur_bx, cur_by, cur_bz, next_depth);
         st.depth = next_depth;
         if st.depth > st.max_depth_reached { st.max_depth_reached = st.depth; }
-        st.stack[next_idx].bx = cur_bx;
-        st.stack[next_idx].by = cur_by;
-        st.stack[next_idx].bz = cur_bz;
-        st.stack[next_idx].parent_block = cur_blk;
-        st.stack[next_idx].seed = nseed;
-        st.stack[next_idx].biome = pick_biome_for_entry(next_depth, cur_blk, cur_forced, nseed);
+        let nbio = pick_biome_for_entry(next_depth, cur_blk, cur_forced, nseed);
+        set_frame(next_depth, ScaleFrame {
+            bx: cur_bx, by: cur_by, bz: cur_bz,
+            biome: nbio, parent_block: cur_blk, seed: nseed
+        });
         cur_bx = 8; cur_by = 8; cur_bz = 8;
         cur_blk = BLK_BLACK_CUBE;
         cur_forced = -1;
@@ -1269,18 +1335,16 @@ fn shrink_into(bx: i32, by: i32, bz: i32, target_blk: u8, forced_biome: i32, ste
     st.py = 3.2;
     st.pz = 6.5;
     st.vx = 0.0; st.vy = 0.0; st.vz = 0.0;
-    st.ring_cd_ms = 650;
-    st.flash_ms = 220;
+    st.ring_cd_ms = 240;
+    st.flash_ms = 200;
     st.flash_rgb = pack_rgb(40, 235, 130);
-    set_status_msg("Shrank 16x deeper into fractal block!", 1800);
+    set_status_msg("Shrank 16x deeper into fractal block!", 1600);
 }
 
 fn grow_out_axis(exit_x: f64, exit_y: f64, exit_z: f64) {
     if st.ring_cd_ms > 0 { return; }
     let next_depth = st.depth - 1;
-    let next_idx = next_depth + MACRO_OFFSET;
-    if next_idx < 1 {
-        // Outer Cosmic Boundary — wrap gently inside Outer Space
+    if next_depth < MAX_NEG_DEPTH {
         st.px = fclamp(exit_x, 0.5, 15.5);
         st.py = fclamp(exit_y, 0.5, 15.5);
         st.pz = fclamp(exit_z, 0.5, 15.5);
@@ -1288,19 +1352,18 @@ fn grow_out_axis(exit_x: f64, exit_y: f64, exit_z: f64) {
         return;
     }
 
-    let cur_idx = st.depth + MACRO_OFFSET;
-    let ret_bx = st.stack[cur_idx].bx;
-    let ret_by = st.stack[cur_idx].by;
-    let ret_bz = st.stack[cur_idx].bz;
+    let cur_f = get_frame(st.depth);
+    let ret_bx = cur_f.bx;
+    let ret_by = cur_f.by;
+    let ret_bz = cur_f.bz;
 
-    if next_depth < 0 && st.stack[next_idx].seed == 0 {
+    let nf = get_frame(next_depth);
+    if next_depth < 0 && nf.seed == 0 {
         let mseed = hash_block_seed(0x4642575f584152, 8, 6, 8, next_depth);
-        st.stack[next_idx].bx = 8;
-        st.stack[next_idx].by = 6;
-        st.stack[next_idx].bz = 8;
-        st.stack[next_idx].parent_block = BLK_YING_PLANET;
-        st.stack[next_idx].seed = mseed;
-        st.stack[next_idx].biome = BIOME_SPACE;
+        set_frame(next_depth, ScaleFrame {
+            bx: 8, by: 6, bz: 8,
+            biome: BIOME_SPACE, parent_block: BLK_YING_PLANET, seed: mseed
+        });
     }
 
     st.depth = next_depth;
@@ -1344,10 +1407,10 @@ fn grow_out_axis(exit_x: f64, exit_y: f64, exit_z: f64) {
     }
 
     st.vx = 0.0; st.vy = 0.0; st.vz = 0.0;
-    st.ring_cd_ms = 650;
-    st.flash_ms = 220;
+    st.ring_cd_ms = 240;
+    st.flash_ms = 200;
     st.flash_rgb = pack_rgb(245, 70, 70);
-    set_status_msg("Grew 16x outward to parent chunk!", 1800);
+    set_status_msg("Grew 16x outward to parent chunk!", 1600);
 }
 
 // ---------------------------------------------------------------------------
@@ -1367,13 +1430,31 @@ fn set_default_ammo_caps() {
     st.max_ammo[WEP_DARKHOLE] = (6.0 * mul) as! i32;
 }
 
+fn unlock_all_weapons() {
+    var wi: i32 = 0;
+    while wi < NUM_WEAPONS {
+        st.wep_unlocked[wi] = 1;
+        wi = wi + 1;
+    }
+}
+
 fn init_new_game() {
     var i: i32 = 0;
-    while i < MAX_STACK {
-        st.stack[i].seed = 0;
-        st.stack[i].biome = BIOME_SPACE;
+    let plen = st.pos_stack.len as! i32;
+    while i < plen {
+        st.pos_stack[i].seed = 0;
+        st.pos_stack[i].biome = BIOME_BLACK_CUBE;
         i = i + 1;
     }
+    i = 0;
+    let nlen = st.neg_stack.len as! i32;
+    while i < nlen {
+        st.neg_stack[i].seed = 0;
+        st.neg_stack[i].biome = BIOME_SPACE;
+        i = i + 1;
+    }
+    st.marker_frames_len = 0;
+
     i = 0;
     while i < MAX_DELTAS {
         st.deltas[i].used = 0;
@@ -1382,6 +1463,8 @@ fn init_new_game() {
     i = 0;
     while i < MAX_MARKERS {
         st.markers[i].used = 0;
+        st.markers[i].pos_cnt = 0;
+        st.markers[i].neg_cnt = 0;
         i = i + 1;
     }
     st.delta_head = 0;
@@ -1390,13 +1473,10 @@ fn init_new_game() {
     st.depth = 0;
     st.max_depth_reached = 0;
     st.min_depth_reached = 0;
-    let zidx = MACRO_OFFSET;
-    st.stack[zidx].bx = 8;
-    st.stack[zidx].by = 6;
-    st.stack[zidx].bz = 8;
-    st.stack[zidx].parent_block = BLK_YING_PLANET;
-    st.stack[zidx].seed = 0x5841525f54555430;
-    st.stack[zidx].biome = BIOME_TUTORIAL;
+    set_frame(0, ScaleFrame {
+        bx: 8, by: 6, bz: 8,
+        biome: BIOME_TUTORIAL, parent_block: BLK_YING_PLANET, seed: 0x5841525f54555430
+    });
 
     // Spawn inside the Tutorial Room facing the Black Cube (+Z)
     st.px = 8.5;
@@ -1430,6 +1510,11 @@ fn init_new_game() {
     set_default_ammo_caps();
 
     st.weapon = WEP_PLASMA;
+    i = 0;
+    while i < NUM_WEAPONS {
+        st.wep_unlocked[i] = if i == WEP_PLASMA || st.genesis_mode != 0 { 1 } else { 0 };
+        i = i + 1;
+    }
     st.ammo[WEP_PLASMA] = 9999;
     st.ammo[WEP_CANNON] = 24;
     st.ammo[WEP_LASER] = 45;
@@ -1442,7 +1527,7 @@ fn init_new_game() {
     st.ammo[WEP_DARKHOLE] = 2;
 
     st.fire_cd_ms = 0;
-    st.ring_cd_ms = 400;
+    st.ring_cd_ms = 300;
     st.beam_timer_ms = 0;
     st.flash_ms = 0;
     st.near_ring_kind = ENT_NONE;
@@ -1451,7 +1536,11 @@ fn init_new_game() {
     st.tome_id = 0;
 
     load_current_chunk();
-    set_status_msg("Tutorial: Fly into Black Cube -> Ying Forest, or exit to Space!", 4200);
+    if st.genesis_mode != 0 {
+        set_status_msg("Genesis Mode (Peaceful): Shrink forever with Black Cube, Rings & [B]!", 4200);
+    } else {
+        set_status_msg("Tutorial: Fly into Black Cube -> Ying Forest, or exit to Space!", 4200);
+    }
 }
 
 fn respawn_at_tutorial_preserving_progress() {
@@ -1461,13 +1550,10 @@ fn respawn_at_tutorial_preserving_progress() {
     st.hp = st.max_hp;
     st.armor = clamp_i(st.armor, st.max_armor / 2, st.max_armor);
     st.depth = 0;
-    let zidx = MACRO_OFFSET;
-    st.stack[zidx].bx = 8;
-    st.stack[zidx].by = 6;
-    st.stack[zidx].bz = 8;
-    st.stack[zidx].parent_block = BLK_YING_PLANET;
-    st.stack[zidx].seed = 0x5841525f54555430;
-    st.stack[zidx].biome = BIOME_TUTORIAL;
+    set_frame(0, ScaleFrame {
+        bx: 8, by: 6, bz: 8,
+        biome: BIOME_TUTORIAL, parent_block: BLK_YING_PLANET, seed: 0x5841525f54555430
+    });
     load_current_chunk();
     st.px = 8.5;
     st.py = 3.2;
@@ -1476,7 +1562,7 @@ fn respawn_at_tutorial_preserving_progress() {
     st.yaw = HALF_PI;
     st.pitch = -0.04;
     st.roll = 0.0;
-    st.ring_cd_ms = 600;
+    st.ring_cd_ms = 400;
     st.flash_ms = 320;
     st.flash_rgb = pack_rgb(220, 40, 60);
     set_status_msg("Hull destroyed! Respawned at Tutorial (-30 Gold, upgrades preserved).", 3600);
@@ -1543,6 +1629,28 @@ fn collect_upgrade_block(bx: i32, by: i32, bz: i32, blk: u8) {
     } else if blk == BLK_KEY_BLOCK {
         st.keys = st.keys + 1;
         set_status_msg("Picked up Vault Key!", 2000);
+    } else if blk == BLK_UPG_WEP {
+        let cb = cur_biome();
+        if cb == BIOME_YING_FOREST {
+            st.wep_unlocked[WEP_CANNON] = 1;
+            st.wep_unlocked[WEP_LASER] = 1;
+            set_status_msg("WEAPON MODULE: Unlocked 2:Cannon & 3:Laser!", 2400);
+        } else if cb == BIOME_WHITE_FLOWER {
+            st.wep_unlocked[WEP_MINIGUN] = 1;
+            set_status_msg("WEAPON MODULE: Unlocked 6:Minigun!", 2400);
+        } else if cb == BIOME_YELLOW_FLOWER {
+            st.wep_unlocked[WEP_ROCKET] = 1;
+            st.wep_unlocked[WEP_HOMING] = 1;
+            set_status_msg("WEAPON MODULE: Unlocked 4:Rocket & 5:Homing!", 2400);
+        } else if cb == BIOME_MYLANTIS {
+            st.wep_unlocked[WEP_RAILGUN] = 1;
+            st.wep_unlocked[WEP_EMP] = 1;
+            set_status_msg("WEAPON MODULE: Unlocked 7:Railgun & 8:EMP!", 2400);
+        } else {
+            st.wep_unlocked[WEP_NUKE] = 1;
+            st.wep_unlocked[WEP_DARKHOLE] = 1;
+            set_status_msg("WEAPON MODULE: Unlocked 9:Nuke & 0:DarkHole!", 2400);
+        }
     }
 }
 
@@ -1555,7 +1663,7 @@ fn check_touch_special_block(tx: f64, ty: f64, tz: f64) -> i32 {
         collect_upgrade_block(bx, by, bz, blk);
         return 1;
     }
-    if is_block_shrinkable(blk) != 0 && st.ring_cd_ms <= 0 {
+    if (is_block_shrinkable(blk) != 0 || (st.shrink_any != 0 && is_block_solid(blk) != 0)) && st.ring_cd_ms <= 0 {
         shrink_into(bx, by, bz, blk, -1, 1);
         return 2;
     }
@@ -1731,6 +1839,10 @@ fn camera_forward(fx: f64&, fy: f64&, fz: f64&) {
 fn fire_weapon(secondary: i32) {
     if st.fire_cd_ms > 0 { return; }
     let w = st.weapon;
+    if st.wep_unlocked[w] == 0 {
+        set_status_msg("Weapon locked! Find Weapon Module or Buy Station to unlock.", 1400);
+        return;
+    }
     let cost: i32 = if w == WEP_PLASMA { 0 } else if secondary != 0 && (w == WEP_HOMING || w == WEP_NUKE) { 2 } else { 1 };
     if w != WEP_PLASMA && st.ammo[w] < cost {
         st.weapon = WEP_PLASMA;
@@ -1964,6 +2076,16 @@ fn trigger_telekinesis() {
     }
 }
 
+fn push_marker_frame(f: ScaleFrame) {
+    let idx = st.marker_frames_len;
+    if idx < (st.marker_frames.len as! i32) {
+        st.marker_frames[idx] = f;
+    } else {
+        st.marker_frames.push(f);
+    }
+    st.marker_frames_len = idx + 1;
+}
+
 fn drop_marker(is_long: i32) {
     var slot: i32 = 0;
     if is_long == 0 {
@@ -1976,19 +2098,32 @@ fn drop_marker(is_long: i32) {
         }
         if slot >= MAX_MARKERS { slot = 1; }
     }
+    let pos_cnt = if st.depth >= 0 { st.depth + 1 } else { 1 };
+    let neg_cnt = if st.depth < 0 { -st.depth } else { 0 };
+    let pos_off = st.marker_frames_len;
+    var wi: i32 = 0;
+    while wi < pos_cnt {
+        push_marker_frame(get_frame(wi));
+        wi = wi + 1;
+    }
+    let neg_off = st.marker_frames_len;
+    wi = 1;
+    while wi <= neg_cnt {
+        push_marker_frame(get_frame(-wi));
+        wi = wi + 1;
+    }
+
     st.markers[slot].used = 1;
     st.markers[slot].is_long = is_long;
     st.markers[slot].depth = st.depth;
     st.markers[slot].px = st.px;
     st.markers[slot].py = st.py;
     st.markers[slot].pz = st.pz;
-    let sidx = st.depth + MACRO_OFFSET;
-    st.markers[slot].biome = st.stack[sidx].biome;
-    var wi: i32 = 0;
-    while wi < MAX_STACK {
-        st.markers[slot].stack[wi] = st.stack[wi];
-        wi = wi + 1;
-    }
+    st.markers[slot].biome = cur_biome();
+    st.markers[slot].pos_off = pos_off;
+    st.markers[slot].pos_cnt = pos_cnt;
+    st.markers[slot].neg_off = neg_off;
+    st.markers[slot].neg_cnt = neg_cnt;
     st.active_marker = slot;
     if is_long != 0 {
         set_status_msg("Long Tracking Marker placed! View & warp via [F4].", 1800);
@@ -2000,8 +2135,13 @@ fn drop_marker(is_long: i32) {
 fn warp_to_marker(slot: i32) -> i32 {
     if slot < 0 || slot >= MAX_MARKERS || st.markers[slot].used == 0 { return 0; }
     var wi: i32 = 0;
-    while wi < MAX_STACK {
-        st.stack[wi] = st.markers[slot].stack[wi];
+    while wi < st.markers[slot].pos_cnt {
+        set_frame(wi, st.marker_frames[st.markers[slot].pos_off + wi]);
+        wi = wi + 1;
+    }
+    wi = 0;
+    while wi < st.markers[slot].neg_cnt {
+        set_frame(-(wi + 1), st.marker_frames[st.markers[slot].neg_off + wi]);
         wi = wi + 1;
     }
     st.depth = st.markers[slot].depth;
@@ -2014,6 +2154,31 @@ fn warp_to_marker(slot: i32) -> i32 {
     st.flash_rgb = pack_rgb(74, 222, 128);
     set_status_msg("Warped to Marker!", 1600);
     return 1;
+}
+
+fn shrink_targeted_block() {
+    st.ring_cd_ms = 0;
+    var fx: f64 = 0.0;
+    var fy: f64 = 0.0;
+    var fz: f64 = 0.0;
+    camera_forward(fx, fy, fz);
+    var t: f64 = 0.4;
+    while t <= 4.5 {
+        let bx = ffloor(st.px + fx * t);
+        let by = ffloor(st.py + fy * t);
+        let bz = ffloor(st.pz + fz * t);
+        let b = get_block(bx, by, bz);
+        if b != BLK_AIR {
+            shrink_into(bx, by, bz, b, -1, 1);
+            return;
+        }
+        t = t + 0.35;
+    }
+    // In open air: shrink into current voxel position
+    let pbx = clamp_i(ffloor(st.px), 0, 15);
+    let pby = clamp_i(ffloor(st.py), 0, 15);
+    let pbz = clamp_i(ffloor(st.pz), 0, 15);
+    shrink_into(pbx, pby, pbz, BLK_BLACK_CUBE, -1, 1);
 }
 
 fn use_nearest() {
@@ -2058,8 +2223,7 @@ fn use_nearest() {
         if b == BLK_SELL_STATION { st.screen = SCREEN_SELL; return; }
         if b == BLK_BLACK_MARKET { st.screen = SCREEN_BLACK_MARKET; return; }
         if b == BLK_TOME {
-            let sidx = st.depth + MACRO_OFFSET;
-            st.tome_id = st.stack[sidx].biome;
+            st.tome_id = cur_biome();
             st.screen = SCREEN_TOME;
             return;
         }
@@ -2096,8 +2260,7 @@ fn use_nearest() {
                 if nb == BLK_SELL_STATION { st.screen = SCREEN_SELL; return; }
                 if nb == BLK_BLACK_MARKET { st.screen = SCREEN_BLACK_MARKET; return; }
                 if nb == BLK_TOME {
-                    let sidx = st.depth + MACRO_OFFSET;
-                    st.tome_id = st.stack[sidx].biome;
+                    st.tome_id = cur_biome();
                     st.screen = SCREEN_TOME;
                     return;
                 }
@@ -2125,7 +2288,7 @@ fn use_nearest() {
 }
 
 fn handle_buy_action(choice: i32) {
-    // Buy Station items (authentic FBW Gold economy)
+    // Buy Station items (authentic FBW Gold economy; also unlocks purchased munitions tier)
     if choice == 1 && st.gold >= 15 {
         st.gold = st.gold - 15;
         st.hp = clamp_i(st.hp + 50, 0, st.max_hp);
@@ -2136,22 +2299,31 @@ fn handle_buy_action(choice: i32) {
         set_status_msg("Bought +50 Armor!", 1400);
     } else if choice == 3 && st.gold >= 25 {
         st.gold = st.gold - 25;
+        st.wep_unlocked[WEP_CANNON] = 1;
+        st.wep_unlocked[WEP_LASER] = 1;
+        st.wep_unlocked[WEP_MINIGUN] = 1;
         st.ammo[WEP_CANNON] = clamp_i(st.ammo[WEP_CANNON] + 20, 0, st.max_ammo[WEP_CANNON]);
         st.ammo[WEP_LASER] = clamp_i(st.ammo[WEP_LASER] + 30, 0, st.max_ammo[WEP_LASER]);
         st.ammo[WEP_MINIGUN] = clamp_i(st.ammo[WEP_MINIGUN] + 80, 0, st.max_ammo[WEP_MINIGUN]);
-        set_status_msg("Bought Standard Munitions Pack!", 1400);
+        set_status_msg("Unlocked & stocked Cannon / Laser / Minigun!", 1500);
     } else if choice == 4 && st.gold >= 40 {
         st.gold = st.gold - 40;
+        st.wep_unlocked[WEP_ROCKET] = 1;
+        st.wep_unlocked[WEP_HOMING] = 1;
+        st.wep_unlocked[WEP_RAILGUN] = 1;
+        st.wep_unlocked[WEP_EMP] = 1;
         st.ammo[WEP_ROCKET] = clamp_i(st.ammo[WEP_ROCKET] + 10, 0, st.max_ammo[WEP_ROCKET]);
         st.ammo[WEP_HOMING] = clamp_i(st.ammo[WEP_HOMING] + 8, 0, st.max_ammo[WEP_HOMING]);
         st.ammo[WEP_RAILGUN] = clamp_i(st.ammo[WEP_RAILGUN] + 8, 0, st.max_ammo[WEP_RAILGUN]);
         st.ammo[WEP_EMP] = clamp_i(st.ammo[WEP_EMP] + 5, 0, st.max_ammo[WEP_EMP]);
-        set_status_msg("Bought Heavy Ordnance Pack!", 1400);
+        set_status_msg("Unlocked & stocked Rocket / Homing / Railgun / EMP!", 1500);
     } else if choice == 5 && st.gold >= 60 {
         st.gold = st.gold - 60;
+        st.wep_unlocked[WEP_NUKE] = 1;
+        st.wep_unlocked[WEP_DARKHOLE] = 1;
         st.ammo[WEP_NUKE] = clamp_i(st.ammo[WEP_NUKE] + 2, 0, st.max_ammo[WEP_NUKE]);
         st.ammo[WEP_DARKHOLE] = clamp_i(st.ammo[WEP_DARKHOLE] + 2, 0, st.max_ammo[WEP_DARKHOLE]);
-        set_status_msg("Bought Nuke & Dark Hole Warheads!", 1400);
+        set_status_msg("Unlocked & stocked Nuke & Dark Hole!", 1500);
     } else if choice == 6 && st.gold >= 50 {
         st.gold = st.gold - 50;
         st.keys = st.keys + 1;
@@ -2184,18 +2356,22 @@ fn handle_black_market_action(choice: i32) {
     // Black Market: discounted high-tier Railgun, EMP, Nuke, Dark Hole!
     if choice == 1 && st.gold >= 20 {
         st.gold = st.gold - 20;
+        st.wep_unlocked[WEP_RAILGUN] = 1;
         st.ammo[WEP_RAILGUN] = clamp_i(st.ammo[WEP_RAILGUN] + 12, 0, st.max_ammo[WEP_RAILGUN]);
         set_status_msg("Black Market: +12 Railgun Slugs!", 1400);
     } else if choice == 2 && st.gold >= 18 {
         st.gold = st.gold - 18;
+        st.wep_unlocked[WEP_EMP] = 1;
         st.ammo[WEP_EMP] = clamp_i(st.ammo[WEP_EMP] + 8, 0, st.max_ammo[WEP_EMP]);
         set_status_msg("Black Market: +8 EMP Charges!", 1400);
     } else if choice == 3 && st.gold >= 30 {
         st.gold = st.gold - 30;
+        st.wep_unlocked[WEP_NUKE] = 1;
         st.ammo[WEP_NUKE] = clamp_i(st.ammo[WEP_NUKE] + 3, 0, st.max_ammo[WEP_NUKE]);
         set_status_msg("Black Market: +3 Nukes!", 1400);
     } else if choice == 4 && st.gold >= 35 {
         st.gold = st.gold - 35;
+        st.wep_unlocked[WEP_DARKHOLE] = 1;
         st.ammo[WEP_DARKHOLE] = clamp_i(st.ammo[WEP_DARKHOLE] + 3, 0, st.max_ammo[WEP_DARKHOLE]);
         set_status_msg("Black Market: +3 Dark Holes!", 1400);
     }
