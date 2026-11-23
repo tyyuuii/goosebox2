@@ -154,11 +154,12 @@ fn clamp_x(x: i32) -> i32 {
 fn grid_height() -> i32 {
     // Reserve 2 rows for status bar
     if world.height >= 3 { return world.height - 2; }
-    return world.height;
+    return 0;
 }
 
 fn clamp_y(y: i32) -> i32 {
     let gh = grid_height();
+    if gh <= 0 { return 0; }
     if y < 0 { return 0; }
     if y >= gh { return gh - 1; }
     return y;
@@ -184,16 +185,23 @@ fn cgol_init() -> i32 {
         i = i + 1;
     }
 
-    // Randomize ~50% alive
-    var seed: u64 = 0x123456789ABCDEF;
-    var j = 0;
-    for j in total {
-        // xorshift64*
-        seed ^= seed >> 12;
-        seed ^= seed << 25;
-        seed ^= seed >> 27;
-        let r = (seed * 0x2545F4914F6CDD1D) as u32;
-        world.cur[j] = if (r & 1) != 0 { 1 } else { 0 };
+    // Randomize ~50% alive in visible grid only
+    let gh = grid_height();
+    var seed: u64 = 0x123456789ABCDEF ^ (tb_adapter_now_ms() as u64);
+    if seed == 0 { seed = 0x123456789ABCDEF; }
+    var ry: i32 = 0;
+    while ry < gh {
+        var rx: i32 = 0;
+        while rx < world.width {
+            // xorshift64*
+            seed ^= seed >> 12;
+            seed ^= seed << 25;
+            seed ^= seed >> 27;
+            let r = (seed * 0x2545F4914F6CDD1D) as u32;
+            world.cur[idx(rx, ry)] = if (r & 1) != 0 { 1 } else { 0 };
+            rx = rx + 1;
+        }
+        ry = ry + 1;
     }
 
     world.gen = 0;
@@ -207,6 +215,7 @@ fn cgol_init() -> i32 {
     world.frame_time_ms = 0;
     world.skip_frame = 0;
 
+    let _ = tb_set_input_mode(TB_INPUT_ESC | TB_INPUT_MOUSE);
     let _ = tb_hide_cursor();
     return TB_OK;
 }
@@ -221,10 +230,11 @@ fn cgol_shutdown() {
 
 fn count_neighbors(x: i32, y: i32) -> i32 {
     let w = world.width;
-    let h = world.height;
+    let h = grid_height();
+    if w <= 0 || h <= 0 { return 0; }
     var n: i32 = 0;
 
-    // Toroidal wrapping: (y + dy + h) % h, (x + dx + w) % w
+    // Toroidal wrapping over visible grid: (y + dy + h) % h, (x + dx + w) % w
     var dy: i32 = -1;
     while dy <= 1 {
         var dx: i32 = -1;
@@ -243,7 +253,8 @@ fn count_neighbors(x: i32, y: i32) -> i32 {
 
 fn cgol_step() {
     let w = world.width;
-    let h = world.height;
+    let h = grid_height();
+    if w <= 0 || h <= 0 { return; }
     var y: i32 = 0;
     while y < h {
         var x: i32 = 0;
@@ -262,9 +273,9 @@ fn cgol_step() {
         y = y + 1;
     }
 
-    // Copy nxt into cur, zero nxt
-    var k: i32 = 0;
+    // Copy nxt into cur, zero nxt (visible grid)
     let total = w * h;
+    var k: i32 = 0;
     while k < total {
         world.cur[k] = world.nxt[k];
         world.nxt[k] = 0;
@@ -295,17 +306,24 @@ fn cgol_clear() {
 }
 
 fn cgol_randomize() {
-    let total = world.width * world.height;
+    cgol_clear();
+    let gh = grid_height();
+    if world.width <= 0 || gh <= 0 { return; }
     // Mix in current time for different boards on each call
     var seed: u64 = (world.gen as u64 + 0x9E3779B97F4A7C15) ^ (tb_adapter_now_ms() as u64);
-    var i: i32 = 0;
-    for i in total {
-        seed ^= seed >> 12;
-        seed ^= seed << 25;
-        seed ^= seed >> 27;
-        let r = (seed * 0x2545F4914F6CDD1D) as u32;
-        world.cur[i] = if (r & 1) != 0 { 1 } else { 0 };
-        world.nxt[i] = 0;
+    if seed == 0 { seed = 0x9E3779B97F4A7C15; }
+    var ry: i32 = 0;
+    while ry < gh {
+        var rx: i32 = 0;
+        while rx < world.width {
+            seed ^= seed >> 12;
+            seed ^= seed << 25;
+            seed ^= seed >> 27;
+            let r = (seed * 0x2545F4914F6CDD1D) as u32;
+            world.cur[idx(rx, ry)] = if (r & 1) != 0 { 1 } else { 0 };
+            rx = rx + 1;
+        }
+        ry = ry + 1;
     }
     world.gen = 0;
 }
@@ -343,7 +361,9 @@ fn cgol_place_pattern(name: const u8[:], px: i32, py: i32) {
         let dy = pts[j].y;
         // Toroidal wrapping to match count_neighbors behavior
         let x = ((px + dx) % world.width + world.width) % world.width;
-        let y = ((py + dy) % world.height + world.height) % world.height;
+        let gh = grid_height();
+        if gh <= 0 { continue; }
+        let y = ((py + dy) % gh + gh) % gh;
         world.cur[idx(x, y)] = 1;
     }
 }
@@ -477,8 +497,8 @@ fn cgol_draw() {
         let _ = tb_print(col, status_y - 1,
             if world.running != 0 { TB_GREEN | TB_BOLD } else { TB_WHITE },
             TB_DEFAULT,
-            if world.running != 0 { "ON" } else { "OFF" });
-        col = col + 3;
+            if world.running != 0 { "ON " } else { "OFF" });
+        col = col + 4;
         
         // Speed
         let _ = tb_print(col, status_y - 1, TB_CYAN, TB_DEFAULT, "Speed: ");
@@ -503,7 +523,7 @@ fn cgol_draw() {
         }
         let _ = tb_print(col, status_y - 1, TB_WHITE, TB_DEFAULT, spd_str[0..spd_len]);
         col = col + spd_len;
-        if sv > 0 {
+        if world.speed_ms > 0 {
             let _ = tb_print(col, status_y - 1, TB_WHITE, TB_DEFAULT, "ms");
             col = col + 2;
         }
@@ -609,8 +629,8 @@ fn cgol_handle_key(ev: tb_event&) -> i32 {
         return 1;
     }
 
-    // Single step when paused (S or Shift+S)
-    if ev.ch == 'S' || ev.ch == 's' {
+    // Single step (Shift+S; lowercase 's' moves cursor down in WASD)
+    if ev.ch == 'S' {
         cgol_step();
         return 1;
     }
@@ -642,7 +662,7 @@ fn cgol_handle_key(ev: tb_event&) -> i32 {
         world.running = if world.running != 0 { 0 } else { 1 };
         return 1;
     }
-    if ev.ch == 'r' || ev.ch == 'R' || ev.ch == TB_KEY_ENTER || ev.ch == 0x0a {
+    if ev.ch == 'r' || ev.ch == 'R' || ev.key == TB_KEY_ENTER || ev.ch == 0x0a {
         world.running = 1;
         return 1;
     }
@@ -686,6 +706,7 @@ fn main() {
 
     while running != 0 {
         let frame_start = tb_adapter_now_ms();
+        var needs_draw: i32 = world.last_frame_skipped;
 
         // Process events with adaptive timeout (frame pacing + instant input)
         loop {
@@ -710,9 +731,11 @@ fn main() {
             // Event received - process IMMEDIATELY
             if ev.kind == TB_EVENT_KEY {
                 let should_continue = cgol_handle_key(ev);
+                needs_draw = 1;
                 if should_continue == 0 { running = 0; break; } // quit
             } else if ev.kind == TB_EVENT_RESIZE {
                 cgol_resize();
+                needs_draw = 1;
             } else if ev.kind == TB_EVENT_MOUSE {
                 if ev.key == TB_KEY_MOUSE_LEFT {
                     world.cx = ev.x;
@@ -720,11 +743,13 @@ fn main() {
                     world.cx = clamp_x(world.cx);
                     world.cy = clamp_y(world.cy);
                     cgol_toggle(world.cx, world.cy);
+                    needs_draw = 1;
                 } else if ev.mod & TB_MOD_MOTION != 0 {
                     world.cx = ev.x;
                     world.cy = ev.y;
                     world.cx = clamp_x(world.cx);
                     world.cy = clamp_y(world.cy);
+                    needs_draw = 1;
                 }
             }
             // Continue inner loop to check for more events with updated timeout
@@ -737,18 +762,22 @@ fn main() {
             if now - last_sim_ms >= world.speed_ms {
                 cgol_step();
                 last_sim_ms = now;
+                needs_draw = 1;
             }
         } else if world.running != 0 && world.speed_ms == 0 {
             // Unlimited: step every frame
             cgol_step();
+            needs_draw = 1;
         }
 
-        // Render (skip if frame already too slow)
+        // Render only when needed (skip if frame already too slow)
         world.skip_frame = 0;
-        if world.frame_time_ms <= MAX_FRAME_MS {
-            cgol_draw();
-        } else {
-            world.skip_frame = 1;
+        if needs_draw != 0 {
+            if world.frame_time_ms <= MAX_FRAME_MS {
+                cgol_draw();
+            } else {
+                world.skip_frame = 1;
+            }
         }
         // Track if last frame was skipped for [SKIP] indicator
         world.last_frame_skipped = world.skip_frame;

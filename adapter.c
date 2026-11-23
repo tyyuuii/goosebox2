@@ -1,16 +1,19 @@
 #define _POSIX_C_SOURCE 200809L
-
 #include "adapter.h"
 
 #include <errno.h>
-#include <stdlib.h>
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <unistd.h>
+
+/* Saved original termios (kept in C so platform struct size never leaks into Goose). */
+static struct termios g_orig_tios;
+static int g_has_orig_tios = 0;
 
 /* The pipe fd that the SIGWINCH handler writes to. */
 static volatile sig_atomic_t g_sigwinch_pipe_fd = -1;
@@ -37,9 +40,31 @@ int tb_adapter_tcsetattr(int fd, int optional_actions, const struct termios *tio
     return tcsetattr(fd, optional_actions, tios);
 }
 
+int tb_adapter_save_termios(int fd) {
+    if (tcgetattr(fd, &g_orig_tios) != 0) return -1;
+    g_has_orig_tios = 1;
+    return 0;
+}
+
+int tb_adapter_restore_termios(int fd) {
+    if (!g_has_orig_tios) return 0;
+    int rv = tcsetattr(fd, TCSAFLUSH, &g_orig_tios);
+    g_has_orig_tios = 0;
+    return rv;
+}
+
 /* Winsize via ioctl (TIOCGWINSZ). */
 int tb_adapter_ioctl_winsize(int fd, unsigned long request, void *ws) {
     return ioctl(fd, request, ws);
+}
+
+int tb_adapter_get_winsize(int fd, int *out_w, int *out_h) {
+    struct winsize ws;
+    memset(&ws, 0, sizeof(ws));
+    if (ioctl(fd, TIOCGWINSZ, &ws) != 0) return -1;
+    if (out_w) *out_w = (int)ws.ws_col;
+    if (out_h) *out_h = (int)ws.ws_row;
+    return 0;
 }
 
 /* fcntl wrappers (non-variadic subset we need). */
@@ -51,9 +76,19 @@ int tb_adapter_fcntl_setfl(int fd, int flags) {
     return fcntl(fd, F_SETFL, flags);
 }
 
+int tb_adapter_set_nonblock(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) return -1;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
 /* open wrapper (path must be NUL-terminated). */
 int tb_adapter_open_tty(const char *path, int flags) {
     return open(path, flags);
+}
+
+int tb_adapter_open_tty_rw(const char *path) {
+    return open(path, O_RDWR);
 }
 
 int tb_adapter_close(int fd) {
@@ -61,19 +96,19 @@ int tb_adapter_close(int fd) {
 }
 
 long long tb_adapter_write(int fd, const char *buf, size_t n) {
-    return write(fd, buf, n);
+    return (long long)write(fd, buf, n);
 }
 
 long long tb_adapter_read(int fd, char *buf, size_t n) {
-    return read(fd, buf, n);
+    return (long long)read(fd, buf, n);
 }
 
 int tb_adapter_pipe(int *pipefd) {
     if (pipe(pipefd) != 0) return -1;
     int f0 = fcntl(pipefd[0], F_GETFL, 0);
     int f1 = fcntl(pipefd[1], F_GETFL, 0);
-    if (f0 >= 0) fcntl(pipefd[0], F_SETFL, f0 | O_NONBLOCK);
-    if (f1 >= 0) fcntl(pipefd[1], F_SETFL, f1 | O_NONBLOCK);
+    if (f0 >= 0) (void)fcntl(pipefd[0], F_SETFL, f0 | O_NONBLOCK);
+    if (f1 >= 0) (void)fcntl(pipefd[1], F_SETFL, f1 | O_NONBLOCK);
     return 0;
 }
 
@@ -85,8 +120,17 @@ int tb_adapter_poll(int fd, int timeout_ms) {
     return poll(&pfd, 1, timeout_ms);
 }
 
+int tb_adapter_poll_out(int fd, int timeout_ms) {
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = POLLOUT;
+    pfd.revents = 0;
+    return poll(&pfd, 1, timeout_ms);
+}
+
 /* Poll two fds simultaneously. Stores revents in g_poll_revents[0]/[1]. */
 static int g_poll_revents[2];
+
 int tb_adapter_poll_multi(int fd1, int fd2, int timeout_ms) {
     struct pollfd pfds[2];
     pfds[0].fd = fd1;
@@ -95,9 +139,13 @@ int tb_adapter_poll_multi(int fd1, int fd2, int timeout_ms) {
     pfds[1].fd = fd2;
     pfds[1].events = POLLIN;
     pfds[1].revents = 0;
+    g_poll_revents[0] = 0;
+    g_poll_revents[1] = 0;
     int rv = poll(pfds, 2, timeout_ms);
-    g_poll_revents[0] = pfds[0].revents;
-    g_poll_revents[1] = pfds[1].revents;
+    if (rv > 0) {
+        g_poll_revents[0] = pfds[0].revents;
+        g_poll_revents[1] = pfds[1].revents;
+    }
     return rv;
 }
 
@@ -107,6 +155,16 @@ int tb_adapter_poll_revents(int idx) {
     return g_poll_revents[idx];
 }
 
+int tb_adapter_poll_is_in(int idx) {
+    if (idx < 0 || idx > 1) return 0;
+    return (g_poll_revents[idx] & POLLIN) ? 1 : 0;
+}
+
+int tb_adapter_poll_is_err(int idx) {
+    if (idx < 0 || idx > 1) return 0;
+    return (g_poll_revents[idx] & (POLLERR | POLLHUP | POLLNVAL)) ? 1 : 0;
+}
+
 int tb_adapter_isatty(int fd) {
     return isatty(fd);
 }
@@ -114,6 +172,14 @@ int tb_adapter_isatty(int fd) {
 /* errno access. */
 int tb_adapter_errno(void) {
     return errno;
+}
+
+int tb_adapter_is_eintr(void) {
+    return errno == EINTR ? 1 : 0;
+}
+
+int tb_adapter_is_again(void) {
+    return (errno == EAGAIN || errno == EWOULDBLOCK) ? 1 : 0;
 }
 
 /* ttyname — returns const char* as a numeric pointer. */
@@ -166,16 +232,18 @@ int tb_adapter_clear_signwinch(void) {
 /* Resize pipe notification: write a byte to wake the poll loop. */
 int tb_adapter_resize_notify(int fd) {
     const char b = 1;
-    return write(fd, &b, 1);
+    return (int)write(fd, &b, 1);
 }
 
 int tb_adapter_set_raw_mode(int fd) {
     struct termios raw;
     if (tcgetattr(fd, &raw) != 0) return -1;
     /* Disable canonical mode, echo, signal chars, output processing */
-    raw.c_lflag &= ~(ICANON | ECHO | ECHOE | ECHOK | ECHONL | ISIG);
-    raw.c_iflag &= ~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
-    raw.c_oflag &= ~(OPOST);
+    raw.c_lflag &= ~(tcflag_t)(ICANON | ECHO | ECHOE | ECHOK | ECHONL | ISIG);
+    raw.c_iflag &= ~(tcflag_t)(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
+    raw.c_oflag &= ~(tcflag_t)(OPOST);
+    raw.c_cflag &= ~(tcflag_t)(CSIZE | PARENB);
+    raw.c_cflag |= (tcflag_t)(CS8);
     raw.c_cc[VMIN] = 1;
     raw.c_cc[VTIME] = 0;
     return tcsetattr(fd, TCSAFLUSH, &raw);

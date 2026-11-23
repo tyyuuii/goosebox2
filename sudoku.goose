@@ -289,9 +289,6 @@ fn generate_solved_board(g: i32[81]&, seed: i32) -> i32 {
     // Clear the board
     var i = 0;
     for i in 81 { g[i] = 0; }
-    // Initialize xorshift PRNG state from seed
-    var prng_state: u64 = seed as u64;
-
     fn prng_next(state: u64&) -> u32 {
         state ^= state >> 12;
         state ^= state << 25;
@@ -326,7 +323,7 @@ fn generate_solved_board(g: i32[81]&, seed: i32) -> i32 {
             var placed = 0;
             for v_idx in 9 {
                 let v = digits[v_idx];
-                if can_place(g, x, y, v as i32) != 0 {
+                if can_place(g, x, y, v) != 0 {
                     g[pos] = v;
                     if solve_full_board(g, prng_state) != 0 {
                         placed = 1;
@@ -347,6 +344,8 @@ fn generate_solved_board(g: i32[81]&, seed: i32) -> i32 {
     // Simple, reliable approach: fill board from scratch with backtracking
     // using PRNG to shuffle digit order at each step.
     var prng_state: u64 = seed as u64;
+    if prng_state == 0 { prng_state = 0x9E3779B97F4A7C15; }
+    if prng_state == 0 { prng_state = 0x9E3779B97F4A7C15; }
     var ok = solve_full_board(g, prng_state);
     // Validate the generated board
     if ok != 0 && validate_puzzle(g) == 0 {
@@ -383,6 +382,7 @@ fn generate_puzzle(src: i32[81]&, clues: i32, seed: i32) -> i32 {
     var j = 0;
     for j in 81 { order[j] = j as i32; }
     var prng_state: u64 = seed as u64;
+    if prng_state == 0 { prng_state = 0x9E3779B97F4A7C15; }
     var k = 80;
     while k > 0 {
         prng_state ^= prng_state >> 12;
@@ -666,7 +666,7 @@ fn draw_cell(x: i32, y: i32) {
     } else if c.notes != 0 {
         var shown: i32 = 0;
         var n = 1;
-        for n in 10 {
+        for n in 1..10 {
             let bit: u16 = (1 as u64 << n) as u16;
             if c.notes & bit != 0 {
                 if shown < 3 {
@@ -716,39 +716,20 @@ fn draw_status() {
     put_num(69, STATUS_Y + 1, game.moves, TB_WHITE, TB_DEFAULT);
 
     // Focus cell coordinates and notes
+    clear_line(STATUS_Y + 2);
     put_str(0, STATUS_Y + 2, TB_CYAN, TB_DEFAULT, "Cell R");
-    put_num(7, STATUS_Y + 2, game.cursor_y + 1, TB_WHITE, TB_DEFAULT);
-    put_str(8, STATUS_Y + 2, TB_CYAN, TB_DEFAULT, " C");
-    put_num(10, STATUS_Y + 2, game.cursor_x + 1, TB_WHITE, TB_DEFAULT);
-
+    put_num(6, STATUS_Y + 2, game.cursor_y + 1, TB_WHITE, TB_DEFAULT);
+    put_str(7, STATUS_Y + 2, TB_CYAN, TB_DEFAULT, " C");
+    put_num(9, STATUS_Y + 2, game.cursor_x + 1, TB_WHITE, TB_DEFAULT);
     let c = cell_ref(game.cursor_x, game.cursor_y);
     if c.value == 0 && c.notes != 0 {
-        put_str(16, STATUS_Y + 2, TB_CYAN, TB_DEFAULT, "Notes:");
-        var col: i32 = 0;
-        var n: i32 = 1;
-        for n in 10 {
-            let bit: u16 = (1 as u64 << n) as u16;
-            if c.notes & bit != 0 {
-                put(23 + col, STATUS_Y + 2, (0x30 + n) as u32,
-                    TB_MAGENTA, TB_DEFAULT);
-                col = col + 1;
-            }
-        }
-    }
-    clear_line(STATUS_Y + 2);
-    // Re-draw line 2 contents (clear_line wiped it, so draw after)
-    put_str(0, STATUS_Y + 2, TB_CYAN, TB_DEFAULT, "Cell R");
-    put_num(7, STATUS_Y + 2, game.cursor_y + 1, TB_WHITE, TB_DEFAULT);
-    put_str(8, STATUS_Y + 2, TB_CYAN, TB_DEFAULT, " C");
-    put_num(10, STATUS_Y + 2, game.cursor_x + 1, TB_WHITE, TB_DEFAULT);
-    if c.value == 0 && c.notes != 0 {
-        put_str(16, STATUS_Y + 2, TB_CYAN, TB_DEFAULT, "Notes:");
+        put_str(15, STATUS_Y + 2, TB_CYAN, TB_DEFAULT, "Notes:");
         var col2: i32 = 0;
         var n2: i32 = 1;
-        for n2 in 10 {
+        for n2 in 1..10 {
             let bit2: u16 = (1 as u64 << n2) as u16;
             if c.notes & bit2 != 0 {
-                put(23 + col2, STATUS_Y + 2, (0x30 + n2) as u32,
+                put(22 + col2, STATUS_Y + 2, (0x30 + n2) as u32,
                     TB_MAGENTA, TB_DEFAULT);
                 col2 = col2 + 1;
             }
@@ -968,8 +949,10 @@ fn init_puzzle(diff: i32) {
     else if diff == 2 { clues = 28; } // Hard
     else { clues = 24; }              // Expert
 
-    // Mix difficulty into seed so each difficulty gets different puzzles
-    var seed: i32 = base_seed * 4 + diff;
+    // Mix current monotonic time + instance + difficulty so puzzles vary per run
+    let t_mix = (tb_internal_now_ms() & 0x7ffffff) as i32;
+    var seed: i32 = (t_mix ^ (base_seed * 2654435761 as i32)) + diff;
+    if seed == 0 { seed = base_seed * 4 + diff + 1; }
 
     // Generate a solved board with entropy from game instance + difficulty
     // Retry with different seeds if generation fails - NO PUZZLE_EASY FALLBACK
@@ -990,14 +973,26 @@ fn init_puzzle(diff: i32) {
         clues = 40;
     }
 
-    // Generate puzzle with target clue count, seeded by game instance + difficulty
-    // Retry with different seed if puzzle is invalid
+    // Generate puzzle with target clue count, keeping best unique-solution board
+    let target_removed = 81 - clues;
+    var best_src: i32[81] = src;
+    var best_removed: i32 = -1;
     var attempts: i32 = 0;
     while attempts < 50 {
-        let removed = generate_puzzle(src, clues, seed);
-        if removed >= 0 && validate_puzzle(src) != 0 { break; }
+        var candidate: i32[81] = src;
+        let removed = generate_puzzle(candidate, clues, seed);
+        if removed >= 0 && validate_puzzle(candidate) != 0 {
+            if removed > best_removed {
+                best_removed = removed;
+                best_src = candidate;
+            }
+            if removed >= target_removed { break; }
+        }
         seed = seed + 4;
         attempts = attempts + 1;
+    }
+    if best_removed >= 0 {
+        src = best_src;
     }
 
     var i2 = 0;
@@ -1012,8 +1007,8 @@ fn init_puzzle(diff: i32) {
 
     // Compute reference solution for hints.
     var sol: i32[81] = src;
-    let ok = solve_puzzle(sol, 0);
-    if ok != 0 {
+    let sol_ok = solve_puzzle(sol, 0);
+    if sol_ok != 0 {
         var k = 0;
         for k in 81 { game.solution[k] = sol[k]; }
         game.has_solution = 1;
@@ -1117,8 +1112,6 @@ fn main() {
 
     init_puzzle(diff);
     let _ = check_errors();
-    let _ = tb_clear();
-    let _ = tb_present();
     draw_all();
 
     loop {
@@ -1162,7 +1155,7 @@ fn main() {
             undo();
         } else if ev.ch == 'r' || ev.ch == 'R' {
             redo();
-        } else if ev.key == TB_KEY_BACKSPACE || ev.key == TB_KEY_BACKSPACE2 || ev.ch == '0' {
+        } else if ev.key == TB_KEY_BACKSPACE || ev.key == TB_KEY_BACKSPACE2 || ev.key == TB_KEY_DELETE || ev.ch == '0' {
             let c = cell_ref(game.cursor_x, game.cursor_y);
             if c.fixed == 0 {
                 if game.notes_mode != 0 {

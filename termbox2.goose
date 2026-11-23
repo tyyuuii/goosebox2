@@ -264,8 +264,8 @@ struct cellbuf {
 
 struct cap_trie_node {
     c: u8,
-    child_offset: i32,
-    child_count: i32,
+    first_child: i32,
+    next_sibling: i32,
     is_leaf: i32,
     key: u16,
     mod: u8,
@@ -277,11 +277,13 @@ root struct tb_global {
     wfd: i32,
     ttyfd_open: i32,
     fd_owned: i32,
+    has_resize_pipe: i32,
     resize_pipefd: i32[2],
     width: i32,
     height: i32,
     cursor_x: i32,
     cursor_y: i32,
+    cursor_hidden: i32,
     last_x: i32,
     last_y: i32,
     fg: uintattr_t,
@@ -294,7 +296,7 @@ root struct tb_global {
     nterminfo: i64,
     caps: const u8[:][TB_CAP__COUNT],
     cap_trie: cap_trie_node[>..],
-    cap_trie_children: i32[>..],
+    cap_trie_root: i32,
     term_index: i32,
     inbuf: u8[>..],
     inbuf_pos: i64,
@@ -303,8 +305,6 @@ root struct tb_global {
     outbuf_len: i64,
     back: cellbuf,
     front: cellbuf,
-    orig_tios: u8[64],
-    winsize: u8[16],
     has_orig_tios: i32,
     last_errno: i32,
     initialized: i32,
@@ -321,28 +321,32 @@ fn gbl() -> tb_global& {
 // FFI DECLARATIONS
 // ===========================================================================
 
-extern fn tb_adapter_tcgetattr(fd: i32, tios: u8[64]&) -> i32;
-extern fn tb_adapter_tcsetattr(fd: i32, optional_actions: i32, tios: const u8[64]&) -> i32;
-extern fn tb_adapter_ioctl_winsize(fd: i32, request: u64, ws: u8[16]&) -> i32;
-extern fn tb_adapter_fcntl_getfl(fd: i32) -> i32;
-extern fn tb_adapter_fcntl_setfl(fd: i32, flags: i32) -> i32;
-extern fn tb_adapter_open_tty(path: const u8&, flags: i32) -> i32;
+extern fn tb_adapter_save_termios(fd: i32) -> i32;
+extern fn tb_adapter_restore_termios(fd: i32) -> i32;
+extern fn tb_adapter_get_winsize(fd: i32, out_w: i32&, out_h: i32&) -> i32;
+extern fn tb_adapter_set_nonblock(fd: i32) -> i32;
+extern fn tb_adapter_open_tty_rw(path: const u8&) -> i32;
 extern fn tb_adapter_close(fd: i32) -> i32;
 extern fn tb_adapter_write(fd: i32, buf: const u8&, n: u64) -> i64;
 extern fn tb_adapter_read(fd: i32, buf: u8&, n: u64) -> i64;
 extern fn tb_adapter_poll(fd: i32, timeout_ms: i32) -> i32;
+extern fn tb_adapter_poll_out(fd: i32, timeout_ms: i32) -> i32;
 extern fn tb_adapter_poll_multi(fd1: i32, fd2: i32, timeout_ms: i32) -> i32;
-extern fn tb_adapter_poll_revents(idx: i32) -> i32;
+extern fn tb_adapter_poll_is_in(idx: i32) -> i32;
+extern fn tb_adapter_poll_is_err(idx: i32) -> i32;
 extern fn tb_adapter_pipe(pipefd: i32[2]&) -> i32;
 extern fn tb_adapter_isatty(fd: i32) -> i32;
 extern fn tb_adapter_errno() -> i32;
+extern fn tb_adapter_is_eintr() -> i32;
+extern fn tb_adapter_is_again() -> i32;
 extern fn tb_adapter_ttyname(fd: i32) -> u64;
-extern fn tb_adapter_get_ttyname(buf: u8&, bufsz: i32, tty_name_ptr: u64) -> i32;
+extern fn tb_adapter_get_ttyname(buf: u8&, bufsz: u64, tty_name_ptr: u64) -> i32;
 extern fn tb_adapter_setup_signwinch(pipe_fd: i32) -> i32;
 extern fn tb_adapter_clear_signwinch() -> i32;
 extern fn tb_adapter_resize_notify(fd: i32) -> i32;
 extern fn tb_adapter_set_raw_mode(fd: i32) -> i32;
-extern fn tb_adapter_get_term(buf: u8&, bufsz: i32) -> i32;
+extern fn tb_adapter_get_term(buf: u8&, bufsz: u64) -> i32;
+extern fn tb_internal_now_ms() -> i64 = "tb_adapter_now_ms";
 
 // ===========================================================================
 // UTF-8 HELPERS
@@ -364,11 +368,12 @@ fn tb_utf8_char_to_unicode(out: u32&, c: const u8[:]) -> i32 {
     if c.len == 0 { return 0; }
     let first = c[0];
     let len = tb_utf8_char_length(first as i8);
-    if len <= 0 || len > c.len { return -1; }
+    if len <= 0 { return TB_ERR; }
+    if len > c.len { return TB_ERR_NEED_MORE; }
     // Validate continuation bytes
     var i: i32 = 1;
     while i < len {
-        if c[i] & 0xc0 != 0x80 { return -1; }
+        if c[i] & 0xc0 != 0x80 { return TB_ERR; }
         i = i + 1;
     }
     let v0 = first as u32;
@@ -388,12 +393,12 @@ fn tb_utf8_char_to_unicode(out: u32&, c: const u8[:]) -> i32 {
         let b3 = c[3] as u32;
         value = ((v0 & 0x07) << 18) | ((b1 & 0x3f) << 12) | ((b2 & 0x3f) << 6) | (b3 & 0x3f);
     } else {
-        return -1;
+        return TB_ERR;
     }
     // Reject overlong, surrogates, > 0x10ffff
-    if (len == 2 && value < 0x80) || (len == 3 && value < 0x800) || (len == 4 && value < 0x10000) { return -1; }
-    if value >= 0xd800 && value <= 0xdfff { return -1; }
-    if value > 0x10ffff { return -1; }
+    if (len == 2 && value < 0x80) || (len == 3 && value < 0x800) || (len == 4 && value < 0x10000) { return TB_ERR; }
+    if value >= 0xd800 && value <= 0xdfff { return TB_ERR; }
+    if value > 0x10ffff { return TB_ERR; }
     out = value;
     return len;
 }
@@ -404,7 +409,10 @@ fn tb_utf8_unicode_to_char(out: u8[7]&, c: u32) -> i32 {
     var b1: u8 = 0;
     var b2: u8 = 0;
     var b3: u8 = 0;
-    if c < 0x80 {
+    if c > 0x10ffff || (c >= 0xd800 && c <= 0xdfff) {
+        // Replacement character U+FFFD
+        b0 = 0xef; b1 = 0xbf; b2 = 0xbd; len = 3;
+    } else if c < 0x80 {
         b0 = c as u8; len = 1;
     } else if c < 0x800 {
         let sh = (c >> 6) as u8;
@@ -432,6 +440,7 @@ fn tb_utf8_unicode_to_char(out: u8[7]&, c: u32) -> i32 {
     if len >= 2 { out[1] = b1; }
     if len >= 3 { out[2] = b2; }
     if len >= 4 { out[3] = b3; }
+    out[len] = 0;
     return len;
 }
 
@@ -442,12 +451,38 @@ fn tb_iswprint(ch: u32) -> i32 {
     if ch >= 0xa0 && ch <= 0xd7ff { return 1; }
     if ch >= 0xe000 && ch <= 0xfdcf { return 1; }
     if ch >= 0xfdf0 && ch <= 0xfffd { return 1; }
+    if ch >= 0x10000 && ch <= 0x10fffd { return 1; }
     return 0;
 }
 
 fn tb_wcwidth(ch: u32) -> i32 {
-    if ch < 0x20 { return -1; }
-    if ch == 0x7f { return -1; }
+    if ch == 0 { return 0; }
+    if ch < 0x20 || (ch >= 0x7f && ch < 0xa0) { return -1; }
+    // Common combining marks
+    if (ch >= 0x0300 && ch <= 0x036f) ||
+       (ch >= 0x1ab0 && ch <= 0x1aff) ||
+       (ch >= 0x1dc0 && ch <= 0x1dff) ||
+       (ch >= 0x20d0 && ch <= 0x20ff) ||
+       (ch >= 0xfe00 && ch <= 0xfe0f) ||
+       (ch >= 0xfe20 && ch <= 0xfe2f) {
+        return 0;
+    }
+    // Wide East Asian & emoji ranges
+    if ch >= 0x1100 && (
+        ch <= 0x115f ||
+        ch == 0x2329 || ch == 0x232a ||
+        (ch >= 0x2e80 && ch <= 0xa4cf && ch != 0x303f) ||
+        (ch >= 0xac00 && ch <= 0xd7a3) ||
+        (ch >= 0xf900 && ch <= 0xfaff) ||
+        (ch >= 0xfe10 && ch <= 0xfe19) ||
+        (ch >= 0xfe30 && ch <= 0xfe6f) ||
+        (ch >= 0xff00 && ch <= 0xff60) ||
+        (ch >= 0xffe0 && ch <= 0xffe6) ||
+        (ch >= 0x1f300 && ch <= 0x1faff) ||
+        (ch >= 0x20000 && ch <= 0x3fffd)
+    ) {
+        return 2;
+    }
     return 1;
 }
 
@@ -465,16 +500,16 @@ fn tb_height() -> i32 {
 
 fn tb_set_clear_attrs(fg: uintattr_t, bg: uintattr_t) -> i32 {
     let g = gbl();
-    g.last_fg = fg;
-    g.last_bg = bg;
+    g.fg = fg;
+    g.bg = bg;
     return TB_OK;
 }
 
 fn tb_clear() -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
-    let fg = g.last_fg;
-    let bg = g.last_bg;
+    let fg = g.fg;
+    let bg = g.bg;
     var y = 0;
     for y in g.height {
         var x = 0;
@@ -502,8 +537,6 @@ fn tb_set_cell_ex(x: i32, y: i32, ch: const u32&, nch: i64, fg: uintattr_t, bg: 
     g.back.cells[idx].ch = ch;
     g.back.cells[idx].fg = fg;
     g.back.cells[idx].bg = bg;
-    // nch not used: Goose cells hold a single codepoint.
-    // Callers needing wide chars should set cell at x and x+1 manually.
     return TB_OK;
 }
 
@@ -516,12 +549,6 @@ fn tb_extend_cell(x: i32, y: i32, ch: u32) -> i32 {
     if TB_OPT_EGC == 0 {
         return TB_ERR;
     }
-    let idx = y * g.width + x;
-    // EGC extension: append ch to existing cell's combining sequence.
-    // Goose cells hold one codepoint; store extension in bg as a marker.
-    let existing = g.back.cells[idx].ch;
-    g.back.cells[idx].ch = existing;
-    g.back.cells[idx].bg = g.back.cells[idx].bg | ((ch & 0xffff) as uintattr_t << 32);
     return TB_OK;
 }
 
@@ -558,9 +585,44 @@ fn grow_cells(buf: cellbuf&, width: i32, height: i32) -> i32 {
     return TB_OK;
 }
 
+fn reset_cellbuf(buf: cellbuf&, ch: u32, fg: uintattr_t, bg: uintattr_t) {
+    var y = 0;
+    for y in buf.height {
+        var x = 0;
+        for x in buf.width {
+            let idx = y * buf.width + x;
+            buf.cells[idx].ch = ch;
+            buf.cells[idx].fg = fg;
+            buf.cells[idx].bg = bg;
+        }
+    }
+}
+
 // ===========================================================================
-// TTY INITIALIZATION
+// TTY INITIALIZATION & SHUTDOWN
 // ===========================================================================
+
+fn cleanup_partial_init() {
+    let g = gbl();
+    let _ = tb_adapter_clear_signwinch();
+    if g.has_orig_tios != 0 {
+        let _ = tb_adapter_restore_termios(g.rfd);
+        g.has_orig_tios = 0;
+    }
+    if g.has_resize_pipe != 0 {
+        let _ = tb_adapter_close(g.resize_pipefd[0]);
+        let _ = tb_adapter_close(g.resize_pipefd[1]);
+        g.resize_pipefd[0] = -1;
+        g.resize_pipefd[1] = -1;
+        g.has_resize_pipe = 0;
+    }
+    if g.ttyfd_open != 0 && g.fd_owned != 0 {
+        let _ = tb_adapter_close(g.ttyfd);
+    }
+    g.ttyfd_open = 0;
+    g.fd_owned = 0;
+    g.initialized = 0;
+}
 
 fn tb_init() -> i32 {
     return tb_init_file("/dev/tty");
@@ -570,141 +632,177 @@ fn tb_init_file(path: const u8[:]) -> i32 {
     let g = gbl();
     guard g.initialized == 0 else { return TB_ERR_INIT_ALREADY; }
 
-    let pathbuf: u8[>..] = [];
+    var pathbuf: u8[>..] = [];
     var i = 0;
     for i in path.len { pathbuf.push(path[i]); }
     pathbuf.push(0);
 
-    let fd = tb_adapter_open_tty(&pathbuf[0], O_RDWR);
+    let fd = tb_adapter_open_tty_rw(pathbuf[0]);
     guard fd >= 0 else { return TB_ERR_INIT_OPEN; }
 
     g.fd_owned = 1;
-    return tb_init_fd(fd);
+    let rv = tb_init_fd(fd);
+    if rv != TB_OK {
+        // tb_init_rwfd cleans up fd_owned on failure, ensure cleared
+        g.fd_owned = 0;
+    }
+    return rv;
 }
 
 fn tb_init_fd(ttyfd: i32) -> i32 {
     return tb_init_rwfd(ttyfd, ttyfd);
 }
 
+fn str_starts_with(haystack: const u8[:], prefix: const u8[:]) -> i32 {
+    if prefix.len == 0 || haystack.len < prefix.len { return 0; }
+    var i = 0;
+    for i in prefix.len {
+        if haystack[i] != prefix[i] { return 0; }
+    }
+    return 1;
+}
+
+fn str_equals(a: const u8[:], b: const u8[:]) -> i32 {
+    if a.len != b.len { return 0; }
+    var i = 0;
+    for i in a.len {
+        if a[i] != b[i] { return 0; }
+    }
+    return 1;
+}
+
 fn tb_init_rwfd(rfd: i32, wfd: i32) -> i32 {
     let g = gbl();
-    // If re-initializing, clean up previous state first
     if g.initialized != 0 {
-        // Clean up previous state
-        if g.has_orig_tios != 0 {
-            let _ = tb_adapter_tcsetattr(g.rfd, 0, g.orig_tios);
-        }
-        if g.ttyfd_open != 0 && g.fd_owned != 0 {
-            let _ = tb_adapter_close(g.ttyfd);
-        }
-        if g.resize_pipefd[0] != 0 {
-            let _ = tb_adapter_close(g.resize_pipefd[0]);
-        }
-        if g.resize_pipefd[1] != 0 {
-            let _ = tb_adapter_close(g.resize_pipefd[1]);
-        }
-        tb_adapter_clear_signwinch();
-        // Reset cell buffers (borrow checker prevents direct len assignment on globals)
-        // cap_trie_build() will rebuild trie on re-init
-        var i: i32 = 0;
-        g.last_fg = TB_DEFAULT;
-        g.last_bg = TB_DEFAULT;
-        g.cursor_x = -1;
-        g.cursor_y = -1;
-        g.last_x = -1;
-        g.last_y = -1;
-        // Reset other state
-        g.initialized = 0;
-        g.has_orig_tios = 0;
-        g.fd_owned = 0;
+        let _ = tb_shutdown();
     }
 
-    guard tb_adapter_isatty(rfd) != 0 else { return TB_ERR_NOT_INIT; }
+    if tb_adapter_isatty(rfd) == 0 {
+        if g.fd_owned != 0 {
+            let _ = tb_adapter_close(rfd);
+            g.fd_owned = 0;
+        }
+        return TB_ERR_NOT_INIT;
+    }
 
     g.ttyfd = rfd;
-    g.wfd = wfd;
     g.rfd = rfd;
+    g.wfd = wfd;
     g.ttyfd_open = 1;
-    // Only reset fd_owned if not already set by tb_init_file
-    if g.fd_owned == 0 { g.fd_owned = 0; }
+    g.has_resize_pipe = 0;
+    g.resize_pipefd[0] = -1;
+    g.resize_pipefd[1] = -1;
+    g.has_orig_tios = 0;
+    g.last_errno = 0;
 
-    let rv = tb_adapter_tcgetattr(rfd, g.orig_tios);
-    if rv != 0 { return TB_ERR_TCGETATTR; }
+    if tb_adapter_save_termios(rfd) != 0 {
+        g.last_errno = tb_adapter_errno();
+        cleanup_partial_init();
+        return TB_ERR_TCGETATTR;
+    }
     g.has_orig_tios = 1;
 
-    let flags = tb_adapter_fcntl_getfl(rfd);
-    if flags < 0 { return TB_ERR_READ; }
-    let rv2 = tb_adapter_fcntl_setfl(rfd, flags | O_NONBLOCK);
-    if rv2 != 0 { return TB_ERR_READ; }
+    if tb_adapter_set_nonblock(rfd) != 0 {
+        g.last_errno = tb_adapter_errno();
+        cleanup_partial_init();
+        return TB_ERR_READ;
+    }
 
-    let rv_raw = tb_adapter_set_raw_mode(rfd);
-    if rv_raw != 0 { return TB_ERR_TCSETATTR; }
+    if tb_adapter_set_raw_mode(rfd) != 0 {
+        g.last_errno = tb_adapter_errno();
+        cleanup_partial_init();
+        return TB_ERR_TCSETATTR;
+    }
 
-    var pipefd: i32[2] = [0, 0];
-    let rv3 = tb_adapter_pipe(pipefd);
-    if rv3 != 0 { return TB_ERR_RESIZE_PIPE; }
+    var pipefd: i32[2] = [-1, -1];
+    if tb_adapter_pipe(pipefd) != 0 {
+        g.last_errno = tb_adapter_errno();
+        cleanup_partial_init();
+        return TB_ERR_RESIZE_PIPE;
+    }
     g.resize_pipefd[0] = pipefd[0];
     g.resize_pipefd[1] = pipefd[1];
+    g.has_resize_pipe = 1;
 
-    let rv4 = tb_adapter_ioctl_winsize(rfd, TIOCGWINSZ, g.winsize);
-    if rv4 != 0 { return TB_ERR_RESIZE_IOCTL; }
-    g.height = (g.winsize[0] as i32) | ((g.winsize[1] as i32) << 8);
-    g.width = (g.winsize[2] as i32) | ((g.winsize[3] as i32) << 8);
-    if !(g.width > 0 && g.height > 0) { return TB_ERR_RESIZE_IOCTL; }
+    var w: i32 = 0;
+    var h: i32 = 0;
+    if tb_adapter_get_winsize(wfd, w, h) != 0 {
+        if tb_adapter_get_winsize(rfd, w, h) != 0 {
+            g.last_errno = tb_adapter_errno();
+            cleanup_partial_init();
+            return TB_ERR_RESIZE_IOCTL;
+        }
+    }
+    if !(w > 0 && h > 0) {
+        cleanup_partial_init();
+        return TB_ERR_RESIZE_IOCTL;
+    }
+    g.width = w;
+    g.height = h;
 
-    // Terminal capability detection - use TERM env var
+    // Terminal capability detection - use TERM env var (exact, then alias, then prefix)
+    g.term_index = -1;
     var term_name: u8[64] = [0; 64];
-    let rv = tb_adapter_get_term(&term_name[0], 64);
-    if rv >= 0 {
-        let term_idx = find_builtin_term(term_name[0..rv]);
+    let rv = tb_adapter_get_term(term_name[0], 64);
+    if rv > 0 {
+        let tslice = term_name[0..rv];
+        let term_idx = find_builtin_term(tslice);
         if term_idx >= 0 {
             g.term_index = term_idx;
-            let entry = builtin_terms[term_idx];
-            g.caps = entry.caps;
         } else {
-            // Try prefix match for things like "xterm-256color"
             var i: i32 = 0;
-            for i in 6 {  // Number of builtin terms
+            for i in builtin_terms.len {
                 let entry = builtin_terms[i];
-                var j = 0;
-                var matched = 1;
-                for j in entry.name.len {
-                    if term_name[j] != entry.name[j] { matched = 0; break; }
-                }
-                if matched != 0 {
+                if str_starts_with(tslice, entry.name) != 0 ||
+                   str_starts_with(tslice, entry.alias) != 0 {
                     g.term_index = i as i32;
-                    g.caps = entry.caps;
                     break;
                 }
             }
-            if g.term_index == -1 {
-                g.term_index = 0;
-                g.caps = builtin_terms[0].caps;
-            }
         }
-    } else {
-        g.term_index = 0;
-        g.caps = builtin_terms[0].caps;
     }
+    if g.term_index < 0 {
+        g.term_index = 0;
+    }
+    g.caps = builtin_terms[g.term_index].caps;
 
-    // Build capability trie
+    // Build capability trie (re-creates root cleanly on re-init)
     let _ = cap_trie_build();
 
     // Initialize back and front cell buffers
     let _ = grow_cells(g.back, g.width, g.height);
     let _ = grow_cells(g.front, g.width, g.height);
+    reset_cellbuf(g.back, 0x20, TB_DEFAULT, TB_DEFAULT);
+    reset_cellbuf(g.front, 0xffffffff, 0xffffffffffffffff, 0xffffffffffffffff);
 
-    let rv5 = tb_adapter_setup_signwinch(g.resize_pipefd[1]);
-    if rv5 != 0 { return TB_ERR_RESIZE_SIGACTION; }
+    if tb_adapter_setup_signwinch(g.resize_pipefd[1]) != 0 {
+        g.last_errno = tb_adapter_errno();
+        cleanup_partial_init();
+        return TB_ERR_RESIZE_SIGACTION;
+    }
 
     g.input_mode = TB_INPUT_ESC;
     g.output_mode = TB_OUTPUT_NORMAL;
+    g.fg = TB_DEFAULT;
+    g.bg = TB_DEFAULT;
+    g.last_fg = 0xffffffffffffffff;
+    g.last_bg = 0xffffffffffffffff;
     g.inbuf_pos = 0;
     g.inbuf_len = 0;
     g.outbuf_len = 0;
     g.cursor_x = -1;
     g.cursor_y = -1;
+    g.cursor_hidden = 1;
+    g.last_x = -1;
+    g.last_y = -1;
     g.initialized = 1;
+
+    // Enter alternate screen, keypad transmit mode, hide cursor, clear screen
+    if g.caps[TB_CAP_ENTER_CA].len > 0 { let _ = outbuf_puts(g.caps[TB_CAP_ENTER_CA]); }
+    if g.caps[TB_CAP_ENTER_KEYPAD].len > 0 { let _ = outbuf_puts(g.caps[TB_CAP_ENTER_KEYPAD]); }
+    if g.caps[TB_CAP_HIDE_CURSOR].len > 0 { let _ = outbuf_puts(g.caps[TB_CAP_HIDE_CURSOR]); }
+    if g.caps[TB_CAP_CLEAR_SCREEN].len > 0 { let _ = outbuf_puts(g.caps[TB_CAP_CLEAR_SCREEN]); }
+    let _ = outbuf_flush(g.wfd);
 
     return TB_OK;
 }
@@ -713,21 +811,37 @@ fn tb_shutdown() -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
 
+    // Restore terminal modes before restoring termios and closing fds
+    if (g.input_mode & TB_INPUT_MOUSE) != 0 {
+        let _ = outbuf_puts(TB_HARDCAP_EXIT_MOUSE);
+    }
+    if g.caps[TB_CAP_SHOW_CURSOR].len > 0 { let _ = outbuf_puts(g.caps[TB_CAP_SHOW_CURSOR]); }
+    if g.caps[TB_CAP_SGR0].len > 0 { let _ = outbuf_puts(g.caps[TB_CAP_SGR0]); }
+    if g.caps[TB_CAP_EXIT_KEYPAD].len > 0 { let _ = outbuf_puts(g.caps[TB_CAP_EXIT_KEYPAD]); }
+    if g.caps[TB_CAP_EXIT_CA].len > 0 { let _ = outbuf_puts(g.caps[TB_CAP_EXIT_CA]); }
+    let _ = outbuf_flush(g.wfd);
+
     // Clear SIGWINCH handler before closing pipe fds
-    tb_adapter_clear_signwinch();
+    let _ = tb_adapter_clear_signwinch();
 
     if g.has_orig_tios != 0 {
-        let _ = tb_adapter_tcsetattr(g.rfd, 0, g.orig_tios);
+        let _ = tb_adapter_restore_termios(g.rfd);
+        g.has_orig_tios = 0;
     }
 
     if g.ttyfd_open != 0 && g.fd_owned != 0 {
         let _ = tb_adapter_close(g.ttyfd);
     }
-    let _ = tb_adapter_close(g.resize_pipefd[0]);
-    let _ = tb_adapter_close(g.resize_pipefd[1]);
+    if g.has_resize_pipe != 0 {
+        let _ = tb_adapter_close(g.resize_pipefd[0]);
+        let _ = tb_adapter_close(g.resize_pipefd[1]);
+        g.resize_pipefd[0] = -1;
+        g.resize_pipefd[1] = -1;
+        g.has_resize_pipe = 0;
+    }
 
     g.initialized = 0;
-    g.has_orig_tios = 0;
+    g.ttyfd_open = 0;
     g.fd_owned = 0;
     return TB_OK;
 }
@@ -800,22 +914,22 @@ const linux_caps: const u8[:][TB_CAP__COUNT] = [
     "\x1b[B",       // kcud1
     "\x1b[D",       // kcub1
     "\x1b[C",       // kcuf1
-    "\x1b\x09",      // kcbt
-    "",              // smcup
-    "",              // rmcup
+    "\x1b\x09",     // kcbt
+    "",             // smcup
+    "",             // rmcup
     "\x1b[?25h\x1b[?0c",  // cnorm
     "\x1b[?25l\x1b[?1c",  // civis
     "\x1b[H\x1b[J",       // clear
     "\x1b[m\x0f",         // sgr0
-    "\x1b[4m",             // smul
-    "\x1b[1m",             // bold
-    "\x1b[5m",             // blink
-    "",                     // sitm
-    "\x1b[7m",             // rev
-    "",                     // smkx
-    "",                     // rmkx
-    "\x1b[2m",             // dim
-    "",                     // invis
+    "\x1b[4m",            // smul
+    "\x1b[1m",            // bold
+    "\x1b[5m",            // blink
+    "",                   // sitm
+    "\x1b[7m",            // rev
+    "",                   // smkx
+    "",                   // rmkx
+    "\x1b[2m",            // dim
+    "",                   // invis
 ];
 
 struct term_entry {
@@ -836,15 +950,11 @@ const builtin_terms: term_entry[6] = [
 fn find_builtin_term(name: const u8[:]) -> i32 {
     var i = 0;
     for i in builtin_terms.len {
-        let a = builtin_terms[i].name;
-        let b = name;
-        if a.len == b.len {
-            var j = 0;
-            var matched = 1;
-            for j in a.len {
-                if a[j] != b[j] { matched = 0; }
-            }
-            if matched != 0 { return i as i32; }
+        if str_equals(builtin_terms[i].name, name) != 0 {
+            return i as i32;
+        }
+        if builtin_terms[i].alias.len > 0 && str_equals(builtin_terms[i].alias, name) != 0 {
+            return i as i32;
         }
     }
     return -1;
@@ -897,7 +1007,7 @@ fn tb_strerror(err: i32) -> const u8[:] {
 }
 
 // ===========================================================================
-// ESCAPE SEQUENCE PARSER & EVENT POLLING
+// ESCAPE SEQUENCE PARSER (CAP TRIE + CSI + MOUSE) & EVENT POLLING
 // ===========================================================================
 
 fn cap_trie_add_node(c: u8) -> i32 {
@@ -905,8 +1015,8 @@ fn cap_trie_add_node(c: u8) -> i32 {
     let idx = g.cap_trie.len;
     g.cap_trie.push(cap_trie_node {
         c: c,
-        child_offset: 0,
-        child_count: 0,
+        first_child: -1,
+        next_sibling: -1,
         is_leaf: 0,
         key: 0,
         mod: 0,
@@ -916,13 +1026,12 @@ fn cap_trie_add_node(c: u8) -> i32 {
 
 fn cap_trie_find_child(node: i32, c: u8) -> i32 {
     let g = gbl();
-    let n = &g.cap_trie[node];
-    var i = 0;
-    for i in n.child_count {
-        let child_idx = g.cap_trie_children[n.child_offset + i];
-        if g.cap_trie[child_idx].c == c {
-            return child_idx;
+    var cur = g.cap_trie[node].first_child;
+    while cur >= 0 {
+        if g.cap_trie[cur].c == c {
+            return cur;
         }
+        cur = g.cap_trie[cur].next_sibling;
     }
     return -1;
 }
@@ -932,104 +1041,313 @@ fn cap_trie_add_child(node: i32, c: u8) -> i32 {
     if existing >= 0 { return existing; }
     let new_idx = cap_trie_add_node(c);
     let g = gbl();
-    let n = &g.cap_trie[node];
-    let off = g.cap_trie_children.len;
-    g.cap_trie_children.push(0);
-    g.cap_trie_children[off] = new_idx;
-    g.cap_trie[node].child_count = n.child_count + 1;
-    if n.child_count == 0 {
-        g.cap_trie[node].child_offset = off as i32;
-    }
+    let old_first = g.cap_trie[node].first_child;
+    g.cap_trie[new_idx].next_sibling = old_first;
+    g.cap_trie[node].first_child = new_idx;
     return new_idx;
 }
 
+fn cap_trie_insert_seq(seq: const u8[:], key_code: u16, mod_val: u8) {
+    if seq.len == 0 { return; }
+    let g = gbl();
+    var node = g.cap_trie_root;
+    var si = 0;
+    for si in seq.len {
+        node = cap_trie_add_child(node, seq[si]);
+    }
+    if g.cap_trie[node].is_leaf == 0 {
+        g.cap_trie[node].is_leaf = 1;
+        g.cap_trie[node].key = key_code;
+        g.cap_trie[node].mod = mod_val;
+    }
+}
+
 fn cap_trie_build() -> i32 {
-    cap_trie_add_node(0);
+    let g = gbl();
+    g.cap_trie_root = cap_trie_add_node(0);
+
+    // 1) Insert active terminal's key capabilities first so they take priority
+    var ci = 0;
+    for ci in TB_CAP__COUNT_KEYS {
+        cap_trie_insert_seq(g.caps[ci], (0xffff - ci) as u16, 0);
+    }
+
+    // 2) Insert standard CSI/SS3 fallbacks common across modern terminals
+    cap_trie_insert_seq("\x1b[A", TB_KEY_ARROW_UP, 0);
+    cap_trie_insert_seq("\x1b[B", TB_KEY_ARROW_DOWN, 0);
+    cap_trie_insert_seq("\x1b[C", TB_KEY_ARROW_RIGHT, 0);
+    cap_trie_insert_seq("\x1b[D", TB_KEY_ARROW_LEFT, 0);
+    cap_trie_insert_seq("\x1b[H", TB_KEY_HOME, 0);
+    cap_trie_insert_seq("\x1b[F", TB_KEY_END, 0);
+    cap_trie_insert_seq("\x1b[Z", TB_KEY_BACK_TAB, 0);
+
+    // 3) Insert remaining built-in terminal key capabilities without overriding
     var ti = 0;
     for ti in builtin_terms.len {
         let entry = builtin_terms[ti];
-        var ci = 0;
-        for ci in TB_CAP__COUNT {
-            let caps = entry.caps;
-            let seq = caps[ci];
-            if seq.len == 0 { continue; }
-            var node: i32 = 0;
-            var si = 0;
-            for si in seq.len {
-                node = cap_trie_add_child(node, seq[si]);
-            }
-            let g = gbl();
-            g.cap_trie[node].is_leaf = 1;
-            g.cap_trie[node].key = ci as u16;
-            g.cap_trie[node].mod = 0;
+        var ci2 = 0;
+        for ci2 in TB_CAP__COUNT_KEYS {
+            cap_trie_insert_seq(entry.caps[ci2], (0xffff - ci2) as u16, 0);
         }
     }
+
     return TB_OK;
 }
 
+fn xterm_mod_to_tb(m: i32) -> u8 {
+    let bits = m - 1;
+    var mod_out: u8 = 0;
+    if (bits & 1) != 0 { mod_out = mod_out | TB_MOD_SHIFT; }
+    if (bits & 2) != 0 { mod_out = mod_out | TB_MOD_ALT; }
+    if (bits & 4) != 0 { mod_out = mod_out | TB_MOD_CTRL; }
+    return mod_out;
+}
+
+fn apply_mouse_btn(event: tb_event&, cb: i32, is_release: i32) {
+    event.mod = 0;
+    if (cb & 4) != 0 { event.mod = event.mod | TB_MOD_SHIFT; }
+    if (cb & 8) != 0 { event.mod = event.mod | TB_MOD_ALT; }
+    if (cb & 16) != 0 { event.mod = event.mod | TB_MOD_CTRL; }
+    if (cb & 32) != 0 { event.mod = event.mod | TB_MOD_MOTION; }
+    event.ch = 0;
+
+    if is_release != 0 {
+        event.key = TB_KEY_MOUSE_RELEASE;
+        return;
+    }
+    if (cb & 64) != 0 {
+        if (cb & 1) != 0 {
+            event.key = TB_KEY_MOUSE_WHEEL_DOWN;
+        } else {
+            event.key = TB_KEY_MOUSE_WHEEL_UP;
+        }
+        return;
+    }
+    let btn = cb & 3;
+    if btn == 0 { event.key = TB_KEY_MOUSE_LEFT; }
+    else if btn == 1 { event.key = TB_KEY_MOUSE_MIDDLE; }
+    else if btn == 2 { event.key = TB_KEY_MOUSE_RIGHT; }
+    else { event.key = TB_KEY_MOUSE_RELEASE; }
+}
+
+fn parse_sgr_mouse(buf: const u8[:], event: tb_event&) -> i32 {
+    let g = gbl();
+    // Format: \x1b[<b;x;yM  or  \x1b[<b;x;ym
+    var i: i64 = 3;
+    var vals: i32[3] = [0, 0, 0];
+    var field: i32 = 0;
+    var have_digit: i32 = 0;
+    while i < buf.len {
+        let ch = buf[i];
+        if ch >= '0' && ch <= '9' {
+            vals[field] = vals[field] * 10 + (ch - '0');
+            have_digit = 1;
+        } else if ch == ';' {
+            if have_digit == 0 || field >= 2 { return 0; }
+            field = field + 1;
+            have_digit = 0;
+        } else if ch == 'M' || ch == 'm' {
+            if field != 2 || have_digit == 0 { return 0; }
+            if (g.input_mode & TB_INPUT_MOUSE) != 0 {
+                event.kind = TB_EVENT_MOUSE;
+                event.x = vals[1] - 1;
+                event.y = vals[2] - 1;
+                apply_mouse_btn(event, vals[0], if ch == 'm' { 1 } else { 0 });
+            } else {
+                event.kind = 0;
+            }
+            return (i + 1) as i32;
+        } else {
+            return 0;
+        }
+        i = i + 1;
+    }
+    if buf.len < 32 { return TB_ERR_NEED_MORE; }
+    return 0;
+}
+
+fn parse_csi_modified(buf: const u8[:], end: i64, event: tb_event&) -> i32 {
+    // Parse \x1b[p1;p2<final> or \x1b[p1<final>
+    var p1: i32 = 0;
+    var p2: i32 = 0;
+    var has_p1: i32 = 0;
+    var has_p2: i32 = 0;
+    var in_p2: i32 = 0;
+    var i: i64 = 2;
+    while i < end {
+        let ch = buf[i];
+        if ch >= '0' && ch <= '9' {
+            if in_p2 == 0 {
+                p1 = p1 * 10 + (ch - '0');
+                has_p1 = 1;
+            } else {
+                p2 = p2 * 10 + (ch - '0');
+                has_p2 = 1;
+            }
+        } else if ch == ';' {
+            if in_p2 != 0 { return 0; }
+            in_p2 = 1;
+        } else {
+            return 0;
+        }
+        i = i + 1;
+    }
+
+    let fin = buf[end];
+    var key: u16 = 0;
+    var mod_val: u8 = 0;
+
+    if fin == '~' {
+        if has_p1 == 0 { return 0; }
+        if p1 == 2 { key = TB_KEY_INSERT; }
+        else if p1 == 3 { key = TB_KEY_DELETE; }
+        else if p1 == 1 || p1 == 7 { key = TB_KEY_HOME; }
+        else if p1 == 4 || p1 == 8 { key = TB_KEY_END; }
+        else if p1 == 5 { key = TB_KEY_PGUP; }
+        else if p1 == 6 { key = TB_KEY_PGDN; }
+        else if p1 == 15 { key = TB_KEY_F5; }
+        else if p1 == 17 { key = TB_KEY_F6; }
+        else if p1 == 18 { key = TB_KEY_F7; }
+        else if p1 == 19 { key = TB_KEY_F8; }
+        else if p1 == 20 { key = TB_KEY_F9; }
+        else if p1 == 21 { key = TB_KEY_F10; }
+        else if p1 == 23 { key = TB_KEY_F11; }
+        else if p1 == 24 { key = TB_KEY_F12; }
+        else { return 0; }
+        if has_p2 != 0 { mod_val = xterm_mod_to_tb(p2); }
+    } else if has_p1 != 0 && p1 == 1 && has_p2 != 0 {
+        mod_val = xterm_mod_to_tb(p2);
+        if fin == 'A' { key = TB_KEY_ARROW_UP; }
+        else if fin == 'B' { key = TB_KEY_ARROW_DOWN; }
+        else if fin == 'C' { key = TB_KEY_ARROW_RIGHT; }
+        else if fin == 'D' { key = TB_KEY_ARROW_LEFT; }
+        else if fin == 'H' { key = TB_KEY_HOME; }
+        else if fin == 'F' { key = TB_KEY_END; }
+        else if fin == 'P' { key = TB_KEY_F1; }
+        else if fin == 'Q' { key = TB_KEY_F2; }
+        else if fin == 'R' { key = TB_KEY_F3; }
+        else if fin == 'S' { key = TB_KEY_F4; }
+        else { return 0; }
+    } else {
+        return 0;
+    }
+
+    event.kind = TB_EVENT_KEY;
+    event.mod = mod_val;
+    event.key = key;
+    event.ch = 0;
+    return 1;
+}
+
 fn try_match_escape_buf(buf: const u8[:], event: tb_event&) -> i32 {
+    let g = gbl();
     guard buf.len > 0 else { return 0; }
     guard buf[0] == 0x1b else { return 0; }
 
+    event.kind = 0;
+    event.mod = 0;
+    event.key = 0;
+    event.ch = 0;
+
     if buf.len == 1 {
         event.kind = TB_EVENT_KEY;
-        event.mod = 0;
         event.key = TB_KEY_ESC;
-        event.ch = 0;
         return 1;
     }
 
-    // ESC followed by an introducer: '[' (CSI) or 'O' (SS3)
-    let intro = buf[1];
-    if intro != 0x5b && intro != 0x4f {
-        // Not CSI or SS3: ESC by itself
-        event.kind = TB_EVENT_KEY;
-        event.mod = 0;
-        event.key = TB_KEY_ESC;
-        event.ch = 0;
-        return 1;
+    // 1) Mouse sequences
+    if buf.len >= 3 && buf[1] == '[' && buf[2] == '<' {
+        let mrv = parse_sgr_mouse(buf, event);
+        if mrv != 0 { return mrv; }
+    }
+    if buf.len >= 3 && buf[1] == '[' && buf[2] == 'M' {
+        if buf.len < 6 { return TB_ERR_NEED_MORE; }
+        if (g.input_mode & TB_INPUT_MOUSE) != 0 {
+            event.kind = TB_EVENT_MOUSE;
+            let cb = (buf[3] as i32) - 32;
+            event.x = (buf[4] as i32) - 33;
+            event.y = (buf[5] as i32) - 33;
+            apply_mouse_btn(event, cb, if (cb & 3) == 3 { 1 } else { 0 });
+        } else {
+            event.kind = 0;
+        }
+        return 6;
     }
 
-    // Find the final byte (0x40-0x7e) that terminates the sequence.
-    // Start at index 2 to skip the introducer byte (0x5b '[' or 0x4f 'O')
-    // which is itself in the 0x40-0x7e range.
-    var end = 2;
-    while end < buf.len {
-        let b = buf[end];
-        if b >= 0x40 && b <= 0x7e { break; }
-        end = end + 1;
+    // 2) Walk capability trie
+    var node = g.cap_trie_root;
+    var i: i64 = 0;
+    while i < buf.len {
+        let next = cap_trie_find_child(node, buf[i]);
+        if next < 0 { break; }
+        node = next;
+        if g.cap_trie[node].is_leaf != 0 {
+            event.kind = TB_EVENT_KEY;
+            event.mod = g.cap_trie[node].mod;
+            event.key = g.cap_trie[node].key;
+            event.ch = 0;
+            return (i + 1) as i32;
+        }
+        i = i + 1;
     }
-    if end >= buf.len { return TB_ERR_NEED_MORE; }
+    if i == buf.len && g.cap_trie[node].first_child >= 0 {
+        return TB_ERR_NEED_MORE;
+    }
 
-    let seq_len = end + 1;
+    // 3) CSI sequence (\x1b[ ... final)
+    if buf[1] == '[' {
+        var end: i64 = 2;
+        while end < buf.len {
+            let b = buf[end];
+            if b >= 0x40 && b <= 0x7e { break; }
+            end = end + 1;
+        }
+        if end >= buf.len {
+            if buf.len < 32 { return TB_ERR_NEED_MORE; }
+            // Overlong malformed CSI: discard ESC
+            event.kind = TB_EVENT_KEY;
+            event.key = TB_KEY_ESC;
+            return 1;
+        }
+        let seq_len = (end + 1) as i32;
+        if parse_csi_modified(buf, end, event) != 0 {
+            return seq_len;
+        }
+        // Unrecognized complete CSI sequence (e.g. focus in/out): consume silently
+        event.kind = 0;
+        return seq_len;
+    }
 
-    // Match against every builtin capability sequence.
-    var ti = 0;
-    for ti in builtin_terms.len {
-        let entry = builtin_terms[ti];
-        var ci = 0;
-        for ci in TB_CAP__COUNT {
-            let caps = entry.caps;
-            let seq = caps[ci];
-            if seq.len == 0 { continue; }
-            if seq.len != seq_len { continue; }
-            var matched = 1;
-            var k = 0;
-            for k in seq.len {
-                if seq[k] != buf[k] { matched = 0; }
-            }
-            if matched != 0 {
-                // Key codes are 0xffff - cap_index (e.g. cap 18 = arrow up → key 0xffed)
-                event.kind = TB_EVENT_KEY;
-                event.mod = 0;
-                event.key = (0xffff - ci) as u16;
-                event.ch = 0;
-                return seq_len as i32;
-            }
+    // 4) SS3 sequence (\x1bO<ch>) not in trie
+    if buf[1] == 'O' {
+        if buf.len < 3 { return TB_ERR_NEED_MORE; }
+        event.kind = 0;
+        return 3;
+    }
+
+    // 5) TB_INPUT_ALT: ESC + char/control
+    if (g.input_mode & TB_INPUT_ALT) != 0 {
+        let b1 = buf[1];
+        if b1 < 0x20 || b1 == 0x7f {
+            event.kind = TB_EVENT_KEY;
+            event.mod = TB_MOD_ALT;
+            event.key = b1;
+            event.ch = 0;
+            return 2;
+        }
+        var uni: u32 = 0;
+        let urv = tb_utf8_char_to_unicode(uni, buf[1..]);
+        if urv == TB_ERR_NEED_MORE { return TB_ERR_NEED_MORE; }
+        if urv > 0 {
+            event.kind = TB_EVENT_KEY;
+            event.mod = TB_MOD_ALT;
+            event.key = 0;
+            event.ch = uni;
+            return 1 + urv;
         }
     }
 
-    // No capability matched; treat as ESC.
+    // 6) Fallback: bare ESC
     event.kind = TB_EVENT_KEY;
     event.mod = 0;
     event.key = TB_KEY_ESC;
@@ -1042,6 +1360,10 @@ fn inbuf_consume(n: i64) {
     guard n > 0 && n <= g.inbuf_len else { return; }
     g.inbuf_pos = g.inbuf_pos + n;
     g.inbuf_len = g.inbuf_len - n;
+    if g.inbuf_len == 0 {
+        g.inbuf_pos = 0;
+        return;
+    }
     // Compact when position gets too large or logical end exceeds physical array
     if g.inbuf_pos > 32 || (g.inbuf_pos + g.inbuf_len) > g.inbuf.len {
         var i: i64 = 0;
@@ -1056,87 +1378,22 @@ fn inbuf_consume(n: i64) {
     }
 }
 
-fn tb_peek_event(event: tb_event&, timeout_ms: i32) -> i32 {
+fn inbuf_copy_to(mbuf: u8[64]&) -> i64 {
     let g = gbl();
-    guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
-
-    // Helper: copy valid inbuf bytes to a local buffer for matching
-    fn inbuf_copy_to(mbuf: u8[64]&) -> i64 {
-        let g = gbl();
-        var i: i64 = 0;
-        while i < g.inbuf_len && i < 64 {
-            let src = (g.inbuf_pos + i) as i32;
-            guard src < g.inbuf.len else { break; }
-            let idx = i as i32;
-            mbuf[idx] = g.inbuf[src];
-            i = i + 1;
-        }
-        return i;
+    var i: i64 = 0;
+    while i < g.inbuf_len && i < 64 {
+        let src = (g.inbuf_pos + i) as i32;
+        guard src < g.inbuf.len else { break; }
+        let idx = i as i32;
+        mbuf[idx] = g.inbuf[src];
+        i = i + 1;
     }
+    return i;
+}
 
-    // Phase 1: Try to parse bytes already in inbuf
-    if g.inbuf_len > 0 {
-        let mbuf: u8[64] = [0; 64];
-        let mlen = inbuf_copy_to(mbuf);
-        let consumed = try_match_escape_buf(mbuf[0..mlen], event);
-        if consumed > 0 {
-            inbuf_consume(consumed);
-            return TB_OK;
-        }
-        if consumed == 0 {
-            // Regular single byte (not ESC)
-            event.kind = TB_EVENT_KEY;
-            event.mod = 0;
-            event.key = 0;
-            event.ch = g.inbuf[g.inbuf_pos as i32];
-            inbuf_consume(1);
-            return TB_OK;
-        }
-        // consumed == TB_ERR_NEED_MORE: need more data, fall through to read
-    }
-
-    // Phase 2: Poll for data on both TTY and resize pipe
-    let poll_rv = tb_adapter_poll_multi(g.rfd, g.resize_pipefd[0], timeout_ms);
-    if poll_rv <= 0 {
-        return TB_ERR_NO_EVENT;
-    }
-
-    // Check resize pipe first - check POLLIN specifically
-    // POLLIN = 1
-    if (tb_adapter_poll_revents(1) & 1) != 0 {
-        // Drain the resize pipe completely
-        var rb: u8[1] = [0; 1];
-        loop {
-            let r = tb_adapter_read(g.resize_pipefd[0], rb[0], 1);
-            if r <= 0 { break; }
-        }
-        // Re-read terminal size
-        let rv = tb_adapter_ioctl_winsize(g.rfd, TIOCGWINSZ, g.winsize);
-        if rv == 0 {
-            let new_h = (g.winsize[0] as i32) | ((g.winsize[1] as i32) << 8);
-            let new_w = (g.winsize[2] as i32) | ((g.winsize[3] as i32) << 8);
-            if new_w != g.width || new_h != g.height {
-                g.width = new_w;
-                g.height = new_h;
-                let _ = grow_cells(g.back, g.width, g.height);
-                let _ = grow_cells(g.front, g.width, g.height);
-            }
-        }
-        event.kind = TB_EVENT_RESIZE;
-        event.w = g.width;
-        event.h = g.height;
-        return TB_OK;
-    }
-
-    // Phase 3: Read available bytes from TTY
-    var readbuf: u8[64] = [0; 64];
-    let nread = tb_adapter_read(g.rfd, readbuf[0], 64);
-    if nread <= 0 {
-        return TB_ERR_NO_EVENT;
-    }
-
-    // Append new bytes to inbuf at logical end (not physical push)
-    var j = 0;
+fn inbuf_append(readbuf: const u8[64]&, nread: i64) {
+    let g = gbl();
+    var j: i64 = 0;
     while j < nread {
         let pos = (g.inbuf_pos + g.inbuf_len + j) as i32;
         if pos >= g.inbuf.len {
@@ -1147,31 +1404,193 @@ fn tb_peek_event(event: tb_event&, timeout_ms: i32) -> i32 {
         j = j + 1;
     }
     g.inbuf_len = g.inbuf_len + nread;
+}
 
-    // Try to match the combined buffer
-    let mbuf: u8[64] = [0; 64];
+fn drain_resize_and_fill(event: tb_event&) -> i32 {
+    let g = gbl();
+    var got_byte: i32 = 0;
+    var rb: u8[1] = [0; 1];
+    loop {
+        let r = tb_adapter_read(g.resize_pipefd[0], rb[0], 1);
+        if r <= 0 { break; }
+        got_byte = 1;
+    }
+    if got_byte == 0 { return 0; }
+
+    var new_w: i32 = 0;
+    var new_h: i32 = 0;
+    if tb_adapter_get_winsize(g.wfd, new_w, new_h) == 0 ||
+       tb_adapter_get_winsize(g.rfd, new_w, new_h) == 0 {
+        if new_w > 0 && new_h > 0 && (new_w != g.width || new_h != g.height) {
+            g.width = new_w;
+            g.height = new_h;
+            let _ = grow_cells(g.back, g.width, g.height);
+            let _ = grow_cells(g.front, g.width, g.height);
+        }
+    }
+    event.kind = TB_EVENT_RESIZE;
+    event.mod = 0;
+    event.key = 0;
+    event.ch = 0;
+    event.w = g.width;
+    event.h = g.height;
+    return 1;
+}
+
+fn decode_inbuf_event(event: tb_event&, allow_esc_coalesce: i32) -> i32 {
+    let g = gbl();
+    if g.inbuf_len <= 0 { return TB_ERR_NEED_MORE; }
+
+    // If a lone ESC arrived, briefly wait (10ms) to coalesce split escape sequences
+    if allow_esc_coalesce != 0 && g.inbuf_len == 1 && g.inbuf[g.inbuf_pos as i32] == 0x1b {
+        let prv = tb_adapter_poll(g.rfd, 10);
+        if prv > 0 {
+            var more: u8[64] = [0; 64];
+            let nr = tb_adapter_read(g.rfd, more[0], 64);
+            if nr > 0 {
+                inbuf_append(more, nr);
+            }
+        }
+    }
+
+    var mbuf: u8[64] = [0; 64];
     let mlen = inbuf_copy_to(mbuf);
-    let consumed = try_match_escape_buf(mbuf[0..mlen], event);
-    if consumed > 0 {
-        inbuf_consume(consumed);
+    let first = mbuf[0];
+
+    if first == 0x1b {
+        let consumed = try_match_escape_buf(mbuf[0..mlen], event);
+        if consumed == TB_ERR_NEED_MORE {
+            return TB_ERR_NEED_MORE;
+        }
+        if consumed > 0 {
+            inbuf_consume(consumed);
+            if event.kind == 0 {
+                return TB_ERR_NO_EVENT;
+            }
+            return TB_OK;
+        }
+    }
+
+    // ASCII control characters (0x00..0x1f, 0x7f) go into event.key
+    if first < 0x20 || first == 0x7f {
+        event.kind = TB_EVENT_KEY;
+        event.mod = 0;
+        event.key = first;
+        event.ch = 0;
+        inbuf_consume(1);
         return TB_OK;
     }
-    if consumed == TB_ERR_NEED_MORE {
-        return TB_ERR_NO_EVENT;  // inbuf retains all bytes for next call
+
+    // UTF-8 character decoding
+    var uni: u32 = 0;
+    let urv = tb_utf8_char_to_unicode(uni, mbuf[0..mlen]);
+    if urv == TB_ERR_NEED_MORE {
+        return TB_ERR_NEED_MORE;
     }
-    // consumed == 0: regular char
+    if urv > 0 {
+        event.kind = TB_EVENT_KEY;
+        event.mod = 0;
+        event.key = 0;
+        event.ch = uni;
+        inbuf_consume(urv);
+        return TB_OK;
+    }
+
+    // Invalid UTF-8 byte: consume 1 byte and emit replacement char
     event.kind = TB_EVENT_KEY;
     event.mod = 0;
     event.key = 0;
-    event.ch = g.inbuf[g.inbuf_pos as i32];
+    event.ch = 0xfffd;
     inbuf_consume(1);
     return TB_OK;
+}
+
+fn tb_peek_event(event: tb_event&, timeout_ms: i32) -> i32 {
+    let g = gbl();
+    guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
+
+    // Phase 1: Try to parse bytes already in inbuf
+    while g.inbuf_len > 0 {
+        let drv = decode_inbuf_event(event, 0);
+        if drv == TB_OK { return TB_OK; }
+        if drv == TB_ERR_NEED_MORE { break; }
+        // TB_ERR_NO_EVENT means a sequence was consumed & ignored; try remaining bytes
+    }
+
+    // Check if resize pipe already has a pending notification
+    if drain_resize_and_fill(event) != 0 {
+        return TB_OK;
+    }
+
+    // Phase 2: Poll for data on both TTY and resize pipe (handle EINTR cleanly)
+    let start_ms = tb_internal_now_ms();
+    var remaining_ms = timeout_ms;
+    loop {
+        let poll_rv = tb_adapter_poll_multi(g.rfd, g.resize_pipefd[0], remaining_ms);
+        if poll_rv == 0 {
+            return TB_ERR_NO_EVENT;
+        }
+        if poll_rv < 0 {
+            if tb_adapter_is_eintr() != 0 {
+                if drain_resize_and_fill(event) != 0 {
+                    return TB_OK;
+                }
+                if timeout_ms >= 0 {
+                    let elapsed = (tb_internal_now_ms() - start_ms) as i32;
+                    remaining_ms = timeout_ms - elapsed;
+                    if remaining_ms <= 0 { return TB_ERR_NO_EVENT; }
+                }
+                continue;
+            }
+            g.last_errno = tb_adapter_errno();
+            return TB_ERR_POLL;
+        }
+        break;
+    }
+
+    // Check resize pipe first
+    if tb_adapter_poll_is_in(1) != 0 {
+        if drain_resize_and_fill(event) != 0 {
+            return TB_OK;
+        }
+    }
+
+    // Check TTY input
+    if tb_adapter_poll_is_in(0) != 0 {
+        var readbuf: u8[64] = [0; 64];
+        let nread = tb_adapter_read(g.rfd, readbuf[0], 64);
+        if nread == 0 {
+            return TB_ERR_READ;
+        }
+        if nread < 0 {
+            if tb_adapter_is_again() != 0 || tb_adapter_is_eintr() != 0 {
+                return TB_ERR_NO_EVENT;
+            }
+            g.last_errno = tb_adapter_errno();
+            return TB_ERR_READ;
+        }
+
+        inbuf_append(readbuf, nread);
+
+        while g.inbuf_len > 0 {
+            let drv = decode_inbuf_event(event, 1);
+            if drv == TB_OK { return TB_OK; }
+            if drv == TB_ERR_NEED_MORE { return TB_ERR_NO_EVENT; }
+        }
+        return TB_ERR_NO_EVENT;
+    }
+
+    if tb_adapter_poll_is_err(0) != 0 {
+        return TB_ERR_READ;
+    }
+
+    return TB_ERR_NO_EVENT;
 }
 
 fn tb_poll_event(event: tb_event&) -> i32 {
     loop {
         let rv = tb_peek_event(event, -1);
-        if rv == TB_OK || rv != TB_ERR_NO_EVENT && rv != TB_ERR_NEED_MORE {
+        if rv != TB_ERR_NO_EVENT && rv != TB_ERR_NEED_MORE {
             return rv;
         }
     }
@@ -1193,8 +1612,19 @@ fn tb_set_input_mode(mode: i32) -> i32 {
     let valid = TB_INPUT_ESC | TB_INPUT_ALT | TB_INPUT_MOUSE;
     if (mode & ~valid) != 0 { return TB_ERR; }
     if (mode & TB_INPUT_ESC) != 0 && (mode & TB_INPUT_ALT) != 0 { return TB_ERR; }
+
+    let was_mouse = g.input_mode & TB_INPUT_MOUSE;
+    let now_mouse = mode & TB_INPUT_MOUSE;
+    if was_mouse == 0 && now_mouse != 0 {
+        let _ = outbuf_puts(TB_HARDCAP_ENTER_MOUSE);
+        let _ = outbuf_flush(g.wfd);
+    } else if was_mouse != 0 && now_mouse == 0 {
+        let _ = outbuf_puts(TB_HARDCAP_EXIT_MOUSE);
+        let _ = outbuf_flush(g.wfd);
+    }
+
     g.input_mode = mode;
-    return TB_OK;
+    return g.input_mode;
 }
 
 fn tb_set_output_mode(mode: i32) -> i32 {
@@ -1205,29 +1635,32 @@ fn tb_set_output_mode(mode: i32) -> i32 {
         return TB_ERR;
     }
     g.output_mode = mode;
-    return TB_OK;
+    g.last_fg = 0xffffffffffffffff;
+    g.last_bg = 0xffffffffffffffff;
+    return g.output_mode;
 }
 
 fn tb_invalidate() -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
-    // Mark front buffer as empty so next tb_present() redraws everything.
-    var y = 0;
-    for y in g.front.height {
-        var x = 0;
-        for x in g.front.width {
-            let idx = y * g.front.width + x;
-            g.front.cells[idx].ch = 0xffffffff;
-            g.front.cells[idx].fg = 0xffffffffffffffff;
-            g.front.cells[idx].bg = 0xffffffffffffffff;
-        }
-    }
+    reset_cellbuf(g.front, 0xffffffff, 0xffffffffffffffff, 0xffffffffffffffff);
     return TB_OK;
 }
 
 fn tb_set_cursor(cx: i32, cy: i32) -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
+    if cx < 0 || cy < 0 {
+        return tb_hide_cursor();
+    }
+    if g.cursor_hidden != 0 {
+        if g.caps[TB_CAP_SHOW_CURSOR].len > 0 {
+            let _ = outbuf_puts(g.caps[TB_CAP_SHOW_CURSOR]);
+        } else {
+            let _ = outbuf_puts("\x1b[?25h");
+        }
+        g.cursor_hidden = 0;
+    }
     g.cursor_x = cx;
     g.cursor_y = cy;
     return TB_OK;
@@ -1236,7 +1669,16 @@ fn tb_set_cursor(cx: i32, cy: i32) -> i32 {
 fn tb_hide_cursor() -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
-    let _ = outbuf_puts("\x1b[?25l");
+    if g.cursor_hidden == 0 {
+        if g.caps[TB_CAP_HIDE_CURSOR].len > 0 {
+            let _ = outbuf_puts(g.caps[TB_CAP_HIDE_CURSOR]);
+        } else {
+            let _ = outbuf_puts("\x1b[?25l");
+        }
+        g.cursor_hidden = 1;
+    }
+    g.cursor_x = -1;
+    g.cursor_y = -1;
     return TB_OK;
 }
 
@@ -1244,7 +1686,6 @@ fn tb_hide_cursor() -> i32 {
 // OUTPUT BUFFER
 // ===========================================================================
 
-// outbuf_puts — append bytes to the frame buffer (do not touch the TTY).
 fn outbuf_puts(str: const u8[:]) -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
@@ -1262,12 +1703,12 @@ fn outbuf_puts(str: const u8[:]) -> i32 {
     return TB_OK;
 }
 
-// outbuf_nputs — append n bytes to the frame buffer.
 fn outbuf_nputs(buf: const u8[:], n: i64) -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
+    let limit = if n < buf.len { n } else { buf.len };
     var i: i64 = 0;
-    while i < n {
+    while i < limit {
         let pos = g.outbuf_len;
         if pos < g.outbuf.len {
             g.outbuf[pos as i32] = buf[i as i32];
@@ -1280,7 +1721,19 @@ fn outbuf_nputs(buf: const u8[:], n: i64) -> i32 {
     return TB_OK;
 }
 
-// outbuf_flush — write the whole frame to the TTY, handling partial writes.
+fn outbuf_shift(written: i64) {
+    let g = gbl();
+    if written <= 0 { return; }
+    var i: i64 = 0;
+    while i < (g.outbuf_len - written) {
+        let src = (written + i) as i32;
+        let dst = i as i32;
+        g.outbuf[dst] = g.outbuf[src];
+        i = i + 1;
+    }
+    g.outbuf_len = g.outbuf_len - written;
+}
+
 fn outbuf_flush(fd: i32) -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
@@ -1294,41 +1747,26 @@ fn outbuf_flush(fd: i32) -> i32 {
         if n > 0 {
             written = written + n;
         } else {
-            let err = tb_adapter_errno();
-            // Portable EINTR/EAGAIN checks
-            if err == 4 || err == 35 { continue; }  // EINTR=4, EAGAIN/EWOULDBLOCK=11/35
-            if err == 11 { break; }
-            // Shift already-written bytes before returning error
-            if written > 0 {
-                var i: i64 = 0;
-                while i < (g.outbuf_len - written) {
-                    let src = (written + i) as i32;
-                    let dst = i as i32;
-                    g.outbuf[dst] = g.outbuf[src];
-                    i = i + 1;
+            if tb_adapter_is_eintr() != 0 { continue; }
+            if tb_adapter_is_again() != 0 {
+                let prv = tb_adapter_poll_out(fd, 50);
+                if prv > 0 || (prv < 0 && tb_adapter_is_eintr() != 0) {
+                    continue;
                 }
-                g.outbuf_len = g.outbuf_len - written;
+                outbuf_shift(written);
+                g.last_errno = tb_adapter_errno();
+                return TB_ERR_POLL;
             }
+            outbuf_shift(written);
+            g.last_errno = tb_adapter_errno();
             return TB_ERR_READ;
         }
     }
 
-    if written > 0 {
-        // Shift any remaining bytes to the front of the buffer
-        var i: i64 = 0;
-        while i < (g.outbuf_len - written) {
-            let src = (written + i) as i32;
-            let dst = i as i32;
-            g.outbuf[dst] = g.outbuf[src];
-            i = i + 1;
-        }
-    }
-    g.outbuf_len = g.outbuf_len - written;
+    outbuf_shift(written);
     return TB_OK;
 }
 
-// convert_num — write an unsigned integer as decimal digits into buf.
-// Returns the number of digits written.
 fn convert_num(num: u64, buf: u8[32]&) -> i32 {
     var digits: u8[32];
     var n = 0;
@@ -1356,9 +1794,119 @@ fn convert_num(num: u64, buf: u8[32]&) -> i32 {
     return n as i32;
 }
 
+fn send_num(num: u64) {
+    var nbuf: u8[32] = [0; 32];
+    let len = convert_num(num, nbuf);
+    let _ = outbuf_puts(nbuf[0..len]);
+}
+
 // ===========================================================================
 // OUTPUT / PRESENT
 // ===========================================================================
+
+fn send_sgr_color_fg(fg: uintattr_t, mode: i32) {
+    if mode == TB_OUTPUT_NORMAL {
+        var idx = fg & 0xff;
+        var bright: i32 = if (fg & TB_BRIGHT) != 0 { 1 } else { 0 };
+        if (fg & TB_HI_BLACK) != 0 && idx == 0 {
+            idx = 1;
+            bright = 1;
+        }
+        if idx >= 1 && idx <= 8 {
+            let base: u64 = if bright != 0 { 90 } else { 30 };
+            let _ = outbuf_puts("\x1b[");
+            send_num(base + idx - 1);
+            let _ = outbuf_puts("m");
+        }
+    } else if mode == TB_OUTPUT_256 {
+        let idx = fg & 0xff;
+        if idx != 0 || (fg & TB_HI_BLACK) != 0 {
+            let _ = outbuf_puts("\x1b[38;5;");
+            send_num(idx);
+            let _ = outbuf_puts("m");
+        }
+    } else if mode == TB_OUTPUT_216 {
+        let idx = fg & 0xff;
+        if idx >= 1 && idx <= 216 {
+            let _ = outbuf_puts("\x1b[38;5;");
+            send_num(15 + idx);
+            let _ = outbuf_puts("m");
+        }
+    } else if mode == TB_OUTPUT_GRAYSCALE {
+        let idx = fg & 0xff;
+        if idx >= 1 && idx <= 24 {
+            let _ = outbuf_puts("\x1b[38;5;");
+            send_num(231 + idx);
+            let _ = outbuf_puts("m");
+        }
+    } else if mode == TB_OUTPUT_TRUECOLOR {
+        let rgb = fg & 0xffffff;
+        if rgb != 0 || (fg & TB_HI_BLACK) != 0 {
+            let r = (rgb >> 16) & 0xff;
+            let gch = (rgb >> 8) & 0xff;
+            let b = rgb & 0xff;
+            let _ = outbuf_puts("\x1b[38;2;");
+            send_num(r);
+            let _ = outbuf_puts(";");
+            send_num(gch);
+            let _ = outbuf_puts(";");
+            send_num(b);
+            let _ = outbuf_puts("m");
+        }
+    }
+}
+
+fn send_sgr_color_bg(bg: uintattr_t, mode: i32) {
+    if mode == TB_OUTPUT_NORMAL {
+        var idx = bg & 0xff;
+        var bright: i32 = if (bg & TB_BRIGHT) != 0 { 1 } else { 0 };
+        if (bg & TB_HI_BLACK) != 0 && idx == 0 {
+            idx = 1;
+            bright = 1;
+        }
+        if idx >= 1 && idx <= 8 {
+            let base: u64 = if bright != 0 { 100 } else { 40 };
+            let _ = outbuf_puts("\x1b[");
+            send_num(base + idx - 1);
+            let _ = outbuf_puts("m");
+        }
+    } else if mode == TB_OUTPUT_256 {
+        let idx = bg & 0xff;
+        if idx != 0 || (bg & TB_HI_BLACK) != 0 {
+            let _ = outbuf_puts("\x1b[48;5;");
+            send_num(idx);
+            let _ = outbuf_puts("m");
+        }
+    } else if mode == TB_OUTPUT_216 {
+        let idx = bg & 0xff;
+        if idx >= 1 && idx <= 216 {
+            let _ = outbuf_puts("\x1b[48;5;");
+            send_num(15 + idx);
+            let _ = outbuf_puts("m");
+        }
+    } else if mode == TB_OUTPUT_GRAYSCALE {
+        let idx = bg & 0xff;
+        if idx >= 1 && idx <= 24 {
+            let _ = outbuf_puts("\x1b[48;5;");
+            send_num(231 + idx);
+            let _ = outbuf_puts("m");
+        }
+    } else if mode == TB_OUTPUT_TRUECOLOR {
+        let rgb = bg & 0xffffff;
+        if rgb != 0 || (bg & TB_HI_BLACK) != 0 {
+            let r = (rgb >> 16) & 0xff;
+            let gch = (rgb >> 8) & 0xff;
+            let b = rgb & 0xff;
+            let _ = outbuf_puts("\x1b[48;2;");
+            send_num(r);
+            let _ = outbuf_puts(";");
+            send_num(gch);
+            let _ = outbuf_puts(";");
+            send_num(b);
+            let _ = outbuf_puts("m");
+        }
+    }
+}
 
 fn send_attr(fg: uintattr_t, bg: uintattr_t) -> i32 {
     let g = gbl();
@@ -1379,41 +1927,9 @@ fn send_attr(fg: uintattr_t, bg: uintattr_t) -> i32 {
     if fg & TB_UNDERLINE_2 != 0 { let _ = outbuf_puts("\x1b[21m"); }
     if fg & TB_OVERLINE    != 0 { let _ = outbuf_puts("\x1b[53m"); }
 
-    // 3) Foreground color. Palette index is in the low 8 bits; 0 = default.
-    //    TB_BRIGHT upgrades 30..37 -> 90..97.
-    //    TB_HI_BLACK with no palette index means "bright black" (gray).
-    var fg_idx = fg & 0xff;
-    var fg_bright: i32 = 0;
-    if fg & TB_BRIGHT != 0 { fg_bright = 1; }
-    if fg & TB_HI_BLACK != 0 {
-        if fg_idx == 0 { fg_idx = 1; fg_bright = 1; }
-    }
-    if fg_idx != 0 {
-        let base: u64 = if fg_bright != 0 { 90 } else { 30 };
-        let code = base + fg_idx - 1;
-        let nbuf: u8[32] = [0; 32];
-        let len = convert_num(code, nbuf);
-        let _ = outbuf_puts("\x1b[");
-        let _ = outbuf_puts(nbuf[0..len]);
-        let _ = outbuf_puts("m");
-    }
-
-    // 4) Background color. Same scheme, 40..47 / 100..107.
-    var bg_idx = bg & 0xff;
-    var bg_bright: i32 = 0;
-    if bg & TB_BRIGHT != 0 { bg_bright = 1; }
-    if bg & TB_HI_BLACK != 0 {
-        if bg_idx == 0 { bg_idx = 1; bg_bright = 1; }
-    }
-    if bg_idx != 0 {
-        let base: u64 = if bg_bright != 0 { 100 } else { 40 };
-        let code = base + bg_idx - 1;
-        let nbuf: u8[32] = [0; 32];
-        let len = convert_num(code, nbuf);
-        let _ = outbuf_puts("\x1b[");
-        let _ = outbuf_puts(nbuf[0..len]);
-        let _ = outbuf_puts("m");
-    }
+    // 3) Foreground and background colors according to output_mode
+    send_sgr_color_fg(fg, g.output_mode);
+    send_sgr_color_bg(bg, g.output_mode);
 
     g.last_fg = fg;
     g.last_bg = bg;
@@ -1433,15 +1949,11 @@ fn cell_copy(dst: tb_cell&, src: tb_cell&) -> i32 {
 }
 
 fn send_cursor_if(x: i32, y: i32) -> i32 {
-    let g = gbl();
     if x < 0 || y < 0 { return TB_OK; }
-    let nbuf: u8[32] = [0; 32];
     let _ = outbuf_puts("\x1b[");
-    let len_y = convert_num((y + 1) as u64, nbuf);
-    let _ = outbuf_puts(nbuf[0..len_y]);
+    send_num((y + 1) as u64);
     let _ = outbuf_puts(";");
-    let len_x = convert_num((x + 1) as u64, nbuf);
-    let _ = outbuf_puts(nbuf[0..len_x]);
+    send_num((x + 1) as u64);
     let _ = outbuf_puts("H");
     return TB_OK;
 }
@@ -1456,18 +1968,10 @@ fn tb_present() -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
 
-    // Frame reset: force attribute state to known default so send_attr
-    // re-emits codes for ALL cells this frame (prevents terminal state drift).
-    let _ = outbuf_puts("\x1b[m");
-    g.last_fg = TB_DEFAULT;
-    g.last_bg = TB_DEFAULT;
-
-    g.last_x = -1;
-    g.last_y = -1;
-
+    var any_dirty: i32 = 0;
     var y = 0;
     for y in g.front.height {
-        var x = 0;
+        var x: i32 = 0;
         while x < g.front.width {
             let back_idx = y * g.back.width + x;
             let front_idx = y * g.front.width + x;
@@ -1475,69 +1979,67 @@ fn tb_present() -> i32 {
             let front = g.front.cells[front_idx];
 
             let w = tb_wcwidth(back.ch);
-            let w2: i32;
-            if w < 1 { w2 = 1; } else { w2 = w; }
+            let w2: i32 = if w < 1 { 1 } else { w };
 
             if cell_cmp(back, front) != 0 {
-                // copy back to front
+                if any_dirty == 0 {
+                    let _ = outbuf_puts("\x1b[m");
+                    g.last_fg = TB_DEFAULT;
+                    g.last_bg = TB_DEFAULT;
+                    g.last_x = -1;
+                    g.last_y = -1;
+                    any_dirty = 1;
+                }
+
                 g.front.cells[front_idx] = back;
 
-                // send attributes
-                // send_attr equivalent
                 let fg = back.fg;
                 let bg = back.bg;
-                let fg_changed = fg != g.last_fg;
-                let bg_changed = bg != g.last_bg;
-                if fg_changed || bg_changed {
+                if fg != g.last_fg || bg != g.last_bg {
                     let _ = send_attr(fg, bg);
                 }
 
-                // send cursor position — skip if adjacent to previous cell
                 if x != g.last_x + 1 || y != g.last_y {
-                    let _ = send_cursor_if(x as i32, y);
+                    let _ = send_cursor_if(x, y);
                 }
-                g.last_x = x as i32;
-                g.last_y = y;
 
-                // send character
                 if w2 > 1 && x >= g.front.width - (w2 - 1) {
-                    // not enough room, send spaces for remaining width
                     var i = x;
                     while i < g.front.width {
-                        let _ = send_char(0x20);  // space
+                        let _ = send_char(0x20);
                         i = i + 1;
                     }
+                    g.last_x = g.front.width - 1;
                 } else {
                     let _ = send_char(back.ch);
+                    g.last_x = x + w2 - 1;
                 }
+                g.last_y = y;
 
-                // mark wide-char cells as invalid
-                var i = 1;
-                for i in w2 {
-                    if i >= w2 { break; }
-                    let wi = x + i;
+                // Mark trailing cells of wide chars as invalid (start at i=1, NOT 0)
+                var wi_off = 1;
+                while wi_off < w2 {
+                    let wi = x + wi_off;
                     if wi < g.front.width {
                         let wide_idx = y * g.front.width + wi;
                         g.front.cells[wide_idx].ch = 0xffffffff;
                         g.front.cells[wide_idx].fg = 0xffffffffffffffff;
                         g.front.cells[wide_idx].bg = 0xffffffffffffffff;
                     }
+                    wi_off = wi_off + 1;
                 }
             }
             x = x + w2;
         }
     }
 
-    // final cursor reposition — skip if cursor is hidden or adjacent to last drawn cell
     if g.cursor_x >= 0 && g.cursor_y >= 0 && (g.cursor_x != g.last_x + 1 || g.cursor_y != g.last_y) {
         let _ = send_cursor_if(g.cursor_x, g.cursor_y);
+        g.last_x = g.cursor_x;
+        g.last_y = g.cursor_y;
     }
-    g.last_x = g.cursor_x;
-    g.last_y = g.cursor_y;
 
-    let _ = outbuf_flush(g.wfd);
-
-    return TB_OK;
+    return outbuf_flush(g.wfd);
 }
 
 // ===========================================================================
@@ -1564,7 +2066,6 @@ fn tb_print_ex(x: i32, y: i32, fg: uintattr_t, bg: uintattr_t, str: const u8[:])
         var uni: u32 = 0;
         let rv = tb_utf8_char_to_unicode(uni, str[si..]);
         if rv <= 0 {
-            // invalid UTF-8, skip
             si = si + 1;
             continue;
         }
@@ -1573,6 +2074,12 @@ fn tb_print_ex(x: i32, y: i32, fg: uintattr_t, bg: uintattr_t, str: const u8[:])
         if uni == 0x0a { // newline
             cx = x;
             cy = cy + 1;
+            if cy >= g.height { break; }
+            continue;
+        }
+
+        // Skip characters past right margin until next newline
+        if cx >= g.width {
             continue;
         }
 
@@ -1581,18 +2088,13 @@ fn tb_print_ex(x: i32, y: i32, fg: uintattr_t, bg: uintattr_t, str: const u8[:])
         }
 
         let w = tb_wcwidth(uni);
-        let w2: i32;
-        if w < 1 { w2 = 1; } else { w2 = w; }
+        let w2: i32 = if w < 1 { 1 } else { w };
 
         if cx >= 0 && cx < g.width && cy >= 0 && cy < g.height {
             let _ = tb_set_cell(cx, cy, uni, fg, bg);
         }
 
         cx = cx + w2;
-        // Clip at right margin instead of wrapping
-        if cx >= g.width {
-            break;
-        }
     }
 
     return TB_OK;
@@ -1606,26 +2108,21 @@ fn tb_send(buf: const u8[:], nbuf: i64) -> i32 {
 }
 
 // tb_sendf — append a format string to the output buffer.
-// Goose has no variadic functions, so the format string is sent literally.
-// C-side varargs (vsnprintf) would require a Goose-side adapter; not implemented.
 fn tb_sendf(fmt: const u8[:]) -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
     return tb_send(fmt, fmt.len);
 }
 
-// tb_printf — print formatted string at position.
-// Goose has no variadic functions, so the format string is sent literally.
+// tb_printf — print string at position.
 fn tb_printf(x: i32, y: i32, fg: uintattr_t, bg: uintattr_t, fmt: const u8[:]) -> i32 {
     return tb_print_ex(x, y, fg, bg, fmt);
 }
 
-// tb_printf_ex — print formatted string at position with width output.
-// out_w is not populated because Goose has no variadic formatting.
+// tb_printf_ex — print string at position with width output.
 fn tb_printf_ex(x: i32, y: i32, fg: uintattr_t, bg: uintattr_t, out_w: u64&, fmt: const u8[:]) -> i32 {
     let rv = tb_print_ex(x, y, fg, bg, fmt);
     if rv != TB_OK { return rv; }
     out_w = 0;
     return TB_OK;
 }
-
