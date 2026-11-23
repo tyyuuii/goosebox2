@@ -394,6 +394,97 @@ fn test_in_place_shrink_and_parent_layers() {
     expect(if st.screen == SCREEN_PLAY && st.depth == 1 && cur_parent_block() == BLK_AIR && cur_biome() == BIOME_TUTORIAL { 1 } else { 0 }, "use_nearest at Tutorial spawn shrinks 16x in-place via Green Ring");
 }
 
+fn count_solid_blocks() -> i32 {
+    let st = core();
+    var cnt: i32 = 0;
+    var i: i32 = 0;
+    while i < CHUNK_VOL {
+        if st.blocks[i] != BLK_AIR { cnt = cnt + 1; }
+        i = i + 1;
+    }
+    return cnt;
+}
+
+fn test_sibling_air_traversal_and_air_atoms() {
+    let st = core();
+    st.genesis_mode = 0;
+
+    // 1) Stay shrunk when flying across multiple sibling air subchunks (East/West/Up)
+    init_new_game();
+    st.screen = SCREEN_PLAY;
+    st.px = 7.5; st.py = 3.5; st.pz = 5.5;
+    st.ring_cd_ms = 0;
+    shrink_into_ex(7, 3, 5, BLK_AIR, -1, 1, st.px, st.py, st.pz);
+    expect(if st.depth == 1 && st.parent_bx[0] == 7 { 1 } else { 0 }, "Shrank at parent voxel (7,3,5)");
+
+    // Fly +X across 2 full sibling chunks (36 steps) -> enters parent_bx 8 then 9 while STILL at depth = 1!
+    var step: i32 = 0;
+    while step < 36 {
+        st.vx = 12.0; st.vy = 0.0; st.vz = 0.0;
+        step_simulation(100);
+        step = step + 1;
+    }
+    expect(if st.depth == 1 && cur_parent_block() == BLK_AIR && st.parent_bx[0] >= 9 { 1 } else { 0 }, "Flying across sibling air edges stays at depth=1 and updates parent_bx");
+
+    // 2) Hitting Tutorial Hall solid east wall (x=11, z=5) while shrunk in air stops cleanly instead of growing or clipping
+    step = 0;
+    while step < 25 {
+        st.vx = 12.0; st.vy = 0.0; st.vz = 0.0;
+        step_simulation(100);
+        step = step + 1;
+    }
+    expect(if st.depth == 1 && st.parent_bx[0] == 10 && st.vx == 0.0 { 1 } else { 0 }, "Macro Tutorial wall at x=11 stops shrunken player at parent_bx=10 without growing");
+
+    // 3) Manual [V] (grow_in_place) grows back 16x from air cleanly
+    grow_in_place();
+    expect(if st.depth == 0 && st.px >= 10.0 && st.px < 11.1 { 1 } else { 0 }, "grow_in_place [V] returns to depth=0 at continuous wall position");
+
+    // 4) Multi-level carry across depth=1 -> depth=0 parent boundary at depth=2 (air_depth=2)
+    init_new_game();
+    st.screen = SCREEN_PLAY;
+    st.px = 8.5; st.py = 4.5; st.pz = 6.5;
+    st.ring_cd_ms = 0;
+    shrink_into_ex(8, 4, 6, BLK_AIR, -1, 1, st.px, st.py, st.pz);
+    st.ring_cd_ms = 0;
+    shrink_into_ex(15, 8, 8, BLK_AIR, -1, 1, 15.8, 8.5, 8.5);
+    expect(if st.depth == 2 && compute_air_depth(2) == 2 { 1 } else { 0 }, "Double air shrink sets depth=2 and air_depth=2");
+    st.px = 15.8; st.py = 8.5; st.pz = 8.5;
+    st.vx = 10.0; st.vy = 0.0; st.vz = 0.0;
+    step_simulation(100);
+    expect(if st.depth == 2 && st.parent_bx[0] == 0 && st.parent_bx[1] == 9 { 1 } else { 0 }, "Multi-level air carry wraps parent_bx[0]=0 and increments parent_bx[1]=9 while staying at depth=2");
+
+    // 5) Progressive microscopic air-atom density: air_depth 1 < 2 < 3 < 4
+    init_new_game();
+    st.screen = SCREEN_PLAY;
+    st.ring_cd_ms = 0;
+    shrink_into_ex(8, 4, 6, BLK_AIR, -1, 1, 8.5, 4.5, 6.5);
+    let c1 = count_solid_blocks();
+    st.ring_cd_ms = 0;
+    shrink_into_ex(8, 8, 8, BLK_AIR, -1, 1, 8.5, 8.5, 8.5);
+    let c2 = count_solid_blocks();
+    st.ring_cd_ms = 0;
+    shrink_into_ex(8, 8, 8, BLK_AIR, -1, 1, 8.5, 8.5, 8.5);
+    let c3 = count_solid_blocks();
+    st.ring_cd_ms = 0;
+    shrink_into_ex(8, 8, 8, BLK_AIR, -1, 1, 8.5, 8.5, 8.5);
+    let c4 = count_solid_blocks();
+    expect(if c1 == 2 && c2 > c1 && c3 > c2 && c4 > c3 { 1 } else { 0 }, "Air atom/molecule density increases monotonically across air_depth 1..4");
+
+    // 6) Inward portal preview returns nested child chunk blocks (Tutorial Black Cube -> Ying Forest grass)
+    init_new_game();
+    st.screen = SCREEN_PLAY;
+    let inner_grass = get_inward_preview_block(8, 2, 9, BLK_BLACK_CUBE, 8, 1, 8);
+    let inner_air = get_inward_preview_block(8, 2, 9, BLK_BLACK_CUBE, 8, 8, 8);
+    expect(if inner_grass == BLK_GRASS && inner_air == BLK_AIR { 1 } else { 0 }, "Inward portal preview exposes Ying Forest floor & sky inside Black Cube");
+
+    // 7) grow_in_place [V] from solid Black Cube exits cleanly above/outside the cube
+    st.ring_cd_ms = 0;
+    shrink_into(8, 2, 9, BLK_BLACK_CUBE, -1, 1);
+    expect(if st.depth == 1 && cur_parent_block() == BLK_BLACK_CUBE { 1 } else { 0 }, "Inside solid Black Cube");
+    grow_in_place();
+    expect(if st.depth == 0 && point_collides(st.px, st.py, st.pz) == 0 { 1 } else { 0 }, "grow_in_place [V] from solid Black Cube exits collision-free to depth=0");
+}
+
 extern fn exit_proc(code: i32) = "exit";
 
 fn main() {
@@ -402,6 +493,7 @@ fn main() {
     test_weapons_and_physics();
     test_economy_markers_and_respawn();
     test_in_place_shrink_and_parent_layers();
+    test_sibling_air_traversal_and_air_atoms();
 
     print("FBW Core Tests: ");
     print(g_pass);

@@ -227,6 +227,12 @@ root struct fbw_state {
     // Unbounded recursive 16x16x16 world stack (-128..3000)
     blocks: u8[CHUNK_VOL],
     parent_blocks: u8[12288], // MAX_PARENT_VIS (3) * CHUNK_VOL
+    scratch_blocks: u8[CHUNK_VOL],
+    inward_blocks: u8[32768], // 8-slot * CHUNK_VOL 1-level inward portal preview cache
+    inward_seeds: u64[8],
+    inward_blks: u8[8],
+    inward_used: i32[8],
+    inward_next: i32,
     parent_bx: i32[3],
     parent_by: i32[3],
     parent_bz: i32[3],
@@ -298,6 +304,7 @@ root struct fbw_state {
     mouse_last_x: i32,
     mouse_last_y: i32,
     mouse_dragging: i32,
+    mouse_drag_moved: i32,
 
     // Feedback / Flash / Lore Tome
     flash_ms: i32,
@@ -550,6 +557,10 @@ fn dst_set_block(dst_layer: i32, x: i32, y: i32, z: i32, b: u8) {
     let idx = b_idx(x, y, z);
     if dst_layer < 0 {
         st.blocks[idx] = b;
+    } else if dst_layer == 3 {
+        st.scratch_blocks[idx] = b;
+    } else if dst_layer >= 10 {
+        st.inward_blocks[(dst_layer - 10) * CHUNK_VOL + idx] = b;
     } else {
         st.parent_blocks[dst_layer * CHUNK_VOL + idx] = b;
     }
@@ -562,6 +573,10 @@ fn dst_get_block(dst_layer: i32, x: i32, y: i32, z: i32) -> u8 {
     let idx = b_idx(x, y, z);
     if dst_layer < 0 {
         return st.blocks[idx];
+    } else if dst_layer == 3 {
+        return st.scratch_blocks[idx];
+    } else if dst_layer >= 10 {
+        return st.inward_blocks[(dst_layer - 10) * CHUNK_VOL + idx];
     }
     return st.parent_blocks[dst_layer * CHUNK_VOL + idx];
 }
@@ -629,7 +644,30 @@ fn cur_seed() -> u64 {
     return get_frame(st.depth).seed;
 }
 
+fn invalidate_inward_cache() {
+    var i: i32 = 0;
+    while i < 8 {
+        st.inward_used[i] = 0;
+        i = i + 1;
+    }
+}
+
+fn compute_air_depth(d_in: i32) -> i32 {
+    var cnt: i32 = 0;
+    var d: i32 = d_in;
+    while d >= MAX_NEG_DEPTH && cnt < 32 {
+        let f = get_frame(d);
+        if f.parent_block != BLK_AIR {
+            break;
+        }
+        cnt = cnt + 1;
+        d = d - 1;
+    }
+    return cnt;
+}
+
 fn record_block_delta(bx: i32, by: i32, bz: i32, b: u8) {
+    invalidate_inward_cache();
     let seed = cur_seed();
     var i: i32 = 0;
     while i < MAX_DELTAS {
@@ -1384,9 +1422,10 @@ fn populate_interior_biome_entities(biome: i32, depth: i32) {
     let _ = spawn_entity(ENT_HEALTH, 8.0, 2.4, 3.5, 1, -1, 0);
 }
 
-fn generate_air_subchunk_blocks(dst: i32, biome: i32, seed: u64) {
-    // Open-air subdivision: ZERO enclosing walls! Only a tiny floating micro-mote in an off-center corner
-    // so shrinking inside a room preserves the giant parent room all around you.
+fn generate_air_subchunk_blocks(dst: i32, biome: i32, seed: u64, air_depth: i32) {
+    // Open-air subdivision: ZERO enclosing walls!
+    // air_depth == 1: sparse XAR_YING_FOREST_AIR mote + stone so giant rooms remain clear.
+    // air_depth >= 2: progressive microscopic air atoms, molecules & lattice obstacles.
     var ls = splitmix64(seed);
     let ox: i32 = if (ls & 1) != 0 { 11 } else { 2 };
     ls = splitmix64(ls);
@@ -1401,8 +1440,117 @@ fn generate_air_subchunk_blocks(dst: i32, biome: i32, seed: u64) {
         else if biome == BIOME_MYLANTIS { BLK_ICE }
         else { BLK_BLACK_CUBE };
 
-    dst_set_block(dst, ox, oy, oz, mote_blk);
-    dst_set_block(dst, ox + 1, oy, oz, BLK_BLACK_CUBE);
+    dst_set_block(dst, ox, oy, oz, BLK_STONE);
+    dst_set_block(dst, ox + 1, oy, oz, mote_blk);
+
+    if air_depth <= 1 {
+        return;
+    }
+
+    if air_depth == 2 {
+        // Scattered microscopic air atoms (diatom/single cubes, navigable gaps)
+        var a: i32 = 0;
+        while a < 8 {
+            ls = splitmix64(ls);
+            let ax = 2 + ((ls % 12) as! i32);
+            ls = splitmix64(ls);
+            let ay = 2 + ((ls % 12) as! i32);
+            ls = splitmix64(ls);
+            let az = 2 + ((ls % 12) as! i32);
+            if (ax < 7 || ax > 8) || (ay < 7 || ay > 8) || (az < 7 || az > 8) {
+                let ablk: u8 =
+                    if (a % 4) == 0 { BLK_ICE }
+                    else if (a % 4) == 1 { BLK_GLASS }
+                    else if (a % 4) == 2 { BLK_STONE }
+                    else { BLK_ALPHA_CUBE };
+                dst_set_block(dst, ax, ay, az, ablk);
+                if ax + 1 < 14 {
+                    dst_set_block(dst, ax + 1, ay, az, BLK_GLASS);
+                }
+            }
+            a = a + 1;
+        }
+        return;
+    }
+
+    if air_depth == 3 {
+        // Dense molecular tri-atom dumbbells & micro-rings
+        var c: i32 = 0;
+        while c < 13 {
+            ls = splitmix64(ls);
+            let cx = 2 + ((ls % 11) as! i32);
+            ls = splitmix64(ls);
+            let cy = 2 + ((ls % 11) as! i32);
+            ls = splitmix64(ls);
+            let cz = 2 + ((ls % 11) as! i32);
+            let nucleus: u8 =
+                if (c % 5) == 0 { BLK_BLACK_CUBE }
+                else if (c % 3) == 0 { BLK_MYLANTIS }
+                else { BLK_STONE };
+            if (cx < 7 || cx > 8) || (cy < 7 || cy > 8) {
+                dst_set_block(dst, cx, cy, cz, nucleus);
+                dst_set_block(dst, cx + 1, cy, cz, BLK_GLASS);
+                dst_set_block(dst, cx, cy + 1, cz, BLK_ICE);
+                dst_set_block(dst, cx, cy, cz + 1, BLK_GLASS);
+            }
+            c = c + 1;
+        }
+        return;
+    }
+
+    // air_depth >= 4: Dense sub-atomic air crystal lattice (requires steering or shrinking into atoms!)
+    let density_pct = clamp_i(34 + (air_depth - 4) * 8, 34, 58);
+    var z: i32 = 1;
+    while z <= 14 {
+        var y: i32 = 1;
+        while y <= 14 {
+            var x: i32 = 1;
+            while x <= 14 {
+                let on_bar =
+                    if ((x % 4) == 2 && (y % 4) == 2) ||
+                       ((y % 4) == 2 && (z % 4) == 2) ||
+                       ((x % 4) == 2 && (z % 4) == 2) { 1 } else { 0 };
+                if on_bar != 0 {
+                    let center_safe = if x >= 7 && x <= 8 && y >= 7 && y <= 8 && z >= 7 && z <= 8 { 1 } else { 0 };
+                    if center_safe == 0 {
+                        let hv = splitmix64(seed ^ ((x * 73856093 + y * 19349663 + z * 83492791) as u64));
+                        if ((hv % 100) as! i32) < density_pct {
+                            let mod_b = (hv >> 8) % 9;
+                            let lblk: u8 =
+                                if mod_b == 0 { BLK_BLACK_CUBE }
+                                else if mod_b == 1 || mod_b == 2 { BLK_MYLANTIS }
+                                else if mod_b == 3 || mod_b == 4 { BLK_ICE }
+                                else if mod_b == 5 || mod_b == 6 { BLK_GLASS }
+                                else { BLK_STONE };
+                            dst_set_block(dst, x, y, z, lblk);
+                        }
+                    }
+                }
+                x = x + 1;
+            }
+            y = y + 1;
+        }
+        z = z + 1;
+    }
+}
+
+fn find_clear_air_pos(x_in: f64, y_in: f64, z_in: f64, ox: f64&, oy: f64&, oz: f64&) {
+    var cx: i32 = clamp_i(ffloor(x_in), 1, 14);
+    var cy: i32 = clamp_i(ffloor(y_in), 1, 14);
+    var cz: i32 = clamp_i(ffloor(z_in), 1, 14);
+    var r: i32 = 0;
+    while r < 4 {
+        if get_block(cx, cy + r, cz) == BLK_AIR {
+            ox = cx + 0.5; oy = cy + r + 0.5; oz = cz + 0.5;
+            return;
+        }
+        if get_block(cx + r, cy, cz) == BLK_AIR {
+            ox = cx + r + 0.5; oy = cy + 0.5; oz = cz + 0.5;
+            return;
+        }
+        r = r + 1;
+    }
+    ox = 8.0; oy = 8.0; oz = 8.0;
 }
 
 fn populate_air_subchunk_entities(depth: i32, seed: u64) {
@@ -1410,26 +1558,36 @@ fn populate_air_subchunk_entities(depth: i32, seed: u64) {
     let gx = 4.5 + ((ls % 7) as f64);
     ls = splitmix64(ls);
     let gz = 4.5 + ((ls % 7) as f64);
-    // In-place Green Shrink Ring (dive another 16x inside this same space) + Red Grow Ring!
-    let _ = spawn_entity(ENT_RING_GREEN, gx, 8.0, gz, 1, -1, BLK_AIR);
-    let _ = spawn_entity(ENT_RING_PINK, 3.2, 6.0, 12.2, 1, -1, BLK_AIR);
-    let _ = spawn_entity(ENT_RING_RED, 12.5, 11.5, 3.5, 1, -1, BLK_AIR);
-    let _ = spawn_entity(ENT_GOLD, 8.0, 5.5, 8.0, 1, -1, 0);
+    var rx: f64 = 0.0;
+    var ry: f64 = 0.0;
+    var rz: f64 = 0.0;
+    // In-place Green Shrink Ring (dive another 16x inside this same space) + Pink + Red Grow Ring!
+    find_clear_air_pos(gx, 8.0, gz, rx, ry, rz);
+    let _ = spawn_entity(ENT_RING_GREEN, rx, ry, rz, 1, -1, BLK_AIR);
+    find_clear_air_pos(3.2, 6.0, 12.2, rx, ry, rz);
+    let _ = spawn_entity(ENT_RING_PINK, rx, ry, rz, 1, -1, BLK_AIR);
+    find_clear_air_pos(12.5, 11.5, 3.5, rx, ry, rz);
+    let _ = spawn_entity(ENT_RING_RED, rx, ry, rz, 1, -1, BLK_AIR);
+    find_clear_air_pos(8.0, 5.5, 8.0, rx, ry, rz);
+    let _ = spawn_entity(ENT_GOLD, rx, ry, rz, 1, -1, 0);
     if depth >= 4 && st.genesis_mode == 0 && (seed % 3) == 0 {
-        let _ = spawn_entity(ENT_RAT, 4.5, 4.5, 4.5, 18 + depth * 4, -1, 0);
+        find_clear_air_pos(4.5, 4.5, 4.5, rx, ry, rz);
+        let _ = spawn_entity(ENT_RAT, rx, ry, rz, 18 + depth * 4, -1, 0);
     }
 }
 
-fn generate_chunk_blocks_to(dst_layer: i32, depth: i32, biome: i32, parent_blk: u8, seed: u64) {
+fn generate_chunk_blocks_to(dst_layer: i32, depth: i32, biome: i32, parent_blk: u8, seed: u64, air_depth: i32) {
     var i: i32 = 0;
     while i < CHUNK_VOL {
         if dst_layer < 0 { st.blocks[i] = BLK_AIR; }
+        else if dst_layer == 3 { st.scratch_blocks[i] = BLK_AIR; }
+        else if dst_layer >= 10 { st.inward_blocks[(dst_layer - 10) * CHUNK_VOL + i] = BLK_AIR; }
         else { st.parent_blocks[dst_layer * CHUNK_VOL + i] = BLK_AIR; }
         i = i + 1;
     }
 
     if parent_blk == BLK_AIR {
-        generate_air_subchunk_blocks(dst_layer, biome, seed);
+        generate_air_subchunk_blocks(dst_layer, biome, seed, air_depth);
     } else if depth < 0 || biome == BIOME_SPACE {
         generate_space_blocks(dst_layer);
     } else if depth == 0 || biome == BIOME_TUTORIAL {
@@ -1452,14 +1610,39 @@ fn generate_chunk_blocks_to(dst_layer: i32, depth: i32, biome: i32, parent_blk: 
     }
 }
 
+fn get_inward_preview_block(mx: i32, my: i32, mz: i32, blk: u8, cx: i32, cy: i32, cz: i32) -> u8 {
+    if cx < 0 || cx >= CHUNK_DIM || cy < 0 || cy >= CHUNK_DIM || cz < 0 || cz >= CHUNK_DIM {
+        return BLK_AIR;
+    }
+    let child_d = st.depth + 1;
+    let cseed = hash_block_seed(cur_seed(), mx, my, mz, child_d);
+    var slot: i32 = 0;
+    while slot < 8 {
+        if st.inward_used[slot] != 0 && st.inward_seeds[slot] == cseed && st.inward_blks[slot] == blk {
+            return st.inward_blocks[slot * CHUNK_VOL + b_idx(cx, cy, cz)];
+        }
+        slot = slot + 1;
+    }
+    slot = st.inward_next;
+    st.inward_next = (st.inward_next + 1) % 8;
+    st.inward_used[slot] = 1;
+    st.inward_seeds[slot] = cseed;
+    st.inward_blks[slot] = blk;
+    let cbio = pick_biome_for_entry(child_d, blk, -1, cseed, cur_biome());
+    generate_chunk_blocks_to(10 + slot, child_d, cbio, blk, cseed, 0);
+    return st.inward_blocks[slot * CHUNK_VOL + b_idx(cx, cy, cz)];
+}
+
 fn load_current_chunk() {
     clear_entities_and_shots();
+    invalidate_inward_cache();
 
     let cf = get_frame(st.depth);
     let biome = cf.biome;
     let seed = cf.seed;
+    let air_d = compute_air_depth(st.depth);
 
-    generate_chunk_blocks_to(-1, st.depth, biome, cf.parent_block, seed);
+    generate_chunk_blocks_to(-1, st.depth, biome, cf.parent_block, seed, air_d);
 
     if cf.parent_block == BLK_AIR {
         populate_air_subchunk_entities(st.depth, seed);
@@ -1490,7 +1673,7 @@ fn load_current_chunk() {
             st.parent_by[pl] = child_f.by;
             st.parent_bz[pl] = child_f.bz;
             st.parent_biome[pl] = pf.biome;
-            generate_chunk_blocks_to(pl, pd, pf.biome, pf.parent_block, pf.seed);
+            generate_chunk_blocks_to(pl, pd, pf.biome, pf.parent_block, pf.seed, compute_air_depth(pd));
         }
         pl = pl + 1;
     }
@@ -1654,6 +1837,9 @@ fn grow_out_axis(exit_x: f64, exit_y: f64, exit_z: f64) {
     st.pz = fclamp(nz, 0.15, 15.85);
 
     // Push cleanly outside multi-block structures (e.g. Ying Planet or Black Cube) if colliding
+    let base_nx = st.px;
+    let base_ny = st.py;
+    let base_nz = st.pz;
     var push: i32 = 0;
     while point_collides(st.px, st.py, st.pz) != 0 && push < 6 {
         if exit_x < 0.0 { st.px = st.px - 1.0; }
@@ -1667,6 +1853,22 @@ fn grow_out_axis(exit_x: f64, exit_y: f64, exit_z: f64) {
         st.py = fclamp(st.py, 0.2, 15.8);
         st.pz = fclamp(st.pz, 0.2, 15.8);
         push = push + 1;
+    }
+    if point_collides(st.px, st.py, st.pz) != 0 {
+        let off_x = [ 0.0, 0.0, 0.0, -1.1, 1.1, 0.0 ];
+        let off_y = [ 1.1, 0.0, 0.0, 0.0, 0.0, -1.1 ];
+        let off_z = [ 0.0, -1.1, 1.1, 0.0, 0.0, 0.0 ];
+        var od: i32 = 0;
+        while od < 6 && point_collides(st.px, st.py, st.pz) != 0 {
+            let tx = fclamp(base_nx + off_x[od], 0.25, 15.75);
+            let ty = fclamp(base_ny + off_y[od], 0.25, 15.75);
+            let tz = fclamp(base_nz + off_z[od], 0.25, 15.75);
+            if point_collides(tx, ty, tz) == 0 {
+                st.px = tx; st.py = ty; st.pz = tz;
+                break;
+            }
+            od = od + 1;
+        }
     }
     if point_collides(st.px, st.py, st.pz) != 0 {
         st.px = 8.5;
@@ -1683,6 +1885,11 @@ fn grow_out_axis(exit_x: f64, exit_y: f64, exit_z: f64) {
     st.flash_ms = 200;
     st.flash_rgb = pack_rgb(245, 70, 70);
     set_status_msg("Grew 16x outward in-place!", 1600);
+}
+
+fn grow_in_place() {
+    st.ring_cd_ms = 0;
+    grow_out_axis(fclamp(st.px, 0.2, 15.8), fclamp(st.py, 0.2, 15.8), fclamp(st.pz, 0.2, 15.8));
 }
 
 // ---------------------------------------------------------------------------
@@ -1726,6 +1933,10 @@ fn init_new_game() {
         i = i + 1;
     }
     st.marker_frames_len = 0;
+    st.inward_next = 0;
+    invalidate_inward_cache();
+    st.mouse_dragging = 0;
+    st.mouse_drag_moved = 0;
 
     i = 0;
     while i < MAX_DELTAS {
@@ -1956,34 +2167,257 @@ fn apply_brake() {
     st.vz = st.vz * 0.18;
 }
 
+fn scratch_point_collides(x: f64, y: f64, z: f64) -> i32 {
+    let rad: f64 = 0.24;
+    var dz: i32 = -1;
+    while dz <= 1 {
+        var dy: i32 = -1;
+        while dy <= 1 {
+            var dx: i32 = -1;
+            while dx <= 1 {
+                let bx = ffloor(x + dx * rad);
+                let by = ffloor(y + dy * rad);
+                let bz = ffloor(z + dz * rad);
+                if bx >= 0 && bx < CHUNK_DIM && by >= 0 && by < CHUNK_DIM && bz >= 0 && bz < CHUNK_DIM {
+                    let blk = st.scratch_blocks[b_idx(bx, by, bz)];
+                    if is_block_solid(blk) != 0 {
+                        return 1;
+                    }
+                }
+                dx = dx + 1;
+            }
+            dy = dy + 1;
+        }
+        dz = dz + 1;
+    }
+    return 0;
+}
+
+fn step_air_single_axis(axis: i32, sdir: i32, cand_x: f64, cand_y: f64, cand_z: f64) -> i32 {
+    let sdx: i32 = if axis == 0 { sdir } else { 0 };
+    let sdy: i32 = if axis == 1 { sdir } else { 0 };
+    let sdz: i32 = if axis == 2 { sdir } else { 0 };
+
+    // Pass 1: Propagate carry/borrow upward across boundaries to locate in-bounds ancestor voxel
+    var cur_d: i32 = st.depth;
+    var cx: i32 = sdx;
+    var cy: i32 = sdy;
+    var cz: i32 = sdz;
+    var anc_d: i32 = st.depth - 1;
+    var target_bx: i32 = 0;
+    var target_by: i32 = 0;
+    var target_bz: i32 = 0;
+
+    loop {
+        let f = get_frame(cur_d);
+        let nbx = f.bx + cx;
+        let nby = f.by + cy;
+        let nbz = f.bz + cz;
+        if nbx >= 0 && nbx < CHUNK_DIM && nby >= 0 && nby < CHUNK_DIM && nbz >= 0 && nbz < CHUNK_DIM {
+            anc_d = cur_d - 1;
+            target_bx = nbx;
+            target_by = nby;
+            target_bz = nbz;
+            break;
+        }
+        cx = if nbx < 0 { -1 } else if nbx >= CHUNK_DIM { 1 } else { 0 };
+        cy = if nby < 0 { -1 } else if nby >= CHUNK_DIM { 1 } else { 0 };
+        cz = if nbz < 0 { -1 } else if nbz >= CHUNK_DIM { 1 } else { 0 };
+        cur_d = cur_d - 1;
+        if cur_d <= MAX_NEG_DEPTH {
+            set_status_msg("Outer Cosmic Boundary of Xar reached!", 1500);
+            return 0;
+        }
+        ensure_neg_frame_seed(cur_d);
+    }
+
+    ensure_neg_frame_seed(anc_d);
+    let anc_f = get_frame(anc_d);
+    let anc_air_d = compute_air_depth(anc_d);
+    generate_chunk_blocks_to(3, anc_d, anc_f.biome, anc_f.parent_block, anc_f.seed, anc_air_d);
+    let tblk = dst_get_block(3, target_bx, target_by, target_bz);
+
+    let nx_w = fclamp(if axis == 0 { cand_x - sdir * 16.0 } else { cand_x }, 0.04, 15.96);
+    let ny_w = fclamp(if axis == 1 { cand_y - sdir * 16.0 } else { cand_y }, 0.04, 15.96);
+    let nz_w = fclamp(if axis == 2 { cand_z - sdir * 16.0 } else { cand_z }, 0.04, 15.96);
+
+    if tblk == BLK_AIR {
+        var run_seed: u64 = hash_block_seed(anc_f.seed, target_bx, target_by, target_bz, cur_d);
+        var run_bio: i32 = anc_f.biome;
+        var run_air_d: i32 = anc_air_d + 1;
+        var wd: i32 = cur_d + 1;
+        while wd <= st.depth {
+            let wf = get_frame(wd);
+            let wbx = (wf.bx + sdx + CHUNK_DIM) & 15;
+            let wby = (wf.by + sdy + CHUNK_DIM) & 15;
+            let wbz = (wf.bz + sdz + CHUNK_DIM) & 15;
+            run_seed = hash_block_seed(run_seed, wbx, wby, wbz, wd);
+            run_air_d = run_air_d + 1;
+            wd = wd + 1;
+        }
+
+        generate_chunk_blocks_to(3, st.depth, run_bio, BLK_AIR, run_seed, run_air_d);
+        if scratch_point_collides(nx_w, ny_w, nz_w) != 0 {
+            return 0;
+        }
+
+        // Atomic Commit Pass 2: keep st.depth unchanged!
+        var cseed = hash_block_seed(anc_f.seed, target_bx, target_by, target_bz, cur_d);
+        set_frame(cur_d, ScaleFrame {
+            bx: target_bx, by: target_by, bz: target_bz,
+            biome: anc_f.biome, parent_block: BLK_AIR, seed: cseed
+        });
+        wd = cur_d + 1;
+        while wd <= st.depth {
+            let wf = get_frame(wd);
+            let wbx = (wf.bx + sdx + CHUNK_DIM) & 15;
+            let wby = (wf.by + sdy + CHUNK_DIM) & 15;
+            let wbz = (wf.bz + sdz + CHUNK_DIM) & 15;
+            cseed = hash_block_seed(cseed, wbx, wby, wbz, wd);
+            set_frame(wd, ScaleFrame {
+                bx: wbx, by: wby, bz: wbz,
+                biome: anc_f.biome, parent_block: BLK_AIR, seed: cseed
+            });
+            wd = wd + 1;
+        }
+
+        load_current_chunk();
+        st.px = nx_w;
+        st.py = ny_w;
+        st.pz = nz_w;
+        return 1;
+    }
+
+    // Neighbor macro voxel is SOLID: allow direct open-space entry if it is a Shrinkable Portal (or ShrinkAny ON)
+    if is_block_shrinkable(tblk) != 0 || (st.shrink_any != 0 && st.ring_cd_ms <= 0) {
+        let is_tut_crown = if anc_d == -1 && target_bx == 8 && target_by == 7 && target_bz == 8 && tblk == BLK_YING_PLANET { 1 } else { 0 };
+        var top_seed: u64 =
+            if is_tut_crown != 0 { 0x5841525f54555430 }
+            else { hash_block_seed(anc_f.seed, target_bx, target_by, target_bz, cur_d) };
+        var top_bio: i32 =
+            if is_tut_crown != 0 { BIOME_TUTORIAL }
+            else { pick_biome_for_entry(cur_d, tblk, -1, top_seed, anc_f.biome) };
+
+        if cur_d == st.depth {
+            generate_chunk_blocks_to(3, st.depth, top_bio, tblk, top_seed, 0);
+            if scratch_point_collides(nx_w, ny_w, nz_w) == 0 {
+                set_frame(cur_d, ScaleFrame {
+                    bx: target_bx, by: target_by, bz: target_bz,
+                    biome: top_bio, parent_block: tblk, seed: top_seed
+                });
+                load_current_chunk();
+                st.px = nx_w;
+                st.py = ny_w;
+                st.pz = nz_w;
+                st.ring_cd_ms = 180;
+                st.flash_ms = 160;
+                st.flash_rgb = pack_rgb(40, 235, 130);
+                set_status_msg("Entered fractal block at current scale!", 1400);
+                return 1;
+            }
+        } else {
+            var rseed = top_seed;
+            var rbio = top_bio;
+            var rair: i32 = 0;
+            var wd = cur_d + 1;
+            while wd <= st.depth {
+                let wf = get_frame(wd);
+                let wbx = (wf.bx + sdx + CHUNK_DIM) & 15;
+                let wby = (wf.by + sdy + CHUNK_DIM) & 15;
+                let wbz = (wf.bz + sdz + CHUNK_DIM) & 15;
+                // Inspect parent chunk to check if entry cell is solid or open air
+                generate_chunk_blocks_to(3, wd - 1, rbio, if wd == cur_d + 1 { tblk } else { BLK_AIR }, rseed, rair);
+                if dst_get_block(3, wbx, wby, wbz) != BLK_AIR {
+                    return 0;
+                }
+                rseed = hash_block_seed(rseed, wbx, wby, wbz, wd);
+                rair = rair + 1;
+                wd = wd + 1;
+            }
+            generate_chunk_blocks_to(3, st.depth, rbio, BLK_AIR, rseed, rair);
+            if scratch_point_collides(nx_w, ny_w, nz_w) == 0 {
+                var cseed = top_seed;
+                set_frame(cur_d, ScaleFrame {
+                    bx: target_bx, by: target_by, bz: target_bz,
+                    biome: top_bio, parent_block: tblk, seed: cseed
+                });
+                wd = cur_d + 1;
+                while wd <= st.depth {
+                    let wf = get_frame(wd);
+                    let wbx = (wf.bx + sdx + CHUNK_DIM) & 15;
+                    let wby = (wf.by + sdy + CHUNK_DIM) & 15;
+                    let wbz = (wf.bz + sdz + CHUNK_DIM) & 15;
+                    cseed = hash_block_seed(cseed, wbx, wby, wbz, wd);
+                    set_frame(wd, ScaleFrame {
+                        bx: wbx, by: wby, bz: wbz,
+                        biome: top_bio, parent_block: BLK_AIR, seed: cseed
+                    });
+                    wd = wd + 1;
+                }
+                load_current_chunk();
+                st.px = nx_w;
+                st.py = ny_w;
+                st.pz = nz_w;
+                return 1;
+            }
+        }
+    }
+
+    return 0;
+}
+
 fn move_player_vec(dx: f64, dy: f64, dz: f64) {
+    let in_air = if cur_parent_block() == BLK_AIR { 1 } else { 0 };
+
     let nx = st.px + dx;
-    if point_collides(nx, st.py, st.pz) == 0 {
+    if in_air != 0 && (nx < 0.0 || nx >= 16.0) {
+        let sdir: i32 = if nx < 0.0 { -1 } else { 1 };
+        if step_air_single_axis(0, sdir, nx, st.py, st.pz) == 0 {
+            st.px = fclamp(st.px, 0.25, 15.75);
+            st.vx = 0.0;
+        }
+    } else if point_collides(nx, st.py, st.pz) == 0 {
         st.px = nx;
     } else {
         if check_touch_special_block(nx + (if dx > 0.0 { 0.25 } else { -0.25 }), st.py, st.pz) == 2 { return; }
         st.vx = 0.0;
     }
 
+    let in_air_y = if cur_parent_block() == BLK_AIR { 1 } else { 0 };
     let ny = st.py + dy;
-    if point_collides(st.px, ny, st.pz) == 0 {
+    if in_air_y != 0 && (ny < 0.0 || ny >= 16.0) {
+        let sdir: i32 = if ny < 0.0 { -1 } else { 1 };
+        if step_air_single_axis(1, sdir, st.px, ny, st.pz) == 0 {
+            st.py = fclamp(st.py, 0.25, 15.75);
+            st.vy = 0.0;
+        }
+    } else if point_collides(st.px, ny, st.pz) == 0 {
         st.py = ny;
     } else {
         if check_touch_special_block(st.px, ny + (if dy > 0.0 { 0.25 } else { -0.25 }), st.pz) == 2 { return; }
         st.vy = 0.0;
     }
 
+    let in_air_z = if cur_parent_block() == BLK_AIR { 1 } else { 0 };
     let nz = st.pz + dz;
-    if point_collides(st.px, st.py, nz) == 0 {
+    if in_air_z != 0 && (nz < 0.0 || nz >= 16.0) {
+        let sdir: i32 = if nz < 0.0 { -1 } else { 1 };
+        if step_air_single_axis(2, sdir, st.px, st.py, nz) == 0 {
+            st.pz = fclamp(st.pz, 0.25, 15.75);
+            st.vz = 0.0;
+        }
+    } else if point_collides(st.px, st.py, nz) == 0 {
         st.pz = nz;
     } else {
         if check_touch_special_block(st.px, st.py, nz + (if dz > 0.0 { 0.25 } else { -0.25 })) == 2 { return; }
         st.vz = 0.0;
     }
 
-    // Authentic FBW: Leaving ANY of the 6 chunk faces grows 16x outward!
-    if st.px < 0.0 || st.px >= 16.0 || st.py < 0.0 || st.py >= 16.0 || st.pz < 0.0 || st.pz >= 16.0 {
-        grow_out_axis(st.px, st.py, st.pz);
+    // Exiting the outer face of an enclosed SOLID fractal block (parent_block != BLK_AIR) grows 16x outward!
+    if cur_parent_block() != BLK_AIR {
+        if st.px < 0.0 || st.px >= 16.0 || st.py < 0.0 || st.py >= 16.0 || st.pz < 0.0 || st.pz >= 16.0 {
+            grow_out_axis(st.px, st.py, st.pz);
+        }
     }
 }
 

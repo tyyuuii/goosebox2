@@ -1922,6 +1922,10 @@ fn parse_csi_modified(buf: const u8[:], end: i64, event: tb_event&) -> i32 {
         else if p1 == 4 || p1 == 8 { key = TB_KEY_END; }
         else if p1 == 5 { key = TB_KEY_PGUP; }
         else if p1 == 6 { key = TB_KEY_PGDN; }
+        else if p1 == 11 { key = TB_KEY_F1; }
+        else if p1 == 12 { key = TB_KEY_F2; }
+        else if p1 == 13 { key = TB_KEY_F3; }
+        else if p1 == 14 { key = TB_KEY_F4; }
         else if p1 == 15 { key = TB_KEY_F5; }
         else if p1 == 17 { key = TB_KEY_F6; }
         else if p1 == 18 { key = TB_KEY_F7; }

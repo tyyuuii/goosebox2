@@ -272,6 +272,85 @@ fn draw_pixel_safe(st: fbw_state&, pw: i32, ph: i32, x: i32, y: i32, z: f64, rgb
     }
 }
 
+fn trace_inward_portal(
+    mx: i32, my: i32, mz: i32,
+    hit_blk: u8, hit_axis: i32, hit_t: f64,
+    hx: f64, hy: f64, hz: f64,
+    rdx: f64, rdy: f64, rdz: f64,
+    outer_col: u32, row_sky: u32, fog_scale: f64
+) -> u32 {
+    var u: f64 = if hit_axis == 0 { hz - mz } else { hx - mx };
+    var v: f64 = if hit_axis == 1 { hz - mz } else { hy - my };
+    if u < 0.0 { u = u + 1.0; }
+    if v < 0.0 { v = v + 1.0; }
+    if u <= 0.16 || u >= 0.84 || v <= 0.16 || v >= 0.84 {
+        return outer_col;
+    }
+
+    var fx = fclamp(hx - mx, 0.002, 0.998) * 16.0 + rdx * 0.01;
+    var fy = fclamp(hy - my, 0.002, 0.998) * 16.0 + rdy * 0.01;
+    var fz = fclamp(hz - mz, 0.002, 0.998) * 16.0 + rdz * 0.01;
+    fx = fclamp(fx, 0.001, 15.999);
+    fy = fclamp(fy, 0.001, 15.999);
+    fz = fclamp(fz, 0.001, 15.999);
+
+    var imx: i32 = clamp_i(ffloor(fx), 0, 15);
+    var imy: i32 = clamp_i(ffloor(fy), 0, 15);
+    var imz: i32 = clamp_i(ffloor(fz), 0, 15);
+
+    var ihit: i32 = 0;
+    var iblk: u8 = get_inward_preview_block(mx, my, mz, hit_blk, imx, imy, imz);
+    var iaxis: i32 = hit_axis;
+    var it: f64 = 0.0;
+
+    if iblk != BLK_AIR {
+        ihit = 1;
+    } else {
+        let sx: i32 = if rdx < 0.0 { -1 } else { 1 };
+        let sy: i32 = if rdy < 0.0 { -1 } else { 1 };
+        let sz: i32 = if rdz < 0.0 { -1 } else { 1 };
+        let tdx: f64 = if rdx > -1e-8 && rdx < 1e-8 { 1e12 } else if rdx < 0.0 { -1.0 / rdx } else { 1.0 / rdx };
+        let tdy: f64 = if rdy > -1e-8 && rdy < 1e-8 { 1e12 } else if rdy < 0.0 { -1.0 / rdy } else { 1.0 / rdy };
+        let tdz: f64 = if rdz > -1e-8 && rdz < 1e-8 { 1e12 } else if rdz < 0.0 { -1.0 / rdz } else { 1.0 / rdz };
+        var tmx: f64 = if rdx < 0.0 { (fx - imx) * tdx } else { ((imx + 1) - fx) * tdx };
+        var tmy: f64 = if rdy < 0.0 { (fy - imy) * tdy } else { ((imy + 1) - fy) * tdy };
+        var tmz: f64 = if rdz < 0.0 { (fz - imz) * tdz } else { ((imz + 1) - fz) * tdz };
+        var k: i32 = 0;
+        while k < 24 {
+            if tmx < tmy {
+                if tmx < tmz { it = tmx; imx = imx + sx; tmx = tmx + tdx; iaxis = 0; }
+                else { it = tmz; imz = imz + sz; tmz = tmz + tdz; iaxis = 2; }
+            } else {
+                if tmy < tmz { it = tmy; imy = imy + sy; tmy = tmy + tdy; iaxis = 1; }
+                else { it = tmz; imz = imz + sz; tmz = tmz + tdz; iaxis = 2; }
+            }
+            if ((imx | imy | imz) & -16) != 0 { break; }
+            let b2 = get_inward_preview_block(mx, my, mz, hit_blk, imx, imy, imz);
+            if b2 != BLK_AIR {
+                iblk = b2;
+                ihit = 1;
+                break;
+            }
+            k = k + 1;
+        }
+    }
+
+    if ihit != 0 {
+        let in_col = shade_hit_block(
+            iblk, iaxis, hit_t + it * 0.0625,
+            fx + rdx * it, fy + rdy * it, fz + rdz * it,
+            row_sky, 0, fog_scale
+        );
+        return lerp_rgb(in_col, outer_col, 0.14) & 0xfcfcfc;
+    }
+
+    let st = core();
+    let cseed = hash_block_seed(cur_seed(), mx, my, mz, st.depth + 1);
+    let cbio = pick_biome_for_entry(st.depth + 1, hit_blk, -1, cseed, cur_biome());
+    let csky = lerp_rgb(biome_sky_top(cbio), biome_sky_bot(cbio), fclamp(0.5 - 0.35 * rdy, 0.0, 1.0));
+    return lerp_rgb(csky, outer_col, 0.18) & 0xfcfcfc;
+}
+
 fn render_3d_world() {
     let st = core();
     let pw = st.pw;
@@ -386,6 +465,9 @@ fn render_3d_world() {
             var hit_axis: i32 = 0;
             var hit_t: f64 = 0.0;
             var hit_layer: i32 = 0;
+            var hit_mx: i32 = 0;
+            var hit_my: i32 = 0;
+            var hit_mz: i32 = 0;
             var hit_fog_scale: f64 = if has_parent != 0 { 4.0 } else { 1.0 };
             var hit_hx: f64 = 0.0;
             var hit_hy: f64 = 0.0;
@@ -429,6 +511,9 @@ fn render_3d_world() {
                 if blk != BLK_AIR {
                     hit = 1;
                     hit_blk = blk;
+                    hit_mx = map_x;
+                    hit_my = map_y;
+                    hit_mz = map_z;
                     hit_hx = ppx + rdx * hit_t;
                     hit_hy = ppy + rdy * hit_t;
                     hit_hz = ppz + rdz * hit_t;
@@ -544,6 +629,12 @@ fn render_3d_world() {
             var out_z: f64 = 1e6;
             if hit != 0 {
                 out_col = shade_hit_block(hit_blk, hit_axis, hit_t, hit_hx, hit_hy, hit_hz, row_sky, hit_layer, hit_fog_scale);
+                if hit_layer == 0 && hit_t < 7.5 && is_block_shrinkable(hit_blk) != 0 {
+                    out_col = trace_inward_portal(
+                        hit_mx, hit_my, hit_mz, hit_blk, hit_axis, hit_t,
+                        hit_hx, hit_hy, hit_hz, rdx, rdy, rdz, out_col, row_sky, hit_fog_scale
+                    );
+                }
                 if deep256 < 256 {
                     let dr = ((((out_col >> 16) & 0xff) as! i32) * deep256) >> 8;
                     let dg = ((((out_col >> 8) & 0xff) as! i32) * deep256) >> 8;
@@ -948,9 +1039,9 @@ fn draw_hud() {
         let _ = tb_print(1, hud_y, ui_green() | TB_BOLD, ui_bg(), st.near_prompt[0..st.near_prompt_len]);
     } else {
         let hint = if w >= 106 {
-            "WASD/Spc/C:Fly | Q/E:Roll U:TrueUp | Tab:Rkt X:Brk | F:Use B:Shrink H:ShrkAny | R/RMB:2nd | F1-F5"
+            "WASD/Spc/C:Fly | Q/E:Roll U:TrueUp | Tab:Rkt X:Brk | F:Use B:Shrink V:Grow M:ShrkAny | G:Map F1-F5"
         } else {
-            "WASD/Spc/C:Fly Q/E:Roll F:Use B/H:Shrink R:2nd G:Map F1-F5"
+            "WASD/Spc/C:Fly F:Use B:Shrk V:Grow M:ShrkAny X:Brk G:Map F1-F5"
         };
         let _ = tb_print(1, hud_y, ui_muted(), ui_bg(), hint);
     }
@@ -976,8 +1067,13 @@ fn draw_hud() {
     buf_put_int(sbuf, slen, st.depth);
     buf_put_str(sbuf, slen, " [");
     buf_put_str(sbuf, slen, biome_name(cur_biome()));
-    if st.depth > 0 && cur_parent_block() == BLK_AIR {
+    if cur_parent_block() == BLK_AIR {
+        let ad = compute_air_depth(st.depth);
         buf_put_str(sbuf, slen, "/AIR");
+        if ad >= 2 {
+            buf_put_ch(sbuf, slen, 'x');
+            buf_put_int(sbuf, slen, ad);
+        }
     }
     buf_put_str(sbuf, slen, "] (");
     buf_put_int(sbuf, slen, ffloor(st.px));
@@ -1074,13 +1170,13 @@ fn draw_title_screen() {
     let _ = tb_print(cx + 3, cy + 5, ui_white(), ui_panel_bg(),           "Early game (Tutorial, Space -1, Ying Forest 1, Alpha Cube) is");
     let _ = tb_print(cx + 3, cy + 6, ui_white(), ui_panel_bg(),           "peaceful: unlock Weapons 2..0 via Modules & Buy Stations, then");
     let _ = tb_print(cx + 3, cy + 7, ui_white(), ui_panel_bg(),           "brave Yellow Flowers, Mylantis & I2 Menger Lattice -> Core!");
-    let _ = tb_print(cx + 3, cy + 8, ui_magenta(), ui_panel_bg(),         "Shrink in-place via Rings/[B] (same world!) or exit any face to Grow.");
+    let _ = tb_print(cx + 3, cy + 8, ui_magenta(), ui_panel_bg(),         "Shrink yourself everywhere with Rings/[B], press [V] to Grow 16x!");
 
     let _ = tb_print(cx + 3, cy + 10, ui_cyan() | TB_BOLD, ui_panel_bg(), "WASD / Space / C(Z): 6-DOF Flight | Q/E: Roll | U: TrueUp");
     let _ = tb_print(cx + 3, cy + 11, ui_white(), ui_panel_bg(),          "Arrows/IJKL/Mouse: Aim | LMB/Enter: Fire | R/RMB: 2nd Fire");
     let _ = tb_print(cx + 3, cy + 12, ui_white(), ui_panel_bg(),          "1-9,0: 10 Weapons (Recoil Boost!) | Tab: Rocket | X: Brake");
-    let _ = tb_print(cx + 3, cy + 13, ui_white(), ui_panel_bg(),          "F: Use | B: Shrink Block | H: ShrinkAny | T: TK | M/N: Markers");
-    let _ = tb_print(cx + 3, cy + 14, ui_white(), ui_panel_bg(),          "F1-F5: Controls/Stats/Weapons/Markers/Lore | O: 2x | P: Pause");
+    let _ = tb_print(cx + 3, cy + 13, ui_white(), ui_panel_bg(),          "F: Use | B: Shrink | V: Grow | M: ShrinkAny | T: TK | N/Y: Mark");
+    let _ = tb_print(cx + 3, cy + 14, ui_white(), ui_panel_bg(),          "F1-F5: Guides/Markers | H: Color | G: Map | O: 2x | P: Pause");
 
     let _ = tb_print(cx + 3, cy + 17, ui_green() | TB_BOLD, ui_panel_bg(),  "[ENTER / SPACE] Classic Xar Mode   ([Q] Quit)");
     let _ = tb_print(cx + 3, cy + 18, ui_cyan() | TB_BOLD, ui_panel_bg(),   "[G]             Genesis Mode (Peaceful Exploration, 0 Enemies)");
@@ -1171,15 +1267,15 @@ fn draw_tome_modal() {
 
     if st.tome_id == BIOME_TUTORIAL {
         let _ = tb_print(mx + 2, my + 3, ui_white(), ui_panel_bg(), "Every block in Xar holds a 16x16x16 universe inside it.");
-        let _ = tb_print(mx + 2, my + 4, ui_white(), ui_panel_bg(), "Green/Pink Rings & [B] in open air shrink 16x IN-PLACE");
-        let _ = tb_print(mx + 2, my + 5, ui_white(), ui_panel_bg(), "inside this same room! Fly out any edge to grow back 16x,");
-        let _ = tb_print(mx + 2, my + 6, ui_white(), ui_panel_bg(), "or enter the Black Cube to reach the Ying Forest!");
+        let _ = tb_print(mx + 2, my + 4, ui_white(), ui_panel_bg(), "Green/Pink Rings & [B] shrink YOU 16x anywhere—fly freely");
+        let _ = tb_print(mx + 2, my + 5, ui_white(), ui_panel_bg(), "across rooms, dodge deep air atoms, or press [V] to Grow!");
+        let _ = tb_print(mx + 2, my + 6, ui_white(), ui_panel_bg(), "You can also enter the Black Cube to reach the Ying Forest.");
         let _ = tb_print(mx + 2, my + 8, ui_cyan(), ui_panel_bg(),  "Tip: Use Railgun/Nuke recoil in Rocket Mode [Tab] to soar!");
     } else if st.tome_id == BIOME_WHITE_FLOWER {
         let _ = tb_print(mx + 2, my + 3, ui_white(), ui_panel_bg(), "Welcome to the Small White Flower's Alpha Cube chamber.");
         let _ = tb_print(mx + 2, my + 4, ui_white(), ui_panel_bg(), "Alpha Cubes generate randomized fractal treasures and");
         let _ = tb_print(mx + 2, my + 5, ui_white(), ui_panel_bg(), "lead onward to Yellow Flower labyrinths & Mylantis.");
-        let _ = tb_print(mx + 2, my + 7, ui_cyan(), ui_panel_bg(),  "Tip: Press [M] or [N] before diving so [F4] brings you home.");
+        let _ = tb_print(mx + 2, my + 7, ui_cyan(), ui_panel_bg(),  "Tip: Press [N] or [Y] before diving so [F4] brings you home.");
     } else {
         let _ = tb_print(mx + 2, my + 3, ui_white(), ui_panel_bg(), "Deep inside the I2 Menger Lattice lies the Core Gate.");
         let _ = tb_print(mx + 2, my + 4, ui_white(), ui_panel_bg(), "Guardians hit hard — freeze them with Laser 2nd [R] or");
@@ -1201,13 +1297,13 @@ fn draw_info_f1() {
     let _ = tb_print(mx + 2, my + 4, ui_white(), ui_panel_bg(), "Space / C or Z    : Ascend / Descend (PgUp / PgDn also work)");
     let _ = tb_print(mx + 2, my + 5, ui_white(), ui_panel_bg(), "Q / E  &  U       : Camera Roll Left/Right & Toggle True Up");
     let _ = tb_print(mx + 2, my + 6, ui_white(), ui_panel_bg(), "Tab / X           : Toggle Rocket Mode (Low Drag) / Brake");
-    let _ = tb_print(mx + 2, my + 7, ui_white(), ui_panel_bg(), "Arrows/IJKL/Mouse : Look Yaw & Pitch");
+    let _ = tb_print(mx + 2, my + 7, ui_white(), ui_panel_bg(), "Arrows/IJKL/Mouse : Look Yaw & Pitch (Drag Mouse to Aim)");
     let _ = tb_print(mx + 2, my + 8, ui_white(), ui_panel_bg(), "LMB / Enter       : Primary Fire  | RMB / R : Secondary Fire");
     let _ = tb_print(mx + 2, my + 9, ui_white(), ui_panel_bg(), "1..9, 0 / Wheel   : Select 10 Weapons (Start w/ Plasma)");
     let _ = tb_print(mx + 2, my + 10, ui_white(), ui_panel_bg(), "F / T             : Use (Stations/Doors/K) / Telekinesis");
-    let _ = tb_print(mx + 2, my + 11, ui_white(), ui_panel_bg(), "B / H             : Shrink Block/Air 16x In-Place / ShrinkAny");
-    let _ = tb_print(mx + 2, my + 12, ui_white(), ui_panel_bg(), "M / N             : Drop Short Marker / Long Marker");
-    let _ = tb_print(mx + 2, my + 13, ui_white(), ui_panel_bg(), "G / O / V / P     : Minimap / Fast 2x / 24-bit Color / Pause");
+    let _ = tb_print(mx + 2, my + 11, ui_white(), ui_panel_bg(), "B / V / M         : Shrink 16x / Grow 16x / Toggle ShrinkAny");
+    let _ = tb_print(mx + 2, my + 12, ui_white(), ui_panel_bg(), "N / Y             : Drop Short Marker / Long Marker");
+    let _ = tb_print(mx + 2, my + 13, ui_white(), ui_panel_bg(), "G / O / H / P     : Minimap / Fast 2x / 24-bit Color / Pause");
     let _ = tb_print(mx + 2, my + 15, ui_green() | TB_BOLD, ui_panel_bg(), "Press [F1] or [ESC] to close");
 }
 
@@ -1317,7 +1413,7 @@ fn draw_info_f4() {
             let col = if i == st.active_marker { ui_yellow() | TB_BOLD } else { ui_white() };
             let _ = tb_print(mx + 2, my + 3 + row, col, ui_panel_bg(), mbuf[0..mlen]);
         } else {
-            buf_put_str(mbuf, mlen, "(Empty — drop with [M] Short or [N] Long)");
+            buf_put_str(mbuf, mlen, "(Empty — drop with [N] Short or [Y] Long)");
             let _ = tb_print(mx + 2, my + 3 + row, ui_muted(), ui_panel_bg(), mbuf[0..mlen]);
         }
         row = row + 1;
@@ -1439,7 +1535,7 @@ fn handle_key(ev: tb_event&) -> i32 {
 
     if st.screen == SCREEN_TITLE {
         if key == TB_KEY_ESC || ch == 'q' || ch == 'Q' { return 0; }
-        if key == TB_KEY_ENTER || key == TB_KEY_SPACE || ch == ' ' {
+        if key == TB_KEY_ENTER || key == TB_KEY_CTRL_J || key == TB_KEY_SPACE || ch == ' ' {
             st.genesis_mode = 0;
             init_new_game();
             st.screen = SCREEN_PLAY;
@@ -1453,7 +1549,7 @@ fn handle_key(ev: tb_event&) -> i32 {
 
     if st.screen == SCREEN_VICTORY {
         if ch == 'q' || ch == 'Q' { return 0; }
-        if key == TB_KEY_ENTER || key == TB_KEY_ESC {
+        if key == TB_KEY_ENTER || key == TB_KEY_CTRL_J || key == TB_KEY_ESC {
             st.screen = SCREEN_PLAY;
             return 1;
         }
@@ -1495,7 +1591,7 @@ fn handle_key(ev: tb_event&) -> i32 {
         return 1;
     }
     if st.screen == SCREEN_TOME {
-        if key == TB_KEY_ESC || ch == 'f' || ch == 'F' || key == TB_KEY_ENTER || key == TB_KEY_SPACE || ch == ' ' {
+        if key == TB_KEY_ESC || ch == 'f' || ch == 'F' || key == TB_KEY_ENTER || key == TB_KEY_CTRL_J || key == TB_KEY_SPACE || ch == ' ' {
             st.screen = SCREEN_PLAY;
         }
         return 1;
@@ -1516,7 +1612,7 @@ fn handle_key(ev: tb_event&) -> i32 {
             }
             return 1;
         }
-        if key == TB_KEY_ESC || key == TB_KEY_ENTER || key == TB_KEY_SPACE || ch == ' ' {
+        if key == TB_KEY_ESC || key == TB_KEY_ENTER || key == TB_KEY_CTRL_J || key == TB_KEY_SPACE || ch == ' ' {
             st.screen = SCREEN_PLAY;
         }
         return 1;
@@ -1536,10 +1632,11 @@ fn handle_key(ev: tb_event&) -> i32 {
         set_status_msg(if st.render_scale == 2 { "Render Scale: 2x Fast (Termux/Low-BW)" } else { "Render Scale: 1x Native Full-Res" }, 1400);
         return 1;
     }
-    if ch == 'v' || ch == 'V' {
+    if ch == 'h' || ch == 'H' {
         st.truecolor = if st.truecolor != 0 { 0 } else { 1 };
         let _ = tb_set_output_mode(if st.truecolor != 0 { TB_OUTPUT_TRUECOLOR } else { TB_OUTPUT_256 });
         let _ = tb_invalidate();
+        set_status_msg(if st.truecolor != 0 { "Color Mode: 24-bit Truecolor" } else { "Color Mode: 256-Color Palette" }, 1300);
         return 1;
     }
 
@@ -1560,27 +1657,36 @@ fn handle_key(ev: tb_event&) -> i32 {
     }
 
     // Camera Roll (Q/E) & True Up (U)
-    if ch == 'q' || ch == 'Q' { st.roll = wrap_angle(st.roll - 0.14); return 1; }
-    if ch == 'e' || ch == 'E' { st.roll = wrap_angle(st.roll + 0.14); return 1; }
+    if ch == 'q' || ch == 'Q' {
+        st.roll = wrap_angle(st.roll - 0.14);
+        if st.true_up != 0 { set_status_msg("True Up ON (auto-levels roll) — press [U] for Free Roll!", 1200); }
+        return 1;
+    }
+    if ch == 'e' || ch == 'E' {
+        st.roll = wrap_angle(st.roll + 0.14);
+        if st.true_up != 0 { set_status_msg("True Up ON (auto-levels roll) — press [U] for Free Roll!", 1200); }
+        return 1;
+    }
     if ch == 'u' || ch == 'U' {
         st.true_up = if st.true_up != 0 { 0 } else { 1 };
         set_status_msg(if st.true_up != 0 { "True Up ON (Horizon Auto-Levels)" } else { "True Up OFF (Free 3D Roll)" }, 1300);
         return 1;
     }
 
-    // Use / Shrink Target / ShrinkAny / Telekinesis / Brake / Markers / Fire
+    // Use / Shrink 16x / Grow 16x / ShrinkAny / Telekinesis / Brake / Markers / Fire
     if ch == 'f' || ch == 'F' { use_nearest(); return 1; }
     if ch == 'b' || ch == 'B' { shrink_targeted_block(); return 1; }
-    if ch == 'h' || ch == 'H' {
+    if ch == 'v' || ch == 'V' { grow_in_place(); return 1; }
+    if ch == 'm' || ch == 'M' {
         st.shrink_any = if st.shrink_any != 0 { 0 } else { 1 };
-        set_status_msg(if st.shrink_any != 0 { "ShrinkAny ON: Fly into ANY solid block to shrink 16x!" } else { "ShrinkAny OFF (Normal fractal portals)" }, 1600);
+        set_status_msg(if st.shrink_any != 0 { "ShrinkAny ON: Fly into ANY solid block/atom to shrink 16x!" } else { "ShrinkAny OFF (Normal fractal portals)" }, 1600);
         return 1;
     }
     if ch == 't' || ch == 'T' { trigger_telekinesis(); return 1; }
     if ch == 'x' || ch == 'X' { apply_brake(); return 1; }
-    if ch == 'm' || ch == 'M' { drop_marker(0); return 1; }
-    if ch == 'n' || ch == 'N' { drop_marker(1); return 1; }
-    if key == TB_KEY_ENTER { fire_weapon(0); return 1; }
+    if ch == 'n' || ch == 'N' { drop_marker(0); return 1; }
+    if ch == 'y' || ch == 'Y' { drop_marker(1); return 1; }
+    if key == TB_KEY_ENTER || key == TB_KEY_CTRL_J { fire_weapon(0); return 1; }
     if ch == 'r' || ch == 'R' { fire_weapon(1); return 1; }
 
     // 6-DOF Flight Thrust & Look
@@ -1616,6 +1722,9 @@ fn handle_mouse(ev: tb_event&) {
             if st.mouse_dragging != 0 {
                 let dx = ev.x - st.mouse_last_x;
                 let dy = ev.y - st.mouse_last_y;
+                if dx != 0 || dy != 0 {
+                    st.mouse_drag_moved = 1;
+                }
                 st.yaw = wrap_angle(st.yaw + dx * 0.025);
                 st.pitch = fclamp(st.pitch - dy * 0.035, -1.25, 1.25);
             }
@@ -1623,15 +1732,19 @@ fn handle_mouse(ev: tb_event&) {
             st.mouse_last_x = ev.x;
             st.mouse_last_y = ev.y;
         } else {
-            fire_weapon(0);
             st.mouse_dragging = 1;
+            st.mouse_drag_moved = 0;
             st.mouse_last_x = ev.x;
             st.mouse_last_y = ev.y;
         }
     } else if ev.key == TB_KEY_MOUSE_RIGHT {
         fire_weapon(1);
     } else if ev.key == TB_KEY_MOUSE_RELEASE {
+        if st.mouse_dragging != 0 && st.mouse_drag_moved == 0 {
+            fire_weapon(0);
+        }
         st.mouse_dragging = 0;
+        st.mouse_drag_moved = 0;
     } else if ev.key == TB_KEY_MOUSE_WHEEL_UP {
         st.weapon = (st.weapon + NUM_WEAPONS - 1) % NUM_WEAPONS;
     } else if ev.key == TB_KEY_MOUSE_WHEEL_DOWN {
