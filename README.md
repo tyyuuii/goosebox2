@@ -53,10 +53,11 @@ interactive TUI applications (`demo`, Conway's Game of Life `cgol`, and
 - `SIGWINCH` resize handling via an async-signal-safe self-pipe (preserving and
   restoring any prior `SIGWINCH` `sigaction`), with back-buffer row re-striding
   and front-buffer invalidation for clean reflow/zoom
-- Thin C11 sidecar (`adapter.c` / `adapter.h`) wrapping POSIX APIs that Goose's
-  `extern fn` cannot declare directly (`termios`, `ioctl`, `fcntl`, `open`,
-  `pipe`, `poll`, `sigaction`, `clock_gettime`, `nanosleep`, `getenv`, binary
-  file reads, `errno`)
+- Dual-platform C11 sidecar (`adapter.c` / `adapter.h`) supporting both POSIX
+  (`termios`, `ioctl`, `fcntl`, `poll`, `sigaction`) and native Windows
+  (Win32 Console VT + ConPTY via `ENABLE_VIRTUAL_TERMINAL_PROCESSING` /
+  `ENABLE_VIRTUAL_TERMINAL_INPUT`, `CONIN$`/`CONOUT$`, `CP_UTF8`,
+  `WINDOW_BUFFER_SIZE_EVENT` resize tracking, and `PeekNamedPipe`)
 
 ---
 
@@ -65,7 +66,8 @@ interactive TUI applications (`demo`, Conway's Game of Life `cgol`, and
 - [Goose](https://github.com/aardappel/goose) compiler (`goose` v2026.4+ / nightly)
 - A C11 compiler (`cc` / `clang` / `gcc`, invoked by `goose build` to link
   `adapter.c`)
-- A POSIX terminal (`/dev/tty` or `tb_init_rwfd` pipe/PTY file descriptors)
+- Either a POSIX terminal (`/dev/tty` or `tb_init_rwfd` pipe/PTY descriptors)
+  or Windows 10/11 Console / Windows Terminal / ConPTY (`CONIN$`/`CONOUT$`)
 
 ---
 
@@ -112,7 +114,15 @@ goose check sudoku.goose
 ### Verify C adapter independently
 
 ```bash
+# POSIX (Linux / macOS / Termux)
 cc -std=c11 -Wall -Wextra -Werror -fsyntax-only adapter.c
+```
+
+```powershell
+# Windows (MSVC Developer Command Prompt or MinGW-w64)
+cl /W4 /Zs adapter.c
+# or with MinGW-w64:
+gcc -std=c11 -Wall -Wextra -Werror -fsyntax-only adapter.c
 ```
 
 ### Run automated tests
@@ -120,6 +130,12 @@ cc -std=c11 -Wall -Wextra -Werror -fsyntax-only adapter.c
 ```bash
 goose build test_termbox2.goose -o test_termbox2
 ./test_termbox2
+```
+
+```powershell
+# Windows (PowerShell / cmd.exe)
+goose build test_termbox2.goose -o test_termbox2.exe
+.\test_termbox2.exe
 ```
 
 ### Build and run demos
@@ -403,11 +419,14 @@ struct`. Therefore:
 
 ### C sidecar (`adapter.c`)
 
-`adapter.c` wraps `tcgetattr`, `tcsetattr`, `ioctl(TIOCGWINSZ)`,
-`fcntl(F_GETFL/F_SETFL)`, `open`, `close`, `read`, `write`, `pipe`, `poll`,
-`isatty`, `ttyname_r`, `getenv`, `sigaction(SIGWINCH)` save/restore,
-`clock_gettime`, `nanosleep`, bounded binary file reads, and `errno` predicates
-(`EINTR`, `EAGAIN`/`EWOULDBLOCK`).
+`adapter.c` wraps POSIX terminal/I/O calls (`tcgetattr`, `tcsetattr`,
+`ioctl(TIOCGWINSZ)`, `fcntl(F_GETFL/F_SETFL)`, `open`, `close`, `read`, `write`,
+`pipe`, `poll`, `isatty`, `ttyname_r`, `getenv`, `sigaction(SIGWINCH)`,
+`clock_gettime`, `nanosleep`) and, under `#ifdef _WIN32`, implements native
+Win32 Console VT + ConPTY equivalents (`CONIN$`/`CONOUT$`, `SetConsoleMode` VT
+flags, `CP_UTF8`, `GetConsoleScreenBufferInfo`, `PeekConsoleInputW` resize
+detection, `_pipe` + `PeekNamedPipe`, `_O_BINARY` file reads, and
+`xterm-256color` fallback when `TERM` is unset).
 
 ---
 

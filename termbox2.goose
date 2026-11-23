@@ -147,9 +147,6 @@ const TB_CAP_DIM              = 36;
 const TB_CAP_INVISIBLE        = 37;
 const TB_CAP__COUNT           = 38;
 
-// --- File/fcntl constants ---
-const O_NONBLOCK_BIT: i32 = 0x800;
-
 // --- Hard-coded capabilities ---
 const TB_HARDCAP_ENTER_MOUSE  = "\x1b[?1000h\x1b[?1002h\x1b[?1015h\x1b[?1006h";
 const TB_HARDCAP_EXIT_MOUSE   = "\x1b[?1006l\x1b[?1015l\x1b[?1002l\x1b[?1000l";
@@ -345,6 +342,8 @@ extern fn tb_adapter_get_winsize(fd: i32, out_w: i32&, out_h: i32&) -> i32;
 extern fn tb_adapter_fcntl_getfl(fd: i32) -> i32;
 extern fn tb_adapter_fcntl_setfl(fd: i32, flags: i32) -> i32;
 extern fn tb_adapter_set_nonblock(fd: i32) -> i32;
+extern fn tb_adapter_save_and_set_nonblock(fd: i32, out_orig_flags: i32&) -> i32;
+extern fn tb_adapter_restore_fd_flags(fd: i32, orig_flags: i32) -> i32;
 extern fn tb_adapter_open_tty_rw(path: const u8&) -> i32;
 extern fn tb_adapter_close(fd: i32) -> i32;
 extern fn tb_adapter_write(fd: i32, buf: const u8&, n: u64) -> i64;
@@ -1246,6 +1245,14 @@ fn load_terminfo_file(term: const u8[:]) -> i64 {
         let n2 = try_read_terminfo_path(envbuf[0..home_len], "/.terminfo", term, 1);
         if n2 >= 12 { return n2; }
     }
+    // 2b) %USERPROFILE%/.terminfo (Windows)
+    let up_len = get_env_var("USERPROFILE", envbuf);
+    if up_len > 0 {
+        let n = try_read_terminfo_path(envbuf[0..up_len], "/.terminfo", term, 0);
+        if n >= 12 { return n; }
+        let n2 = try_read_terminfo_path(envbuf[0..up_len], "/.terminfo", term, 1);
+        if n2 >= 12 { return n2; }
+    }
 
     // 3) $PREFIX/share/terminfo (Termux)
     let pfx_len = get_env_var("PREFIX", envbuf);
@@ -1336,7 +1343,7 @@ fn cleanup_partial_init() {
         g.has_orig_tios = 0;
     }
     if g.has_orig_rfd_flags != 0 {
-        let _ = tb_adapter_fcntl_setfl(g.rfd, g.orig_rfd_flags);
+        let _ = tb_adapter_restore_fd_flags(g.rfd, g.orig_rfd_flags);
         g.has_orig_rfd_flags = 0;
     }
     if g.has_resize_pipe != 0 {
@@ -1420,22 +1427,14 @@ fn tb_init_rwfd(rfd: i32, wfd: i32) -> i32 {
         g.has_orig_tios = 1;
     }
 
-    let orig_fl = tb_adapter_fcntl_getfl(rfd);
-    if orig_fl < 0 {
+    var orig_fl: i32 = 0;
+    if tb_adapter_save_and_set_nonblock(rfd, orig_fl) != 0 {
         g.last_errno = tb_adapter_errno();
         cleanup_partial_init();
         return TB_ERR_READ;
     }
     g.orig_rfd_flags = orig_fl;
     g.has_orig_rfd_flags = 1;
-
-    if (orig_fl & O_NONBLOCK_BIT) == 0 {
-        if tb_adapter_set_nonblock(rfd) != 0 {
-            g.last_errno = tb_adapter_errno();
-            cleanup_partial_init();
-            return TB_ERR_READ;
-        }
-    }
 
     if g.rfd_is_tty != 0 {
         if tb_adapter_set_raw_mode(rfd) != 0 {
@@ -1581,7 +1580,7 @@ fn tb_shutdown() -> i32 {
     }
 
     if g.has_orig_rfd_flags != 0 {
-        let _ = tb_adapter_fcntl_setfl(g.rfd, g.orig_rfd_flags);
+        let _ = tb_adapter_restore_fd_flags(g.rfd, g.orig_rfd_flags);
         g.has_orig_rfd_flags = 0;
     }
 
