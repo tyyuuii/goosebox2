@@ -2,7 +2,15 @@
 // Port of https://github.com/termbox/termbox2 (MIT license)
 // Original authors: Adam Saponara, nsf
 //
-// Build: goose build termbox2.goose   (links adapter.c via termbox2.build)
+// Architecture:
+//   - All mutable library state lives in a single `root struct tb_global` so
+//     Goose's "one resizable value per stack" rule is satisfied.
+//   - POSIX syscalls requiring variadic libc signatures or platform structs
+//     (termios, winsize, ioctl, fcntl, poll, sigaction) live in adapter.c.
+//
+// Build:
+//   goose check termbox2.goose
+//   goose build <app>.goose -o <app>   (links adapter.c via <app>.build)
 
 const TB_VERSION_STR = "3.0.0-goose";
 
@@ -10,9 +18,10 @@ const TB_VERSION_STR = "3.0.0-goose";
 // Compile-time options (mirrors termbox2.h TB_OPT_*)
 // ---------------------------------------------------------------------------
 
+// 64-bit attribute width (matches uintattr_t = u64).
 const TB_OPT_ATTR_W = 64;
-const TB_OPT_EGC = 0;
-const TB_OPT_PRINTF_BUF = 4096;
+// Extended Grapheme Clusters (1 = enabled via pooled egc_node chains).
+const TB_OPT_EGC = 1;
 const TB_OPT_READ_BUF = 64;
 
 // ---------------------------------------------------------------------------
@@ -138,15 +147,8 @@ const TB_CAP_DIM              = 36;
 const TB_CAP_INVISIBLE        = 37;
 const TB_CAP__COUNT           = 38;
 
-// --- TTY/ioctl constants ---
-const TIOCGWINSZ: u64 = 0x5413;
-const TCGETS: u64 = 0x5401;
-const TCSETS: u64 = 0x5402;
-const F_GETFL: i32 = 3;
-const F_SETFL: i32 = 4;
-const O_NONBLOCK: i32 = 0x800;
-const O_RDWR: i32 = 2;
-const SIGWINCH: i32 = 28;
+// --- File/fcntl constants ---
+const O_NONBLOCK_BIT: i32 = 0x800;
 
 // --- Hard-coded capabilities ---
 const TB_HARDCAP_ENTER_MOUSE  = "\x1b[?1000h\x1b[?1002h\x1b[?1015h\x1b[?1006h";
@@ -181,9 +183,9 @@ const TB_OVERLINE             = 0x0000000400000000;
 const TB_INVISIBLE            = 0x0000000800000000;
 
 // --- Event types ---
-const TB_EVENT_KEY   = 1;
+const TB_EVENT_KEY    = 1;
 const TB_EVENT_RESIZE = 2;
-const TB_EVENT_MOUSE = 3;
+const TB_EVENT_MOUSE  = 3;
 
 // --- Modifiers ---
 const TB_MOD_ALT      = 1;
@@ -239,21 +241,30 @@ const TB_PATH_MAX = 4096;
 // DATA STRUCTURES
 // ===========================================================================
 
+// Single terminal cell in the front/back cell buffers.
 struct tb_cell {
-    ch: u32,
-    fg: uintattr_t,
-    bg: uintattr_t,
+    ch: u32,         // Base Unicode codepoint (additional combining chars live in cellbuf EGC chains)
+    fg: uintattr_t,  // Foreground color index / RGB + TB_* attribute flags
+    bg: uintattr_t,  // Background color index / RGB + TB_* attribute flags
 }
 
+// Input or resize event populated by tb_peek_event() / tb_poll_event().
+// Note: `kind` corresponds to `type` in C termbox2.h (`type` is a Goose keyword).
 struct tb_event {
-    kind: u8,
-    mod: u8,
-    key: u16,
+    kind: u8,   // TB_EVENT_KEY (1), TB_EVENT_RESIZE (2), or TB_EVENT_MOUSE (3)
+    mod: u8,    // Bitmask of TB_MOD_ALT, TB_MOD_CTRL, TB_MOD_SHIFT, TB_MOD_MOTION
+    key: u16,   // Special/control key constant (TB_KEY_*), or 0 when `ch` is set
+    ch: u32,    // Decoded Unicode codepoint for printable keys, or 0
+    w: i32,     // New terminal width in columns (TB_EVENT_RESIZE)
+    h: i32,     // New terminal height in rows (TB_EVENT_RESIZE)
+    x: i32,     // Zero-based column (TB_EVENT_MOUSE)
+    y: i32,     // Zero-based row (TB_EVENT_MOUSE)
+}
+
+// Linked node in `tb_global.egc_pool` storing extra codepoints for grapheme clusters.
+struct egc_node {
     ch: u32,
-    w: i32,
-    h: i32,
-    x: i32,
-    y: i32,
+    next: i32,
 }
 
 struct cellbuf {
@@ -277,6 +288,9 @@ root struct tb_global {
     wfd: i32,
     ttyfd_open: i32,
     fd_owned: i32,
+    rfd_is_tty: i32,
+    orig_rfd_flags: i32,
+    has_orig_rfd_flags: i32,
     has_resize_pipe: i32,
     resize_pipefd: i32[2],
     width: i32,
@@ -296,6 +310,7 @@ root struct tb_global {
     nterminfo: i64,
     caps: const u8[:][TB_CAP__COUNT],
     cap_trie: cap_trie_node[>..],
+    cap_trie_len: i32,
     cap_trie_root: i32,
     term_index: i32,
     inbuf: u8[>..],
@@ -305,10 +320,13 @@ root struct tb_global {
     outbuf_len: i64,
     back: cellbuf,
     front: cellbuf,
+    back_ech_head: i32[>..],
+    front_ech_head: i32[>..],
+    egc_pool: egc_node[>..],
+    egc_free_head_p1: i32,
     has_orig_tios: i32,
     last_errno: i32,
     initialized: i32,
-    errbuf: u8[1024],
 }
 
 var global: tb_global;
@@ -324,6 +342,8 @@ fn gbl() -> tb_global& {
 extern fn tb_adapter_save_termios(fd: i32) -> i32;
 extern fn tb_adapter_restore_termios(fd: i32) -> i32;
 extern fn tb_adapter_get_winsize(fd: i32, out_w: i32&, out_h: i32&) -> i32;
+extern fn tb_adapter_fcntl_getfl(fd: i32) -> i32;
+extern fn tb_adapter_fcntl_setfl(fd: i32, flags: i32) -> i32;
 extern fn tb_adapter_set_nonblock(fd: i32) -> i32;
 extern fn tb_adapter_open_tty_rw(path: const u8&) -> i32;
 extern fn tb_adapter_close(fd: i32) -> i32;
@@ -339,20 +359,19 @@ extern fn tb_adapter_isatty(fd: i32) -> i32;
 extern fn tb_adapter_errno() -> i32;
 extern fn tb_adapter_is_eintr() -> i32;
 extern fn tb_adapter_is_again() -> i32;
-extern fn tb_adapter_ttyname(fd: i32) -> u64;
-extern fn tb_adapter_get_ttyname(buf: u8&, bufsz: u64, tty_name_ptr: u64) -> i32;
 extern fn tb_adapter_setup_signwinch(pipe_fd: i32) -> i32;
 extern fn tb_adapter_clear_signwinch() -> i32;
-extern fn tb_adapter_resize_notify(fd: i32) -> i32;
 extern fn tb_adapter_set_raw_mode(fd: i32) -> i32;
 extern fn tb_adapter_get_term(buf: u8&, bufsz: u64) -> i32;
+extern fn tb_adapter_getenv(name: const u8&, buf: u8&, bufsz: u64) -> i32;
+extern fn tb_adapter_read_file(path: const u8&, buf: u8&, max_bytes: u64) -> i64;
 extern fn tb_internal_now_ms() -> i64 = "tb_adapter_now_ms";
 
 // ===========================================================================
-// UTF-8 HELPERS
+// UTF-8 & UNICODE HELPERS
 // ===========================================================================
 
-// Return byte length of codepoint given first byte of UTF-8 sequence (1-6).
+// Return byte length of codepoint given first byte of UTF-8 sequence (1-6, 0 if invalid).
 fn tb_utf8_char_length(c: i8) -> i32 {
     let uc = c as u8;
     if uc & 0x80 == 0 { return 1; }
@@ -364,13 +383,15 @@ fn tb_utf8_char_length(c: i8) -> i32 {
     return 0;
 }
 
+// Decode one UTF-8 character from `c` into `out`.
+// Returns byte length (1..4), 0 if `c` is empty, TB_ERR_NEED_MORE if truncated,
+// or TB_ERR on invalid/overlong/surrogate/>U+10FFFF sequences.
 fn tb_utf8_char_to_unicode(out: u32&, c: const u8[:]) -> i32 {
     if c.len == 0 { return 0; }
     let first = c[0];
     let len = tb_utf8_char_length(first as i8);
     if len <= 0 { return TB_ERR; }
     if len > c.len { return TB_ERR_NEED_MORE; }
-    // Validate continuation bytes
     var i: i32 = 1;
     while i < len {
         if c[i] & 0xc0 != 0x80 { return TB_ERR; }
@@ -395,7 +416,6 @@ fn tb_utf8_char_to_unicode(out: u32&, c: const u8[:]) -> i32 {
     } else {
         return TB_ERR;
     }
-    // Reject overlong, surrogates, > 0x10ffff
     if (len == 2 && value < 0x80) || (len == 3 && value < 0x800) || (len == 4 && value < 0x10000) { return TB_ERR; }
     if value >= 0xd800 && value <= 0xdfff { return TB_ERR; }
     if value > 0x10ffff { return TB_ERR; }
@@ -403,6 +423,8 @@ fn tb_utf8_char_to_unicode(out: u32&, c: const u8[:]) -> i32 {
     return len;
 }
 
+// Encode Unicode codepoint `c` as UTF-8 into NUL-terminated `out` (returns 1..4 bytes).
+// Invalid codepoints (> U+10FFFF or UTF-16 surrogates) encode as U+FFFD.
 fn tb_utf8_unicode_to_char(out: u8[7]&, c: u32) -> i32 {
     var len: i32;
     var b0: u8 = 0;
@@ -410,7 +432,6 @@ fn tb_utf8_unicode_to_char(out: u8[7]&, c: u32) -> i32 {
     var b2: u8 = 0;
     var b3: u8 = 0;
     if c > 0x10ffff || (c >= 0xd800 && c <= 0xdfff) {
-        // Replacement character U+FFFD
         b0 = 0xef; b1 = 0xbf; b2 = 0xbd; len = 3;
     } else if c < 0x80 {
         b0 = c as u8; len = 1;
@@ -444,9 +465,11 @@ fn tb_utf8_unicode_to_char(out: u8[7]&, c: u32) -> i32 {
     return len;
 }
 
+// Return 1 if `ch` is printable (excludes C0/C1 controls, DEL, surrogates, and nonchars).
 fn tb_iswprint(ch: u32) -> i32 {
     if ch < 0x20 { return 0; }
-    if ch == 0x7f { return 0; }
+    if ch >= 0x7f && ch <= 0x9f { return 0; }
+    if (ch & 0xffff) == 0xfffe || (ch & 0xffff) == 0xffff { return 0; }
     if ch >= 0x20 && ch <= 0x7e { return 1; }
     if ch >= 0xa0 && ch <= 0xd7ff { return 1; }
     if ch >= 0xe000 && ch <= 0xfdcf { return 1; }
@@ -455,29 +478,54 @@ fn tb_iswprint(ch: u32) -> i32 {
     return 0;
 }
 
+// Return display column width of `ch`: 0 (NUL/combining/ZWJ), 1 (normal), 2 (wide CJK/emoji),
+// or -1 (C0/C1 control).
 fn tb_wcwidth(ch: u32) -> i32 {
     if ch == 0 { return 0; }
     if ch < 0x20 || (ch >= 0x7f && ch < 0xa0) { return -1; }
-    // Common combining marks
+
+    // Combining marks, format controls (ZWJ/ZWNJ), Hangul Jamo V/T, variation selectors
     if (ch >= 0x0300 && ch <= 0x036f) ||
+       (ch >= 0x0483 && ch <= 0x0489) ||
+       (ch >= 0x0591 && ch <= 0x05bd) || ch == 0x05bf || ch == 0x05c1 || ch == 0x05c2 ||
+       ch == 0x05c4 || ch == 0x05c5 || ch == 0x05c7 ||
+       (ch >= 0x0610 && ch <= 0x061a) || (ch >= 0x064b && ch <= 0x065f) || ch == 0x0670 ||
+       (ch >= 0x06d6 && ch <= 0x06dc) || (ch >= 0x06df && ch <= 0x06e4) ||
+       (ch >= 0x06e7 && ch <= 0x06e8) || (ch >= 0x06ea && ch <= 0x06ed) ||
+       (ch >= 0x0900 && ch <= 0x0902) || ch == 0x093c ||
+       (ch >= 0x0941 && ch <= 0x0948) || ch == 0x094d ||
+       ch == 0x0e31 || (ch >= 0x0e34 && ch <= 0x0e3a) || (ch >= 0x0e47 && ch <= 0x0e4e) ||
+       (ch >= 0x1160 && ch <= 0x11ff) ||
        (ch >= 0x1ab0 && ch <= 0x1aff) ||
        (ch >= 0x1dc0 && ch <= 0x1dff) ||
+       (ch >= 0x200b && ch <= 0x200f) ||
+       (ch >= 0x202a && ch <= 0x202e) ||
+       (ch >= 0x2060 && ch <= 0x206f) ||
        (ch >= 0x20d0 && ch <= 0x20ff) ||
+       (ch >= 0xd7b0 && ch <= 0xd7ff) ||
        (ch >= 0xfe00 && ch <= 0xfe0f) ||
-       (ch >= 0xfe20 && ch <= 0xfe2f) {
+       (ch >= 0xfe20 && ch <= 0xfe2f) ||
+       ch == 0xfeff ||
+       (ch >= 0xe0100 && ch <= 0xe01ef) {
         return 0;
     }
-    // Wide East Asian & emoji ranges
+
+    // Wide East Asian, Hangul, symbols & emoji blocks
     if ch >= 0x1100 && (
         ch <= 0x115f ||
         ch == 0x2329 || ch == 0x232a ||
         (ch >= 0x2e80 && ch <= 0xa4cf && ch != 0x303f) ||
+        (ch >= 0xa960 && ch <= 0xa97f) ||
         (ch >= 0xac00 && ch <= 0xd7a3) ||
         (ch >= 0xf900 && ch <= 0xfaff) ||
         (ch >= 0xfe10 && ch <= 0xfe19) ||
         (ch >= 0xfe30 && ch <= 0xfe6f) ||
         (ch >= 0xff00 && ch <= 0xff60) ||
         (ch >= 0xffe0 && ch <= 0xffe6) ||
+        ch == 0x1f004 || ch == 0x1f0cf || ch == 0x1f18e ||
+        (ch >= 0x1f191 && ch <= 0x1f19a) ||
+        (ch >= 0x1f1e6 && ch <= 0x1f1ff) ||
+        (ch >= 0x1f200 && ch <= 0x1f2ff) ||
         (ch >= 0x1f300 && ch <= 0x1faff) ||
         (ch >= 0x20000 && ch <= 0x3fffd)
     ) {
@@ -487,17 +535,104 @@ fn tb_wcwidth(ch: u32) -> i32 {
 }
 
 // ===========================================================================
-// CELL BUFFER OPERATIONS
+// EGC POOL & CELL BUFFER OPERATIONS
 // ===========================================================================
 
+fn egc_free_chain(head: i32) {
+    let g = gbl();
+    var cur = head;
+    while cur >= 0 {
+        let nxt = g.egc_pool[cur].next;
+        g.egc_pool[cur].ch = 0;
+        g.egc_pool[cur].next = g.egc_free_head_p1 - 1;
+        g.egc_free_head_p1 = cur + 1;
+        cur = nxt;
+    }
+}
+
+fn egc_alloc_node(ch: u32) -> i32 {
+    let g = gbl();
+    if g.egc_free_head_p1 > 0 {
+        let idx = g.egc_free_head_p1 - 1;
+        g.egc_free_head_p1 = g.egc_pool[idx].next + 1;
+        g.egc_pool[idx].ch = ch;
+        g.egc_pool[idx].next = -1;
+        return idx;
+    }
+    let idx = g.egc_pool.len as i32;
+    g.egc_pool.push(egc_node { ch: ch, next: -1 });
+    return idx;
+}
+
+fn egc_append_back(cell_idx: i32, ch: u32) {
+    let g = gbl();
+    let new_idx = egc_alloc_node(ch);
+    var cur = g.back_ech_head[cell_idx];
+    if cur < 0 {
+        g.back_ech_head[cell_idx] = new_idx;
+        return;
+    }
+    while g.egc_pool[cur].next >= 0 {
+        cur = g.egc_pool[cur].next;
+    }
+    g.egc_pool[cur].next = new_idx;
+}
+
+fn egc_append_front(cell_idx: i32, ch: u32) {
+    let g = gbl();
+    let new_idx = egc_alloc_node(ch);
+    var cur = g.front_ech_head[cell_idx];
+    if cur < 0 {
+        g.front_ech_head[cell_idx] = new_idx;
+        return;
+    }
+    while g.egc_pool[cur].next >= 0 {
+        cur = g.egc_pool[cur].next;
+    }
+    g.egc_pool[cur].next = new_idx;
+}
+
+fn egc_cmp_chains(h1: i32, h2: i32) -> i32 {
+    if h1 < 0 && h2 < 0 { return 0; }
+    if h1 < 0 || h2 < 0 { return 1; }
+    let g = gbl();
+    var a = h1;
+    var b = h2;
+    while a >= 0 && b >= 0 {
+        if g.egc_pool[a].ch != g.egc_pool[b].ch { return 1; }
+        a = g.egc_pool[a].next;
+        b = g.egc_pool[b].next;
+    }
+    if a >= 0 || b >= 0 { return 1; }
+    return 0;
+}
+
+fn egc_copy_to_front(front_idx: i32, src_head: i32) {
+    let g = gbl();
+    if g.front_ech_head[front_idx] >= 0 {
+        egc_free_chain(g.front_ech_head[front_idx]);
+        g.front_ech_head[front_idx] = -1;
+    }
+    if src_head < 0 { return; }
+    var cur = src_head;
+    while cur >= 0 {
+        let ch = g.egc_pool[cur].ch;
+        egc_append_front(front_idx, ch);
+        cur = g.egc_pool[cur].next;
+    }
+}
+
+// Return current terminal width in columns (updated on init and resize events).
 fn tb_width() -> i32 {
     return gbl().width;
 }
 
+// Return current terminal height in rows (updated on init and resize events).
 fn tb_height() -> i32 {
     return gbl().height;
 }
 
+// Set default foreground/background attributes used by subsequent tb_clear() calls.
 fn tb_set_clear_attrs(fg: uintattr_t, bg: uintattr_t) -> i32 {
     let g = gbl();
     g.fg = fg;
@@ -505,6 +640,7 @@ fn tb_set_clear_attrs(fg: uintattr_t, bg: uintattr_t) -> i32 {
     return TB_OK;
 }
 
+// Fill the entire back buffer with spaces (0x20) using clear attributes and clear any EGC chains.
 fn tb_clear() -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
@@ -518,15 +654,23 @@ fn tb_clear() -> i32 {
             g.back.cells[idx].ch = 0x20;
             g.back.cells[idx].fg = fg;
             g.back.cells[idx].bg = bg;
+            if g.back_ech_head[idx] >= 0 {
+                egc_free_chain(g.back_ech_head[idx]);
+                g.back_ech_head[idx] = -1;
+            }
         }
     }
     return TB_OK;
 }
 
+// Write a single Unicode codepoint and attributes to the back buffer at (x, y).
+// Returns TB_ERR_OUT_OF_BOUNDS if coordinates lie outside [0..width) x [0..height).
 fn tb_set_cell(x: i32, y: i32, ch: u32, fg: uintattr_t, bg: uintattr_t) -> i32 {
     return tb_set_cell_ex(x, y, ch, 1, fg, bg);
 }
 
+// Extended cell setter (writes `ch` when `nch > 0`, or space if `nch <= 0`, clearing EGC chains).
+// For multi-codepoint grapheme slices in Goose, use tb_set_cell_slice() or tb_extend_cell().
 fn tb_set_cell_ex(x: i32, y: i32, ch: const u32&, nch: i64, fg: uintattr_t, bg: uintattr_t) -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
@@ -534,24 +678,58 @@ fn tb_set_cell_ex(x: i32, y: i32, ch: const u32&, nch: i64, fg: uintattr_t, bg: 
         return TB_ERR_OUT_OF_BOUNDS;
     }
     let idx = y * g.width + x;
-    g.back.cells[idx].ch = ch;
+    if g.back_ech_head[idx] >= 0 {
+        egc_free_chain(g.back_ech_head[idx]);
+        g.back_ech_head[idx] = -1;
+    }
+    // If overwriting the trailing cell of a wide character, clear the orphaned lead cell
+    if x > 0 && tb_wcwidth(g.back.cells[idx - 1].ch) == 2 {
+        g.back.cells[idx - 1].ch = 0x20;
+        if g.back_ech_head[idx - 1] >= 0 {
+            egc_free_chain(g.back_ech_head[idx - 1]);
+            g.back_ech_head[idx - 1] = -1;
+        }
+    }
+    g.back.cells[idx].ch = if nch > 0 { ch } else { 0x20 };
     g.back.cells[idx].fg = fg;
     g.back.cells[idx].bg = bg;
     return TB_OK;
 }
 
+// Goose port helper: write a slice of Unicode codepoints (base + combining marks) at (x, y).
+fn tb_set_cell_slice(x: i32, y: i32, chs: const u32[:], fg: uintattr_t, bg: uintattr_t) -> i32 {
+    let g = gbl();
+    guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
+    guard x >= 0 && x < g.width && y >= 0 && y < g.height else {
+        return TB_ERR_OUT_OF_BOUNDS;
+    }
+    if chs.len == 0 {
+        return tb_set_cell(x, y, 0x20, fg, bg);
+    }
+    let rv = tb_set_cell_ex(x, y, chs[0], 1, fg, bg);
+    if rv != TB_OK { return rv; }
+    let idx = y * g.width + x;
+    var i: i64 = 1;
+    while i < chs.len {
+        egc_append_back(idx, chs[i]);
+        i = i + 1;
+    }
+    return TB_OK;
+}
+
+// Append a combining/additional Unicode codepoint to the cell at (x, y) (EGC support).
 fn tb_extend_cell(x: i32, y: i32, ch: u32) -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
     guard x >= 0 && x < g.width && y >= 0 && y < g.height else {
         return TB_ERR_OUT_OF_BOUNDS;
     }
-    if TB_OPT_EGC == 0 {
-        return TB_ERR;
-    }
+    let idx = y * g.width + x;
+    egc_append_back(idx, ch);
     return TB_OK;
 }
 
+// Goose port helper: copy cell at (x, y) from back buffer (`back != 0`) or front buffer.
 fn tb_get_cell(x: i32, y: i32, back: i32, cell: tb_cell&) -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
@@ -567,9 +745,16 @@ fn tb_get_cell(x: i32, y: i32, back: i32, cell: tb_cell&) -> i32 {
     return TB_OK;
 }
 
-fn grow_cells(buf: cellbuf&, width: i32, height: i32) -> i32 {
+fn grow_cells(buf: cellbuf&, width: i32, height: i32, is_back: i32) -> i32 {
+    let g = gbl();
     let needed = width * height;
     let have = buf.cells.len;
+    var ech_cur = if is_back != 0 { g.back_ech_head.len } else { g.front_ech_head.len };
+    while ech_cur < needed {
+        if is_back != 0 { g.back_ech_head.push(-1); }
+        else { g.front_ech_head.push(-1); }
+        ech_cur = ech_cur + 1;
+    }
     if needed <= have {
         buf.width = width;
         buf.height = height;
@@ -585,19 +770,52 @@ fn grow_cells(buf: cellbuf&, width: i32, height: i32) -> i32 {
     return TB_OK;
 }
 
-fn resize_back_cellbuf(buf: cellbuf&, new_w: i32, new_h: i32, fg: uintattr_t, bg: uintattr_t) {
-    let old_w = buf.width;
-    let old_h = buf.height;
-    let _ = grow_cells(buf, new_w, new_h);
+fn resize_back_cellbuf(new_w: i32, new_h: i32, fg: uintattr_t, bg: uintattr_t) {
+    let g = gbl();
+    let old_w = g.back.width;
+    let old_h = g.back.height;
+
+    if new_h < old_h {
+        var ry = new_h;
+        while ry < old_h {
+            var rx = 0;
+            while rx < old_w {
+                let ridx = ry * old_w + rx;
+                if ridx < g.back_ech_head.len && g.back_ech_head[ridx] >= 0 {
+                    egc_free_chain(g.back_ech_head[ridx]);
+                    g.back_ech_head[ridx] = -1;
+                }
+                rx = rx + 1;
+            }
+            ry = ry + 1;
+        }
+    }
     let min_w = if old_w < new_w { old_w } else { new_w };
     let min_h = if old_h < new_h { old_h } else { new_h };
+    if new_w < old_w {
+        var ry = 0;
+        for ry in min_h {
+            var rx = new_w;
+            while rx < old_w {
+                let ridx = ry * old_w + rx;
+                if ridx < g.back_ech_head.len && g.back_ech_head[ridx] >= 0 {
+                    egc_free_chain(g.back_ech_head[ridx]);
+                    g.back_ech_head[ridx] = -1;
+                }
+                rx = rx + 1;
+            }
+        }
+    }
+
+    let _ = grow_cells(g.back, new_w, new_h, 1);
 
     if new_w < old_w {
         var y = 0;
         for y in min_h {
             var x = 0;
             for x in min_w {
-                buf.cells[y * new_w + x] = buf.cells[y * old_w + x];
+                g.back.cells[y * new_w + x] = g.back.cells[y * old_w + x];
+                g.back_ech_head[y * new_w + x] = g.back_ech_head[y * old_w + x];
             }
         }
     } else if new_w > old_w {
@@ -605,15 +823,17 @@ fn resize_back_cellbuf(buf: cellbuf&, new_w: i32, new_h: i32, fg: uintattr_t, bg
         while y >= 0 {
             var x = min_w - 1;
             while x >= 0 {
-                buf.cells[y * new_w + x] = buf.cells[y * old_w + x];
+                g.back.cells[y * new_w + x] = g.back.cells[y * old_w + x];
+                g.back_ech_head[y * new_w + x] = g.back_ech_head[y * old_w + x];
                 x = x - 1;
             }
             var cx = min_w;
             while cx < new_w {
                 let idx = y * new_w + cx;
-                buf.cells[idx].ch = 0x20;
-                buf.cells[idx].fg = fg;
-                buf.cells[idx].bg = bg;
+                g.back.cells[idx].ch = 0x20;
+                g.back.cells[idx].fg = fg;
+                g.back.cells[idx].bg = bg;
+                g.back_ech_head[idx] = -1;
                 cx = cx + 1;
             }
             y = y - 1;
@@ -626,9 +846,10 @@ fn resize_back_cellbuf(buf: cellbuf&, new_w: i32, new_h: i32, fg: uintattr_t, bg
             var x = 0;
             while x < new_w {
                 let idx = y * new_w + x;
-                buf.cells[idx].ch = 0x20;
-                buf.cells[idx].fg = fg;
-                buf.cells[idx].bg = bg;
+                g.back.cells[idx].ch = 0x20;
+                g.back.cells[idx].fg = fg;
+                g.back.cells[idx].bg = bg;
+                g.back_ech_head[idx] = -1;
                 x = x + 1;
             }
             y = y + 1;
@@ -636,7 +857,8 @@ fn resize_back_cellbuf(buf: cellbuf&, new_w: i32, new_h: i32, fg: uintattr_t, bg
     }
 }
 
-fn reset_cellbuf(buf: cellbuf&, ch: u32, fg: uintattr_t, bg: uintattr_t) {
+fn reset_cellbuf(buf: cellbuf&, ch: u32, fg: uintattr_t, bg: uintattr_t, is_back: i32) {
+    let g = gbl();
     var y = 0;
     for y in buf.height {
         var x = 0;
@@ -645,260 +867,23 @@ fn reset_cellbuf(buf: cellbuf&, ch: u32, fg: uintattr_t, bg: uintattr_t) {
             buf.cells[idx].ch = ch;
             buf.cells[idx].fg = fg;
             buf.cells[idx].bg = bg;
-        }
-    }
-}
-
-// ===========================================================================
-// TTY INITIALIZATION & SHUTDOWN
-// ===========================================================================
-
-fn cleanup_partial_init() {
-    let g = gbl();
-    let _ = tb_adapter_clear_signwinch();
-    if g.has_orig_tios != 0 {
-        let _ = tb_adapter_restore_termios(g.rfd);
-        g.has_orig_tios = 0;
-    }
-    if g.has_resize_pipe != 0 {
-        let _ = tb_adapter_close(g.resize_pipefd[0]);
-        let _ = tb_adapter_close(g.resize_pipefd[1]);
-        g.resize_pipefd[0] = -1;
-        g.resize_pipefd[1] = -1;
-        g.has_resize_pipe = 0;
-    }
-    if g.ttyfd_open != 0 && g.fd_owned != 0 {
-        let _ = tb_adapter_close(g.ttyfd);
-    }
-    g.ttyfd_open = 0;
-    g.fd_owned = 0;
-    g.initialized = 0;
-}
-
-fn tb_init() -> i32 {
-    return tb_init_file("/dev/tty");
-}
-
-fn tb_init_file(path: const u8[:]) -> i32 {
-    let g = gbl();
-    guard g.initialized == 0 else { return TB_ERR_INIT_ALREADY; }
-
-    var pathbuf: u8[>..] = [];
-    var i = 0;
-    for i in path.len { pathbuf.push(path[i]); }
-    pathbuf.push(0);
-
-    let fd = tb_adapter_open_tty_rw(pathbuf[0]);
-    guard fd >= 0 else { return TB_ERR_INIT_OPEN; }
-
-    g.fd_owned = 1;
-    let rv = tb_init_fd(fd);
-    if rv != TB_OK {
-        // tb_init_rwfd cleans up fd_owned on failure, ensure cleared
-        g.fd_owned = 0;
-    }
-    return rv;
-}
-
-fn tb_init_fd(ttyfd: i32) -> i32 {
-    return tb_init_rwfd(ttyfd, ttyfd);
-}
-
-fn str_starts_with(haystack: const u8[:], prefix: const u8[:]) -> i32 {
-    if prefix.len == 0 || haystack.len < prefix.len { return 0; }
-    var i = 0;
-    for i in prefix.len {
-        if haystack[i] != prefix[i] { return 0; }
-    }
-    return 1;
-}
-
-fn str_equals(a: const u8[:], b: const u8[:]) -> i32 {
-    if a.len != b.len { return 0; }
-    var i = 0;
-    for i in a.len {
-        if a[i] != b[i] { return 0; }
-    }
-    return 1;
-}
-
-fn tb_init_rwfd(rfd: i32, wfd: i32) -> i32 {
-    let g = gbl();
-    if g.initialized != 0 {
-        let _ = tb_shutdown();
-    }
-
-    if tb_adapter_isatty(rfd) == 0 {
-        if g.fd_owned != 0 {
-            let _ = tb_adapter_close(rfd);
-            g.fd_owned = 0;
-        }
-        return TB_ERR_NOT_INIT;
-    }
-
-    g.ttyfd = rfd;
-    g.rfd = rfd;
-    g.wfd = wfd;
-    g.ttyfd_open = 1;
-    g.has_resize_pipe = 0;
-    g.resize_pipefd[0] = -1;
-    g.resize_pipefd[1] = -1;
-    g.has_orig_tios = 0;
-    g.last_errno = 0;
-
-    if tb_adapter_save_termios(rfd) != 0 {
-        g.last_errno = tb_adapter_errno();
-        cleanup_partial_init();
-        return TB_ERR_TCGETATTR;
-    }
-    g.has_orig_tios = 1;
-
-    if tb_adapter_set_nonblock(rfd) != 0 {
-        g.last_errno = tb_adapter_errno();
-        cleanup_partial_init();
-        return TB_ERR_READ;
-    }
-
-    if tb_adapter_set_raw_mode(rfd) != 0 {
-        g.last_errno = tb_adapter_errno();
-        cleanup_partial_init();
-        return TB_ERR_TCSETATTR;
-    }
-
-    var pipefd: i32[2] = [-1, -1];
-    if tb_adapter_pipe(pipefd) != 0 {
-        g.last_errno = tb_adapter_errno();
-        cleanup_partial_init();
-        return TB_ERR_RESIZE_PIPE;
-    }
-    g.resize_pipefd[0] = pipefd[0];
-    g.resize_pipefd[1] = pipefd[1];
-    g.has_resize_pipe = 1;
-
-    var w: i32 = 0;
-    var h: i32 = 0;
-    if tb_adapter_get_winsize(wfd, w, h) != 0 {
-        if tb_adapter_get_winsize(rfd, w, h) != 0 {
-            g.last_errno = tb_adapter_errno();
-            cleanup_partial_init();
-            return TB_ERR_RESIZE_IOCTL;
-        }
-    }
-    if !(w > 0 && h > 0) {
-        cleanup_partial_init();
-        return TB_ERR_RESIZE_IOCTL;
-    }
-    g.width = w;
-    g.height = h;
-
-    // Terminal capability detection - use TERM env var (exact, then alias, then prefix)
-    g.term_index = -1;
-    var term_name: u8[64] = [0; 64];
-    let rv = tb_adapter_get_term(term_name[0], 64);
-    if rv > 0 {
-        let tslice = term_name[0..rv];
-        let term_idx = find_builtin_term(tslice);
-        if term_idx >= 0 {
-            g.term_index = term_idx;
-        } else {
-            var i: i32 = 0;
-            for i in builtin_terms.len {
-                let entry = builtin_terms[i];
-                if str_starts_with(tslice, entry.name) != 0 ||
-                   str_starts_with(tslice, entry.alias) != 0 {
-                    g.term_index = i as i32;
-                    break;
+            if is_back != 0 {
+                if idx < g.back_ech_head.len && g.back_ech_head[idx] >= 0 {
+                    egc_free_chain(g.back_ech_head[idx]);
+                    g.back_ech_head[idx] = -1;
+                }
+            } else {
+                if idx < g.front_ech_head.len && g.front_ech_head[idx] >= 0 {
+                    egc_free_chain(g.front_ech_head[idx]);
+                    g.front_ech_head[idx] = -1;
                 }
             }
         }
     }
-    if g.term_index < 0 {
-        g.term_index = 0;
-    }
-    g.caps = builtin_terms[g.term_index].caps;
-
-    // Build capability trie (re-creates root cleanly on re-init)
-    let _ = cap_trie_build();
-
-    // Initialize back and front cell buffers
-    let _ = grow_cells(g.back, g.width, g.height);
-    let _ = grow_cells(g.front, g.width, g.height);
-    reset_cellbuf(g.back, 0x20, TB_DEFAULT, TB_DEFAULT);
-    reset_cellbuf(g.front, 0xffffffff, 0xffffffffffffffff, 0xffffffffffffffff);
-
-    if tb_adapter_setup_signwinch(g.resize_pipefd[1]) != 0 {
-        g.last_errno = tb_adapter_errno();
-        cleanup_partial_init();
-        return TB_ERR_RESIZE_SIGACTION;
-    }
-
-    g.input_mode = TB_INPUT_ESC;
-    g.output_mode = TB_OUTPUT_NORMAL;
-    g.fg = TB_DEFAULT;
-    g.bg = TB_DEFAULT;
-    g.last_fg = 0xffffffffffffffff;
-    g.last_bg = 0xffffffffffffffff;
-    g.inbuf_pos = 0;
-    g.inbuf_len = 0;
-    g.outbuf_len = 0;
-    g.cursor_x = -1;
-    g.cursor_y = -1;
-    g.cursor_hidden = 1;
-    g.last_x = -1;
-    g.last_y = -1;
-    g.initialized = 1;
-
-    // Enter alternate screen, keypad transmit mode, hide cursor, clear screen
-    if g.caps[TB_CAP_ENTER_CA].len > 0 { let _ = outbuf_puts(g.caps[TB_CAP_ENTER_CA]); }
-    if g.caps[TB_CAP_ENTER_KEYPAD].len > 0 { let _ = outbuf_puts(g.caps[TB_CAP_ENTER_KEYPAD]); }
-    if g.caps[TB_CAP_HIDE_CURSOR].len > 0 { let _ = outbuf_puts(g.caps[TB_CAP_HIDE_CURSOR]); }
-    if g.caps[TB_CAP_CLEAR_SCREEN].len > 0 { let _ = outbuf_puts(g.caps[TB_CAP_CLEAR_SCREEN]); }
-    let _ = outbuf_flush(g.wfd);
-
-    return TB_OK;
-}
-
-fn tb_shutdown() -> i32 {
-    let g = gbl();
-    guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
-
-    // Restore terminal modes before restoring termios and closing fds
-    if (g.input_mode & TB_INPUT_MOUSE) != 0 {
-        let _ = outbuf_puts(TB_HARDCAP_EXIT_MOUSE);
-    }
-    if g.caps[TB_CAP_SHOW_CURSOR].len > 0 { let _ = outbuf_puts(g.caps[TB_CAP_SHOW_CURSOR]); }
-    if g.caps[TB_CAP_SGR0].len > 0 { let _ = outbuf_puts(g.caps[TB_CAP_SGR0]); }
-    if g.caps[TB_CAP_EXIT_KEYPAD].len > 0 { let _ = outbuf_puts(g.caps[TB_CAP_EXIT_KEYPAD]); }
-    if g.caps[TB_CAP_EXIT_CA].len > 0 { let _ = outbuf_puts(g.caps[TB_CAP_EXIT_CA]); }
-    let _ = outbuf_flush(g.wfd);
-
-    // Clear SIGWINCH handler before closing pipe fds
-    let _ = tb_adapter_clear_signwinch();
-
-    if g.has_orig_tios != 0 {
-        let _ = tb_adapter_restore_termios(g.rfd);
-        g.has_orig_tios = 0;
-    }
-
-    if g.ttyfd_open != 0 && g.fd_owned != 0 {
-        let _ = tb_adapter_close(g.ttyfd);
-    }
-    if g.has_resize_pipe != 0 {
-        let _ = tb_adapter_close(g.resize_pipefd[0]);
-        let _ = tb_adapter_close(g.resize_pipefd[1]);
-        g.resize_pipefd[0] = -1;
-        g.resize_pipefd[1] = -1;
-        g.has_resize_pipe = 0;
-    }
-
-    g.initialized = 0;
-    g.ttyfd_open = 0;
-    g.fd_owned = 0;
-    return TB_OK;
 }
 
 // ===========================================================================
-// TERMINFO & CAPABILITY TABLE
+// TERMINFO LOADER & BUILT-IN CAPABILITY TABLES
 // ===========================================================================
 
 const xterm_caps: const u8[:][TB_CAP__COUNT] = [
@@ -928,18 +913,100 @@ const xterm_caps: const u8[:][TB_CAP__COUNT] = [
     "\x1b[?1049h\x1b[22;0;0t",  // smcup
     "\x1b[?1049l\x1b[23;0;0t",  // rmcup
     "\x1b[?12l\x1b[?25h",       // cnorm
-    "\x1b[?25l",               // civis
+    "\x1b[?25l",                // civis
     "\x1b[H\x1b[2J",            // clear
     "\x1b(B\x1b[m",             // sgr0
-    "\x1b[4m",                   // smul
-    "\x1b[1m",                   // bold
-    "\x1b[5m",                   // blink
-    "\x1b[3m",                   // sitm
-    "\x1b[7m",                   // rev
+    "\x1b[4m",                  // smul
+    "\x1b[1m",                  // bold
+    "\x1b[5m",                  // blink
+    "\x1b[3m",                  // sitm
+    "\x1b[7m",                  // rev
     "\x1b[?1h\x1b=",            // smkx
     "\x1b[?1l\x1b>",            // rmkx
-    "\x1b[2m",                   // dim
-    "\x1b[8m",                   // invis
+    "\x1b[2m",                  // dim
+    "\x1b[8m",                  // invis
+];
+
+const screen_caps: const u8[:][TB_CAP__COUNT] = [
+    "\x1bOP",      // kf1
+    "\x1bOQ",      // kf2
+    "\x1bOR",      // kf3
+    "\x1bOS",      // kf4
+    "\x1b[15~",    // kf5
+    "\x1b[17~",    // kf6
+    "\x1b[18~",    // kf7
+    "\x1b[19~",    // kf8
+    "\x1b[20~",    // kf9
+    "\x1b[21~",    // kf10
+    "\x1b[23~",    // kf11
+    "\x1b[24~",    // kf12
+    "\x1b[2~",     // kich1
+    "\x1b[3~",     // kdch1
+    "\x1b[1~",     // khome
+    "\x1b[4~",     // kend
+    "\x1b[5~",     // kpp
+    "\x1b[6~",     // knp
+    "\x1bOA",      // kcuu1
+    "\x1bOB",      // kcud1
+    "\x1bOD",      // kcub1
+    "\x1bOC",      // kcuf1
+    "\x1b[Z",      // kcbt
+    "\x1b[?1049h", // smcup
+    "\x1b[?1049l", // rmcup
+    "\x1b[34h\x1b[?25h", // cnorm
+    "\x1b[?25l",         // civis
+    "\x1b[H\x1b[J",      // clear
+    "\x1b[m\x0f",        // sgr0
+    "\x1b[4m",           // smul
+    "\x1b[1m",           // bold
+    "\x1b[5m",           // blink
+    "\x1b[3m",           // sitm
+    "\x1b[7m",           // rev
+    "\x1b[?1h\x1b=",     // smkx
+    "\x1b[?1l\x1b>",     // rmkx
+    "\x1b[2m",           // dim
+    "\x1b[8m",           // invis
+];
+
+const rxvt_caps: const u8[:][TB_CAP__COUNT] = [
+    "\x1b[11~",    // kf1
+    "\x1b[12~",    // kf2
+    "\x1b[13~",    // kf3
+    "\x1b[14~",    // kf4
+    "\x1b[15~",    // kf5
+    "\x1b[17~",    // kf6
+    "\x1b[18~",    // kf7
+    "\x1b[19~",    // kf8
+    "\x1b[20~",    // kf9
+    "\x1b[21~",    // kf10
+    "\x1b[23~",    // kf11
+    "\x1b[24~",    // kf12
+    "\x1b[2~",     // kich1
+    "\x1b[3~",     // kdch1
+    "\x1b[7~",     // khome
+    "\x1b[8~",     // kend
+    "\x1b[5~",     // kpp
+    "\x1b[6~",     // knp
+    "\x1b[A",      // kcuu1
+    "\x1b[B",      // kcud1
+    "\x1b[D",      // kcub1
+    "\x1b[C",      // kcuf1
+    "\x1b[Z",      // kcbt
+    "\x1b7\x1b[?47h",       // smcup
+    "\x1b[2J\x1b[?47l\x1b8",// rmcup
+    "\x1b[?25h",            // cnorm
+    "\x1b[?25l",            // civis
+    "\x1b[H\x1b[2J",        // clear
+    "\x1b[m\x0f",           // sgr0
+    "\x1b[4m",              // smul
+    "\x1b[1m",              // bold
+    "\x1b[5m",              // blink
+    "\x1b[3m",              // sitm
+    "\x1b[7m",              // rev
+    "\x1b=",                // smkx
+    "\x1b>",                // rmkx
+    "\x1b[2m",              // dim
+    "\x1b[8m",              // invis
 ];
 
 const linux_caps: const u8[:][TB_CAP__COUNT] = [
@@ -983,20 +1050,84 @@ const linux_caps: const u8[:][TB_CAP__COUNT] = [
     "",                   // invis
 ];
 
+// SVr4 / ncurses binary terminfo string capability table indices for TB_CAP_* 0..37
+const ti_str_indices: i32[TB_CAP__COUNT] = [
+    66,  // TB_CAP_F1 (kf1)
+    68,  // TB_CAP_F2 (kf2)
+    69,  // TB_CAP_F3 (kf3)
+    70,  // TB_CAP_F4 (kf4)
+    71,  // TB_CAP_F5 (kf5)
+    72,  // TB_CAP_F6 (kf6)
+    73,  // TB_CAP_F7 (kf7)
+    74,  // TB_CAP_F8 (kf8)
+    75,  // TB_CAP_F9 (kf9)
+    67,  // TB_CAP_F10 (kf10)
+    216, // TB_CAP_F11 (kf11)
+    217, // TB_CAP_F12 (kf12)
+    77,  // TB_CAP_INSERT (kich1)
+    59,  // TB_CAP_DELETE (kdch1)
+    76,  // TB_CAP_HOME (khome)
+    164, // TB_CAP_END (kend)
+    82,  // TB_CAP_PGUP (kpp)
+    81,  // TB_CAP_PGDN (knp)
+    87,  // TB_CAP_ARROW_UP (kcuu1)
+    61,  // TB_CAP_ARROW_DOWN (kcud1)
+    79,  // TB_CAP_ARROW_LEFT (kcub1)
+    83,  // TB_CAP_ARROW_RIGHT (kcuf1)
+    148, // TB_CAP_BACK_TAB (kcbt)
+    28,  // TB_CAP_ENTER_CA (smcup)
+    40,  // TB_CAP_EXIT_CA (rmcup)
+    16,  // TB_CAP_SHOW_CURSOR (cnorm)
+    13,  // TB_CAP_HIDE_CURSOR (civis)
+    5,   // TB_CAP_CLEAR_SCREEN (clear)
+    39,  // TB_CAP_SGR0 (sgr0)
+    36,  // TB_CAP_UNDERLINE (smul)
+    27,  // TB_CAP_BOLD (bold)
+    26,  // TB_CAP_BLINK (blink)
+    311, // TB_CAP_ITALIC (sitm)
+    34,  // TB_CAP_REVERSE (rev)
+    89,  // TB_CAP_ENTER_KEYPAD (smkx)
+    88,  // TB_CAP_EXIT_KEYPAD (rmkx)
+    30,  // TB_CAP_DIM (dim)
+    32,  // TB_CAP_INVISIBLE (invis)
+];
+
 struct term_entry {
     name: const u8[:],
     caps: const u8[:][TB_CAP__COUNT],
     alias: const u8[:],
 }
 
-const builtin_terms: term_entry[6] = [
-    term_entry { name: "xterm", caps: xterm_caps, alias: "" },
-    term_entry { name: "linux", caps: linux_caps, alias: "" },
-    term_entry { name: "screen", caps: linux_caps, alias: "tmux" },
-    term_entry { name: "rxvt-256color", caps: linux_caps, alias: "" },
-    term_entry { name: "rxvt-unicode", caps: linux_caps, alias: "rxvt" },
-    term_entry { name: "Eterm", caps: linux_caps, alias: "" },
+const builtin_terms: term_entry[10] = [
+    term_entry { name: "xterm",         caps: xterm_caps,  alias: "alacritty" },
+    term_entry { name: "foot",          caps: xterm_caps,  alias: "kitty" },
+    term_entry { name: "wezterm",       caps: xterm_caps,  alias: "ghostty" },
+    term_entry { name: "gnome",         caps: xterm_caps,  alias: "vte" },
+    term_entry { name: "screen",        caps: screen_caps, alias: "tmux" },
+    term_entry { name: "rxvt-256color", caps: rxvt_caps,   alias: "rxvt-unicode" },
+    term_entry { name: "rxvt",          caps: rxvt_caps,   alias: "" },
+    term_entry { name: "Eterm",         caps: rxvt_caps,   alias: "" },
+    term_entry { name: "eterm",         caps: rxvt_caps,   alias: "" },
+    term_entry { name: "linux",         caps: linux_caps,  alias: "" },
 ];
+
+fn str_starts_with(haystack: const u8[:], prefix: const u8[:]) -> i32 {
+    if prefix.len == 0 || haystack.len < prefix.len { return 0; }
+    var i = 0;
+    for i in prefix.len {
+        if haystack[i] != prefix[i] { return 0; }
+    }
+    return 1;
+}
+
+fn str_equals(a: const u8[:], b: const u8[:]) -> i32 {
+    if a.len != b.len { return 0; }
+    var i = 0;
+    for i in a.len {
+        if a[i] != b[i] { return 0; }
+    }
+    return 1;
+}
 
 fn find_builtin_term(name: const u8[:]) -> i32 {
     var i = 0;
@@ -1011,27 +1142,509 @@ fn find_builtin_term(name: const u8[:]) -> i32 {
     return -1;
 }
 
-fn tb_has_truecolor() -> i32 {
-    return if gbl().output_mode == TB_OUTPUT_TRUECOLOR { 1 } else { 0 };
+fn read_le_i16(buf: const u8[:], off: i64) -> i32 {
+    let lo = buf[off] as i32;
+    let hi = (buf[off + 1] as i8) as i32;
+    return (hi << 8) | lo;
 }
 
+fn read_le_u16(buf: const u8[:], off: i64) -> i32 {
+    let lo = buf[off] as i32;
+    let hi = buf[off + 1] as i32;
+    return (hi << 8) | lo;
+}
+
+fn hex_nibble(v: u8) -> u8 {
+    if v < 10 { return 0x30 + v; }
+    return 0x61 + (v - 10);
+}
+
+fn try_read_terminfo_path(dir: const u8[:], suffix: const u8[:], term: const u8[:], use_hex: i32) -> i64 {
+    if dir.len == 0 || term.len == 0 { return -1; }
+    var pathbuf: u8[TB_PATH_MAX] = [0; TB_PATH_MAX];
+    var pos: i32 = 0;
+    var i: i64 = 0;
+    while i < dir.len && pos < TB_PATH_MAX - 16 {
+        pathbuf[pos] = dir[i];
+        pos = pos + 1;
+        i = i + 1;
+    }
+    i = 0;
+    while i < suffix.len && pos < TB_PATH_MAX - 16 {
+        pathbuf[pos] = suffix[i];
+        pos = pos + 1;
+        i = i + 1;
+    }
+    if pos >= TB_PATH_MAX - 8 { return -1; }
+    pathbuf[pos] = '/';
+    pos = pos + 1;
+    if use_hex != 0 {
+        let ch = term[0];
+        pathbuf[pos] = hex_nibble((ch >> 4) & 0x0f);
+        pathbuf[pos + 1] = hex_nibble(ch & 0x0f);
+        pos = pos + 2;
+    } else {
+        pathbuf[pos] = term[0];
+        pos = pos + 1;
+    }
+    pathbuf[pos] = '/';
+    pos = pos + 1;
+    i = 0;
+    while i < term.len && pos < TB_PATH_MAX - 1 {
+        pathbuf[pos] = term[i];
+        pos = pos + 1;
+        i = i + 1;
+    }
+    pathbuf[pos] = 0;
+
+    var fbuf: u8[32768] = [0; 32768];
+    let n = tb_adapter_read_file(pathbuf[0], fbuf[0], 32768);
+    if n < 12 { return -1; }
+
+    let g = gbl();
+    var j: i64 = 0;
+    while j < n {
+        if j < g.terminfo.len {
+            g.terminfo[j as i32] = fbuf[j];
+        } else {
+            g.terminfo.push(fbuf[j]);
+        }
+        j = j + 1;
+    }
+    g.nterminfo = n;
+    return n;
+}
+
+fn get_env_var(name: const u8[:], envbuf: u8[1024]&) -> i32 {
+    var nbuf: u8[64] = [0; 64];
+    var i: i64 = 0;
+    while i < name.len && i < 63 {
+        nbuf[i] = name[i];
+        i = i + 1;
+    }
+    nbuf[i] = 0;
+    return tb_adapter_getenv(nbuf[0], envbuf[0], 1024);
+}
+
+fn load_terminfo_file(term: const u8[:]) -> i64 {
+    var envbuf: u8[1024] = [0; 1024];
+
+    // 1) $TERMINFO
+    let ti_len = get_env_var("TERMINFO", envbuf);
+    if ti_len > 0 {
+        let n = try_read_terminfo_path(envbuf[0..ti_len], "", term, 0);
+        if n >= 12 { return n; }
+        let n2 = try_read_terminfo_path(envbuf[0..ti_len], "", term, 1);
+        if n2 >= 12 { return n2; }
+    }
+
+    // 2) $HOME/.terminfo
+    let home_len = get_env_var("HOME", envbuf);
+    if home_len > 0 {
+        let n = try_read_terminfo_path(envbuf[0..home_len], "/.terminfo", term, 0);
+        if n >= 12 { return n; }
+        let n2 = try_read_terminfo_path(envbuf[0..home_len], "/.terminfo", term, 1);
+        if n2 >= 12 { return n2; }
+    }
+
+    // 3) $PREFIX/share/terminfo (Termux)
+    let pfx_len = get_env_var("PREFIX", envbuf);
+    if pfx_len > 0 {
+        let n = try_read_terminfo_path(envbuf[0..pfx_len], "/share/terminfo", term, 0);
+        if n >= 12 { return n; }
+    }
+
+    // 4) Standard system terminfo directories
+    let dirs: const u8[:][3] = ["/etc/terminfo", "/lib/terminfo", "/usr/share/terminfo"];
+    var di = 0;
+    for di in 3 {
+        let n = try_read_terminfo_path(dirs[di], "", term, 0);
+        if n >= 12 { return n; }
+        let n2 = try_read_terminfo_path(dirs[di], "", term, 1);
+        if n2 >= 12 { return n2; }
+    }
+
+    return -1;
+}
+
+fn parse_terminfo_caps() -> i32 {
+    let g = gbl();
+    if g.nterminfo < 12 { return TB_ERR; }
+    let ti = g.terminfo[0..g.nterminfo];
+    let magic = read_le_u16(ti, 0);
+    if magic != 0x011a && magic != 0x021e {
+        return TB_ERR;
+    }
+    let num_size: i64 = if magic == 0x021e { 4 } else { 2 };
+    let sz_names = read_le_i16(ti, 2) as i64;
+    let n_bools  = read_le_i16(ti, 4) as i64;
+    let n_nums   = read_le_i16(ti, 6) as i64;
+    let n_strs   = read_le_i16(ti, 8) as i64;
+    let sz_str   = read_le_i16(ti, 10) as i64;
+
+    if sz_names < 0 || n_bools < 0 || n_nums < 0 || n_strs < 0 || sz_str < 0 {
+        return TB_ERR;
+    }
+
+    var str_off_pos: i64 = 12 + sz_names + n_bools;
+    if (str_off_pos % 2) != 0 {
+        str_off_pos = str_off_pos + 1;
+    }
+    str_off_pos = str_off_pos + n_nums * num_size;
+    let strtab_pos = str_off_pos + n_strs * 2;
+    if strtab_pos + sz_str > g.nterminfo {
+        return TB_ERR;
+    }
+
+    var ci = 0;
+    for ci in TB_CAP__COUNT {
+        let ti_idx = ti_str_indices[ci] as i64;
+        if ti_idx >= n_strs {
+            g.caps[ci] = "";
+            continue;
+        }
+        let str_off = read_le_i16(ti, str_off_pos + ti_idx * 2) as i64;
+        if str_off < 0 || str_off >= sz_str {
+            g.caps[ci] = "";
+            continue;
+        }
+        let start = strtab_pos + str_off;
+        var end = start;
+        let max_end = strtab_pos + sz_str;
+        while end < max_end && g.terminfo[end] != 0 {
+            end = end + 1;
+        }
+        if end > start {
+            // Do not mutate g.terminfo after taking slices into it.
+            g.caps[ci] = g.terminfo[start..end];
+        } else {
+            g.caps[ci] = "";
+        }
+    }
+    return TB_OK;
+}
+
+// ===========================================================================
+// TTY INITIALIZATION & SHUTDOWN
+// ===========================================================================
+
+fn cleanup_partial_init() {
+    let g = gbl();
+    let _ = tb_adapter_clear_signwinch();
+    if g.has_orig_tios != 0 {
+        let _ = tb_adapter_restore_termios(g.rfd);
+        g.has_orig_tios = 0;
+    }
+    if g.has_orig_rfd_flags != 0 {
+        let _ = tb_adapter_fcntl_setfl(g.rfd, g.orig_rfd_flags);
+        g.has_orig_rfd_flags = 0;
+    }
+    if g.has_resize_pipe != 0 {
+        let _ = tb_adapter_close(g.resize_pipefd[0]);
+        let _ = tb_adapter_close(g.resize_pipefd[1]);
+        g.resize_pipefd[0] = -1;
+        g.resize_pipefd[1] = -1;
+        g.has_resize_pipe = 0;
+    }
+    if g.ttyfd_open != 0 && g.fd_owned != 0 {
+        let _ = tb_adapter_close(g.ttyfd);
+    }
+    g.ttyfd_open = 0;
+    g.fd_owned = 0;
+    g.rfd_is_tty = 0;
+    g.initialized = 0;
+}
+
+// Open `/dev/tty`, enter raw mode, detect TERM capabilities, install SIGWINCH,
+// switch to alternate screen, enable keypad transmit mode, and hide cursor.
+fn tb_init() -> i32 {
+    return tb_init_file("/dev/tty");
+}
+
+// Initialize termbox2 on the given TTY device path (fails with TB_ERR_INIT_ALREADY if open).
+fn tb_init_file(path: const u8[:]) -> i32 {
+    let g = gbl();
+    guard g.initialized == 0 else { return TB_ERR_INIT_ALREADY; }
+
+    var pathbuf: u8[>..] = [];
+    var i = 0;
+    for i in path.len { pathbuf.push(path[i]); }
+    pathbuf.push(0);
+
+    let fd = tb_adapter_open_tty_rw(pathbuf[0]);
+    guard fd >= 0 else { return TB_ERR_INIT_OPEN; }
+
+    g.fd_owned = 1;
+    let rv = tb_init_fd(fd);
+    if rv != TB_OK {
+        g.fd_owned = 0;
+    }
+    return rv;
+}
+
+// Initialize termbox2 using an existing open TTY file descriptor (caller retains ownership).
+fn tb_init_fd(ttyfd: i32) -> i32 {
+    return tb_init_rwfd(ttyfd, ttyfd);
+}
+
+// Initialize termbox2 using separate read/write file descriptors.
+// Returns TB_ERR_INIT_ALREADY if already initialized. Supports both TTY and non-TTY pipe fds.
+fn tb_init_rwfd(rfd: i32, wfd: i32) -> i32 {
+    let g = gbl();
+    guard g.initialized == 0 else { return TB_ERR_INIT_ALREADY; }
+
+    if rfd < 0 || wfd < 0 {
+        return TB_ERR_INIT_OPEN;
+    }
+
+    g.ttyfd = rfd;
+    g.rfd = rfd;
+    g.wfd = wfd;
+    g.ttyfd_open = 1;
+    g.has_resize_pipe = 0;
+    g.resize_pipefd[0] = -1;
+    g.resize_pipefd[1] = -1;
+    g.has_orig_tios = 0;
+    g.has_orig_rfd_flags = 0;
+    g.last_errno = 0;
+    g.caps = xterm_caps;
+    g.nterminfo = 0;
+    g.rfd_is_tty = tb_adapter_isatty(rfd);
+
+    if g.rfd_is_tty != 0 {
+        if tb_adapter_save_termios(rfd) != 0 {
+            g.last_errno = tb_adapter_errno();
+            cleanup_partial_init();
+            return TB_ERR_TCGETATTR;
+        }
+        g.has_orig_tios = 1;
+    }
+
+    let orig_fl = tb_adapter_fcntl_getfl(rfd);
+    if orig_fl < 0 {
+        g.last_errno = tb_adapter_errno();
+        cleanup_partial_init();
+        return TB_ERR_READ;
+    }
+    g.orig_rfd_flags = orig_fl;
+    g.has_orig_rfd_flags = 1;
+
+    if (orig_fl & O_NONBLOCK_BIT) == 0 {
+        if tb_adapter_set_nonblock(rfd) != 0 {
+            g.last_errno = tb_adapter_errno();
+            cleanup_partial_init();
+            return TB_ERR_READ;
+        }
+    }
+
+    if g.rfd_is_tty != 0 {
+        if tb_adapter_set_raw_mode(rfd) != 0 {
+            g.last_errno = tb_adapter_errno();
+            cleanup_partial_init();
+            return TB_ERR_TCSETATTR;
+        }
+    }
+
+    var pipefd: i32[2] = [-1, -1];
+    if tb_adapter_pipe(pipefd) != 0 {
+        g.last_errno = tb_adapter_errno();
+        cleanup_partial_init();
+        return TB_ERR_RESIZE_PIPE;
+    }
+    g.resize_pipefd[0] = pipefd[0];
+    g.resize_pipefd[1] = pipefd[1];
+    g.has_resize_pipe = 1;
+
+    var w: i32 = 0;
+    var h: i32 = 0;
+    if tb_adapter_get_winsize(wfd, w, h) != 0 {
+        if tb_adapter_get_winsize(rfd, w, h) != 0 {
+            if g.rfd_is_tty != 0 {
+                g.last_errno = tb_adapter_errno();
+                cleanup_partial_init();
+                return TB_ERR_RESIZE_IOCTL;
+            }
+            // Non-TTY pipe fallback dimensions (matches upstream termbox2.h)
+            w = 80;
+            h = 24;
+        }
+    }
+    if !(w > 0 && h > 0) {
+        if g.rfd_is_tty == 0 {
+            w = 80;
+            h = 24;
+        } else {
+            cleanup_partial_init();
+            return TB_ERR_RESIZE_IOCTL;
+        }
+    }
+    g.width = w;
+    g.height = h;
+
+    // Terminal capability detection: require TERM, try binary terminfo first, then builtin_terms
+    var term_name: u8[64] = [0; 64];
+    let rv = tb_adapter_get_term(term_name[0], 64);
+    if rv <= 0 {
+        cleanup_partial_init();
+        return TB_ERR_NO_TERM;
+    }
+    let tslice = term_name[0..rv];
+
+    g.term_index = -1;
+    var loaded_ti: i32 = 0;
+    if load_terminfo_file(tslice) >= 12 {
+        if parse_terminfo_caps() == TB_OK {
+            loaded_ti = 1;
+        }
+    }
+
+    if loaded_ti == 0 {
+        let term_idx = find_builtin_term(tslice);
+        if term_idx >= 0 {
+            g.term_index = term_idx;
+        } else {
+            var i: i32 = 0;
+            for i in builtin_terms.len {
+                let entry = builtin_terms[i];
+                if str_starts_with(tslice, entry.name) != 0 ||
+                   str_starts_with(tslice, entry.alias) != 0 {
+                    g.term_index = i as i32;
+                    break;
+                }
+            }
+        }
+        if g.term_index < 0 {
+            cleanup_partial_init();
+            return TB_ERR_UNSUPPORTED_TERM;
+        }
+        g.caps = builtin_terms[g.term_index].caps;
+    }
+
+    let _ = cap_trie_build();
+
+    let _ = grow_cells(g.back, g.width, g.height, 1);
+    let _ = grow_cells(g.front, g.width, g.height, 0);
+    reset_cellbuf(g.back, 0x20, TB_DEFAULT, TB_DEFAULT, 1);
+    reset_cellbuf(g.front, 0xffffffff, 0xffffffffffffffff, 0xffffffffffffffff, 0);
+
+    if tb_adapter_setup_signwinch(g.resize_pipefd[1]) != 0 {
+        g.last_errno = tb_adapter_errno();
+        cleanup_partial_init();
+        return TB_ERR_RESIZE_SIGACTION;
+    }
+
+    g.input_mode = TB_INPUT_ESC;
+    g.output_mode = TB_OUTPUT_NORMAL;
+    g.fg = TB_DEFAULT;
+    g.bg = TB_DEFAULT;
+    g.last_fg = 0xffffffffffffffff;
+    g.last_bg = 0xffffffffffffffff;
+    g.inbuf_pos = 0;
+    g.inbuf_len = 0;
+    g.outbuf_len = 0;
+    g.cursor_x = -1;
+    g.cursor_y = -1;
+    g.cursor_hidden = 1;
+    g.last_x = -1;
+    g.last_y = -1;
+    g.initialized = 1;
+
+    if g.caps[TB_CAP_ENTER_CA].len > 0 { let _ = outbuf_puts(g.caps[TB_CAP_ENTER_CA]); }
+    if g.caps[TB_CAP_ENTER_KEYPAD].len > 0 { let _ = outbuf_puts(g.caps[TB_CAP_ENTER_KEYPAD]); }
+    if g.caps[TB_CAP_HIDE_CURSOR].len > 0 { let _ = outbuf_puts(g.caps[TB_CAP_HIDE_CURSOR]); }
+    if g.caps[TB_CAP_CLEAR_SCREEN].len > 0 { let _ = outbuf_puts(g.caps[TB_CAP_CLEAR_SCREEN]); }
+    let _ = outbuf_flush(g.wfd);
+
+    return TB_OK;
+}
+
+// Disable mouse tracking, show cursor, reset SGR/keypad/alt-screen, clear SIGWINCH,
+// restore saved termios & fd flags, release buffers, and close owned file descriptors.
+fn tb_shutdown() -> i32 {
+    let g = gbl();
+    guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
+
+    if (g.input_mode & TB_INPUT_MOUSE) != 0 {
+        let _ = outbuf_puts(TB_HARDCAP_EXIT_MOUSE);
+    }
+    if g.caps[TB_CAP_SHOW_CURSOR].len > 0 { let _ = outbuf_puts(g.caps[TB_CAP_SHOW_CURSOR]); }
+    if g.caps[TB_CAP_SGR0].len > 0 { let _ = outbuf_puts(g.caps[TB_CAP_SGR0]); }
+    if g.caps[TB_CAP_EXIT_KEYPAD].len > 0 { let _ = outbuf_puts(g.caps[TB_CAP_EXIT_KEYPAD]); }
+    if g.caps[TB_CAP_EXIT_CA].len > 0 { let _ = outbuf_puts(g.caps[TB_CAP_EXIT_CA]); }
+    let _ = outbuf_flush(g.wfd);
+
+    let _ = tb_adapter_clear_signwinch();
+
+    if g.has_orig_tios != 0 {
+        let _ = tb_adapter_restore_termios(g.rfd);
+        g.has_orig_tios = 0;
+    }
+
+    if g.has_orig_rfd_flags != 0 {
+        let _ = tb_adapter_fcntl_setfl(g.rfd, g.orig_rfd_flags);
+        g.has_orig_rfd_flags = 0;
+    }
+
+    if g.ttyfd_open != 0 && g.fd_owned != 0 {
+        let _ = tb_adapter_close(g.ttyfd);
+    }
+    if g.has_resize_pipe != 0 {
+        let _ = tb_adapter_close(g.resize_pipefd[0]);
+        let _ = tb_adapter_close(g.resize_pipefd[1]);
+        g.resize_pipefd[0] = -1;
+        g.resize_pipefd[1] = -1;
+        g.has_resize_pipe = 0;
+    }
+
+    reset_cellbuf(g.back, 0x20, TB_DEFAULT, TB_DEFAULT, 1);
+    reset_cellbuf(g.front, 0x20, TB_DEFAULT, TB_DEFAULT, 0);
+    g.caps = xterm_caps;
+    g.cap_trie_len = 0;
+    g.cap_trie_root = 0;
+    g.inbuf_pos = 0;
+    g.inbuf_len = 0;
+    g.outbuf_len = 0;
+    g.nterminfo = 0;
+
+    g.initialized = 0;
+    g.ttyfd_open = 0;
+    g.fd_owned = 0;
+    g.rfd_is_tty = 0;
+    return TB_OK;
+}
+
+// ===========================================================================
+// INFO & ERROR HELPERS
+// ===========================================================================
+
+// Return 1 if 24-bit truecolor output is supported by this build (always 1).
+fn tb_has_truecolor() -> i32 {
+    return 1;
+}
+
+// Return 1 if Extended Grapheme Cluster support is enabled (1 in this port).
 fn tb_has_egc() -> i32 {
     return TB_OPT_EGC;
 }
 
+// Return bit width of uintattr_t (64 in this port).
 fn tb_attr_width() -> i32 {
     return TB_OPT_ATTR_W;
 }
 
+// Return the library version string.
 fn tb_version() -> const u8[:] {
     return TB_VERSION_STR;
 }
 
+// Return the last POSIX errno recorded by adapter calls.
 fn tb_last_errno() -> i32 {
     return gbl().last_errno;
 }
 
+// Return a human-readable description for a TB_ERR_* return code.
 fn tb_strerror(err: i32) -> const u8[:] {
+    if err == TB_OK { return "termbox2 ok"; }
     if err == TB_ERR { return "termbox2 error"; }
     if err == TB_ERR_NEED_MORE { return "termbox2 needs more data"; }
     if err == TB_ERR_INIT_ALREADY { return "termbox2 already initialized"; }
@@ -1058,21 +1671,31 @@ fn tb_strerror(err: i32) -> const u8[:] {
 }
 
 // ===========================================================================
-// ESCAPE SEQUENCE PARSER (CAP TRIE + CSI + MOUSE) & EVENT POLLING
+// ESCAPE SEQUENCE PARSER (CAP TRIE + CSI + KITTY + OSC + MOUSE) & POLLING
 // ===========================================================================
 
 fn cap_trie_add_node(c: u8) -> i32 {
     let g = gbl();
-    let idx = g.cap_trie.len;
-    g.cap_trie.push(cap_trie_node {
-        c: c,
-        first_child: -1,
-        next_sibling: -1,
-        is_leaf: 0,
-        key: 0,
-        mod: 0,
-    });
-    return idx as i32;
+    let idx = g.cap_trie_len;
+    if idx < g.cap_trie.len {
+        g.cap_trie[idx].c = c;
+        g.cap_trie[idx].first_child = -1;
+        g.cap_trie[idx].next_sibling = -1;
+        g.cap_trie[idx].is_leaf = 0;
+        g.cap_trie[idx].key = 0;
+        g.cap_trie[idx].mod = 0;
+    } else {
+        g.cap_trie.push(cap_trie_node {
+            c: c,
+            first_child: -1,
+            next_sibling: -1,
+            is_leaf: 0,
+            key: 0,
+            mod: 0,
+        });
+    }
+    g.cap_trie_len = idx + 1;
+    return idx;
 }
 
 fn cap_trie_find_child(node: i32, c: u8) -> i32 {
@@ -1115,15 +1738,16 @@ fn cap_trie_insert_seq(seq: const u8[:], key_code: u16, mod_val: u8) {
 
 fn cap_trie_build() -> i32 {
     let g = gbl();
+    g.cap_trie_len = 0;
     g.cap_trie_root = cap_trie_add_node(0);
 
-    // 1) Insert active terminal's key capabilities first so they take priority
+    // 1) Active terminal's key capabilities take priority
     var ci = 0;
     for ci in TB_CAP__COUNT_KEYS {
         cap_trie_insert_seq(g.caps[ci], (0xffff - ci) as u16, 0);
     }
 
-    // 2) Insert standard CSI/SS3 fallbacks common across modern terminals
+    // 2) Standard CSI/SS3/rxvt sequences
     cap_trie_insert_seq("\x1b[A", TB_KEY_ARROW_UP, 0);
     cap_trie_insert_seq("\x1b[B", TB_KEY_ARROW_DOWN, 0);
     cap_trie_insert_seq("\x1b[C", TB_KEY_ARROW_RIGHT, 0);
@@ -1131,8 +1755,16 @@ fn cap_trie_build() -> i32 {
     cap_trie_insert_seq("\x1b[H", TB_KEY_HOME, 0);
     cap_trie_insert_seq("\x1b[F", TB_KEY_END, 0);
     cap_trie_insert_seq("\x1b[Z", TB_KEY_BACK_TAB, 0);
+    cap_trie_insert_seq("\x1b[a", TB_KEY_ARROW_UP, TB_MOD_SHIFT);
+    cap_trie_insert_seq("\x1b[b", TB_KEY_ARROW_DOWN, TB_MOD_SHIFT);
+    cap_trie_insert_seq("\x1b[c", TB_KEY_ARROW_RIGHT, TB_MOD_SHIFT);
+    cap_trie_insert_seq("\x1b[d", TB_KEY_ARROW_LEFT, TB_MOD_SHIFT);
+    cap_trie_insert_seq("\x1bOa", TB_KEY_ARROW_UP, TB_MOD_CTRL);
+    cap_trie_insert_seq("\x1bOb", TB_KEY_ARROW_DOWN, TB_MOD_CTRL);
+    cap_trie_insert_seq("\x1bOc", TB_KEY_ARROW_RIGHT, TB_MOD_CTRL);
+    cap_trie_insert_seq("\x1bOd", TB_KEY_ARROW_LEFT, TB_MOD_CTRL);
 
-    // 3) Insert remaining built-in terminal key capabilities without overriding
+    // 3) Fallback built-in terminal caps
     var ti = 0;
     for ti in builtin_terms.len {
         let entry = builtin_terms[ti];
@@ -1217,27 +1849,52 @@ fn parse_sgr_mouse(buf: const u8[:], event: tb_event&) -> i32 {
     return 0;
 }
 
+fn apply_kitty_or_other_code(code: i32, mod_val: u8, event: tb_event&) -> i32 {
+    if code <= 0 || code > 0x10ffff { return 0; }
+    event.kind = TB_EVENT_KEY;
+    event.mod = mod_val;
+    if code < 0x20 || code == 0x7f {
+        event.key = code as u16;
+        event.ch = 0;
+    } else {
+        event.key = 0;
+        event.ch = code as u32;
+    }
+    return 1;
+}
+
 fn parse_csi_modified(buf: const u8[:], end: i64, event: tb_event&) -> i32 {
-    // Parse \x1b[p1;p2<final> or \x1b[p1<final>
+    // Parse \x1b[p1<fin>, \x1b[p1;p2<fin>, or \x1b[p1;p2;p3<fin> (also subparams ':' ignored)
     var p1: i32 = 0;
     var p2: i32 = 0;
+    var p3: i32 = 0;
     var has_p1: i32 = 0;
     var has_p2: i32 = 0;
-    var in_p2: i32 = 0;
+    var has_p3: i32 = 0;
+    var p_idx: i32 = 0;
+    var in_subparam: i32 = 0;
     var i: i64 = 2;
     while i < end {
         let ch = buf[i];
         if ch >= '0' && ch <= '9' {
-            if in_p2 == 0 {
-                p1 = p1 * 10 + (ch - '0');
-                has_p1 = 1;
-            } else {
-                p2 = p2 * 10 + (ch - '0');
-                has_p2 = 1;
+            if in_subparam == 0 {
+                if p_idx == 0 {
+                    p1 = p1 * 10 + (ch - '0');
+                    has_p1 = 1;
+                } else if p_idx == 1 {
+                    p2 = p2 * 10 + (ch - '0');
+                    has_p2 = 1;
+                } else {
+                    p3 = p3 * 10 + (ch - '0');
+                    has_p3 = 1;
+                }
             }
+        } else if ch == ':' {
+            in_subparam = 1;
         } else if ch == ';' {
-            if in_p2 != 0 { return 0; }
-            in_p2 = 1;
+            if p_idx >= 2 { return 0; }
+            p_idx = p_idx + 1;
+            in_subparam = 0;
         } else {
             return 0;
         }
@@ -1250,6 +1907,10 @@ fn parse_csi_modified(buf: const u8[:], end: i64, event: tb_event&) -> i32 {
 
     if fin == '~' {
         if has_p1 == 0 { return 0; }
+        // xterm modifyOtherKeys: \x1b[27;mod;code~
+        if p1 == 27 && has_p2 != 0 && has_p3 != 0 {
+            return apply_kitty_or_other_code(p3, xterm_mod_to_tb(p2), event);
+        }
         if p1 == 2 { key = TB_KEY_INSERT; }
         else if p1 == 3 { key = TB_KEY_DELETE; }
         else if p1 == 1 || p1 == 7 { key = TB_KEY_HOME; }
@@ -1266,6 +1927,11 @@ fn parse_csi_modified(buf: const u8[:], end: i64, event: tb_event&) -> i32 {
         else if p1 == 24 { key = TB_KEY_F12; }
         else { return 0; }
         if has_p2 != 0 { mod_val = xterm_mod_to_tb(p2); }
+    } else if fin == 'u' {
+        // Kitty keyboard protocol: \x1b[codepoint;modu or \x1b[codepointu
+        if has_p1 == 0 { return 0; }
+        if has_p2 != 0 { mod_val = xterm_mod_to_tb(p2); }
+        return apply_kitty_or_other_code(p1, mod_val, event);
     } else if has_p1 != 0 && p1 == 1 && has_p2 != 0 {
         mod_val = xterm_mod_to_tb(p2);
         if fin == 'A' { key = TB_KEY_ARROW_UP; }
@@ -1290,7 +1956,27 @@ fn parse_csi_modified(buf: const u8[:], end: i64, event: tb_event&) -> i32 {
     return 1;
 }
 
-fn try_match_escape_buf(buf: const u8[:], event: tb_event&) -> i32 {
+// Consume string-terminated escape sequences (OSC \x1b], DCS \x1bP, APC \x1b_, PM \x1b^, SOS \x1bX)
+fn try_consume_string_esc(buf: const u8[:], event: tb_event&) -> i32 {
+    var i: i64 = 2;
+    while i < buf.len {
+        let b = buf[i];
+        if b == 0x07 {
+            event.kind = 0;
+            return (i + 1) as i32;
+        }
+        if b == 0x1b && (i + 1) < buf.len && buf[i + 1] == '\\' {
+            event.kind = 0;
+            return (i + 2) as i32;
+        }
+        i = i + 1;
+    }
+    if buf.len < TB_OPT_READ_BUF { return TB_ERR_NEED_MORE; }
+    event.kind = 0;
+    return buf.len as i32;
+}
+
+fn try_match_escape_buf(buf: const u8[:], event: tb_event&, alt_bracket_final: i32) -> i32 {
     let g = gbl();
     guard buf.len > 0 else { return 0; }
     guard buf[0] == 0x1b else { return 0; }
@@ -1342,11 +2028,25 @@ fn try_match_escape_buf(buf: const u8[:], event: tb_event&) -> i32 {
         i = i + 1;
     }
     if i == buf.len && g.cap_trie[node].first_child >= 0 {
-        return TB_ERR_NEED_MORE;
+        if !(alt_bracket_final != 0 && buf.len == 2 && buf[1] == '[') {
+            return TB_ERR_NEED_MORE;
+        }
     }
 
-    // 3) CSI sequence (\x1b[ ... final)
+    // 3) OSC / DCS / APC / PM / SOS string-terminated sequences
+    if buf[1] == ']' || buf[1] == 'P' || buf[1] == '_' || buf[1] == '^' || buf[1] == 'X' {
+        return try_consume_string_esc(buf, event);
+    }
+
+    // 4) CSI sequence (\x1b[ ... final)
     if buf[1] == '[' {
+        if buf.len == 2 && (g.input_mode & TB_INPUT_ALT) != 0 && alt_bracket_final != 0 {
+            event.kind = TB_EVENT_KEY;
+            event.mod = TB_MOD_ALT;
+            event.key = 0;
+            event.ch = '[';
+            return 2;
+        }
         var end: i64 = 2;
         while end < buf.len {
             let b = buf[end];
@@ -1355,7 +2055,6 @@ fn try_match_escape_buf(buf: const u8[:], event: tb_event&) -> i32 {
         }
         if end >= buf.len {
             if buf.len < 32 { return TB_ERR_NEED_MORE; }
-            // Overlong malformed CSI: discard ESC
             event.kind = TB_EVENT_KEY;
             event.key = TB_KEY_ESC;
             return 1;
@@ -1369,14 +2068,14 @@ fn try_match_escape_buf(buf: const u8[:], event: tb_event&) -> i32 {
         return seq_len;
     }
 
-    // 4) SS3 sequence (\x1bO<ch>) not in trie
+    // 5) SS3 sequence (\x1bO<ch>) not in trie
     if buf[1] == 'O' {
         if buf.len < 3 { return TB_ERR_NEED_MORE; }
         event.kind = 0;
         return 3;
     }
 
-    // 5) TB_INPUT_ALT: ESC + char/control
+    // 6) TB_INPUT_ALT: ESC + char/control
     if (g.input_mode & TB_INPUT_ALT) != 0 {
         let b1 = buf[1];
         if b1 < 0x20 || b1 == 0x7f {
@@ -1398,7 +2097,7 @@ fn try_match_escape_buf(buf: const u8[:], event: tb_event&) -> i32 {
         }
     }
 
-    // 6) Fallback: bare ESC
+    // 7) Fallback: bare ESC
     event.kind = TB_EVENT_KEY;
     event.mod = 0;
     event.key = TB_KEY_ESC;
@@ -1415,7 +2114,6 @@ fn inbuf_consume(n: i64) {
         g.inbuf_pos = 0;
         return;
     }
-    // Compact when position gets too large or logical end exceeds physical array
     if g.inbuf_pos > 32 || (g.inbuf_pos + g.inbuf_len) > g.inbuf.len {
         var i: i64 = 0;
         while i < g.inbuf_len {
@@ -1429,10 +2127,10 @@ fn inbuf_consume(n: i64) {
     }
 }
 
-fn inbuf_copy_to(mbuf: u8[64]&) -> i64 {
+fn inbuf_copy_to(mbuf: u8[TB_OPT_READ_BUF]&) -> i64 {
     let g = gbl();
     var i: i64 = 0;
-    while i < g.inbuf_len && i < 64 {
+    while i < g.inbuf_len && i < TB_OPT_READ_BUF {
         let src = (g.inbuf_pos + i) as i32;
         guard src < g.inbuf.len else { break; }
         let idx = i as i32;
@@ -1442,7 +2140,7 @@ fn inbuf_copy_to(mbuf: u8[64]&) -> i64 {
     return i;
 }
 
-fn inbuf_append(readbuf: const u8[64]&, nread: i64) {
+fn inbuf_append(readbuf: const u8[TB_OPT_READ_BUF]&, nread: i64) {
     let g = gbl();
     var j: i64 = 0;
     while j < nread {
@@ -1475,13 +2173,11 @@ fn drain_resize_and_fill(event: tb_event&) -> i32 {
         if new_w > 0 && new_h > 0 && (new_w != g.width || new_h != g.height) {
             g.width = new_w;
             g.height = new_h;
-            resize_back_cellbuf(g.back, g.width, g.height, g.fg, g.bg);
-            let _ = grow_cells(g.front, g.width, g.height);
+            resize_back_cellbuf(g.width, g.height, g.fg, g.bg);
+            let _ = grow_cells(g.front, g.width, g.height, 0);
         }
     }
-    // Invalidate front buffer and cached output state so next tb_present()
-    // repaints every visible cell cleanly after terminal reflow/zoom.
-    reset_cellbuf(g.front, 0xffffffff, 0xffffffffffffffff, 0xffffffffffffffff);
+    reset_cellbuf(g.front, 0xffffffff, 0xffffffffffffffff, 0xffffffffffffffff, 0);
     g.last_fg = 0xffffffffffffffff;
     g.last_bg = 0xffffffffffffffff;
     g.last_x = -1;
@@ -1499,24 +2195,33 @@ fn decode_inbuf_event(event: tb_event&, allow_esc_coalesce: i32) -> i32 {
     let g = gbl();
     if g.inbuf_len <= 0 { return TB_ERR_NEED_MORE; }
 
-    // If a lone ESC arrived, briefly wait (10ms) to coalesce split escape sequences
-    if allow_esc_coalesce != 0 && g.inbuf_len == 1 && g.inbuf[g.inbuf_pos as i32] == 0x1b {
+    var alt_bracket_final: i32 = 0;
+
+    // Briefly coalesce lone ESC or ESC+[ (in TB_INPUT_ALT mode) so split sequences don't stall
+    if allow_esc_coalesce != 0 && g.inbuf[g.inbuf_pos as i32] == 0x1b &&
+       (g.inbuf_len == 1 ||
+        (g.inbuf_len == 2 && (g.input_mode & TB_INPUT_ALT) != 0 &&
+         g.inbuf[(g.inbuf_pos + 1) as i32] == '[')) {
+        let prev_len = g.inbuf_len;
         let prv = tb_adapter_poll(g.rfd, 10);
         if prv > 0 {
-            var more: u8[64] = [0; 64];
-            let nr = tb_adapter_read(g.rfd, more[0], 64);
+            var more: u8[TB_OPT_READ_BUF] = [0; TB_OPT_READ_BUF];
+            let nr = tb_adapter_read(g.rfd, more[0], TB_OPT_READ_BUF);
             if nr > 0 {
                 inbuf_append(more, nr);
             }
         }
+        if prev_len == 2 && g.inbuf_len == 2 && (g.input_mode & TB_INPUT_ALT) != 0 {
+            alt_bracket_final = 1;
+        }
     }
 
-    var mbuf: u8[64] = [0; 64];
+    var mbuf: u8[TB_OPT_READ_BUF] = [0; TB_OPT_READ_BUF];
     let mlen = inbuf_copy_to(mbuf);
     let first = mbuf[0];
 
     if first == 0x1b {
-        let consumed = try_match_escape_buf(mbuf[0..mlen], event);
+        let consumed = try_match_escape_buf(mbuf[0..mlen], event, alt_bracket_final);
         if consumed == TB_ERR_NEED_MORE {
             return TB_ERR_NEED_MORE;
         }
@@ -1563,24 +2268,26 @@ fn decode_inbuf_event(event: tb_event&, allow_esc_coalesce: i32) -> i32 {
     return TB_OK;
 }
 
+// Wait up to `timeout_ms` milliseconds (-1 = block until ready, 0 = non-blocking)
+// for a key, mouse, or resize event. Returns TB_OK, TB_ERR_NO_EVENT, or TB_ERR_*.
 fn tb_peek_event(event: tb_event&, timeout_ms: i32) -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
 
     // Phase 1: Try to parse bytes already in inbuf
+    let coalesce_phase1: i32 = if timeout_ms != 0 { 1 } else { 0 };
     while g.inbuf_len > 0 {
-        let drv = decode_inbuf_event(event, 0);
+        let drv = decode_inbuf_event(event, coalesce_phase1);
         if drv == TB_OK { return TB_OK; }
         if drv == TB_ERR_NEED_MORE { break; }
-        // TB_ERR_NO_EVENT means a sequence was consumed & ignored; try remaining bytes
     }
 
-    // Check if resize pipe already has a pending notification
+    // Check pending resize pipe notification
     if drain_resize_and_fill(event) != 0 {
         return TB_OK;
     }
 
-    // Phase 2: Poll for data on both TTY and resize pipe (handle EINTR cleanly)
+    // Phase 2: Poll TTY and resize pipe across remaining timeout
     let start_ms = tb_internal_now_ms();
     var remaining_ms = timeout_ms;
     loop {
@@ -1593,58 +2300,53 @@ fn tb_peek_event(event: tb_event&, timeout_ms: i32) -> i32 {
                 if drain_resize_and_fill(event) != 0 {
                     return TB_OK;
                 }
-                if timeout_ms >= 0 {
-                    let elapsed = (tb_internal_now_ms() - start_ms) as i32;
-                    remaining_ms = timeout_ms - elapsed;
-                    if remaining_ms <= 0 { return TB_ERR_NO_EVENT; }
+            } else {
+                g.last_errno = tb_adapter_errno();
+                return TB_ERR_POLL;
+            }
+        } else {
+            // Check resize pipe first
+            if tb_adapter_poll_is_in(1) != 0 {
+                if drain_resize_and_fill(event) != 0 {
+                    return TB_OK;
                 }
-                continue;
             }
-            g.last_errno = tb_adapter_errno();
-            return TB_ERR_POLL;
-        }
-        break;
-    }
 
-    // Check resize pipe first
-    if tb_adapter_poll_is_in(1) != 0 {
-        if drain_resize_and_fill(event) != 0 {
-            return TB_OK;
-        }
-    }
-
-    // Check TTY input
-    if tb_adapter_poll_is_in(0) != 0 {
-        var readbuf: u8[64] = [0; 64];
-        let nread = tb_adapter_read(g.rfd, readbuf[0], 64);
-        if nread == 0 {
-            return TB_ERR_READ;
-        }
-        if nread < 0 {
-            if tb_adapter_is_again() != 0 || tb_adapter_is_eintr() != 0 {
-                return TB_ERR_NO_EVENT;
+            // Check TTY input
+            if tb_adapter_poll_is_in(0) != 0 {
+                var readbuf: u8[TB_OPT_READ_BUF] = [0; TB_OPT_READ_BUF];
+                let nread = tb_adapter_read(g.rfd, readbuf[0], TB_OPT_READ_BUF);
+                if nread == 0 {
+                    return TB_ERR_READ;
+                }
+                if nread < 0 {
+                    if tb_adapter_is_again() == 0 && tb_adapter_is_eintr() == 0 {
+                        g.last_errno = tb_adapter_errno();
+                        return TB_ERR_READ;
+                    }
+                } else {
+                    inbuf_append(readbuf, nread);
+                    while g.inbuf_len > 0 {
+                        let drv = decode_inbuf_event(event, if timeout_ms != 0 { 1 } else { 0 });
+                        if drv == TB_OK { return TB_OK; }
+                        if drv == TB_ERR_NEED_MORE { break; }
+                    }
+                }
+            } else if tb_adapter_poll_is_err(0) != 0 {
+                return TB_ERR_READ;
             }
-            g.last_errno = tb_adapter_errno();
-            return TB_ERR_READ;
         }
 
-        inbuf_append(readbuf, nread);
-
-        while g.inbuf_len > 0 {
-            let drv = decode_inbuf_event(event, 1);
-            if drv == TB_OK { return TB_OK; }
-            if drv == TB_ERR_NEED_MORE { return TB_ERR_NO_EVENT; }
+        if timeout_ms == 0 { return TB_ERR_NO_EVENT; }
+        if timeout_ms > 0 {
+            let elapsed = (tb_internal_now_ms() - start_ms) as i32;
+            remaining_ms = timeout_ms - elapsed;
+            if remaining_ms <= 0 { return TB_ERR_NO_EVENT; }
         }
-        return TB_ERR_NO_EVENT;
     }
-
-    if tb_adapter_poll_is_err(0) != 0 {
-        return TB_ERR_READ;
-    }
-
-    return TB_ERR_NO_EVENT;
 }
 
+// Block until an event (key, mouse, or resize) is available or a fatal error occurs.
 fn tb_poll_event(event: tb_event&) -> i32 {
     loop {
         let rv = tb_peek_event(event, -1);
@@ -1654,6 +2356,7 @@ fn tb_poll_event(event: tb_event&) -> i32 {
     }
 }
 
+// Export the TTY read fd and SIGWINCH self-pipe read fd for external poll/select loops.
 fn tb_get_fds(ttyfd: i32&, resizefd: i32&) -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
@@ -1662,11 +2365,11 @@ fn tb_get_fds(ttyfd: i32&, resizefd: i32&) -> i32 {
     return TB_OK;
 }
 
+// Get or set the active input mode (`TB_INPUT_CURRENT` queries; accepts ESC or ALT, optionally | MOUSE).
 fn tb_set_input_mode(mode: i32) -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
     if mode == TB_INPUT_CURRENT { return g.input_mode; }
-    // Accept bitmasks: ESC, ALT, MOUSE (but not ESC|ALT together)
     let valid = TB_INPUT_ESC | TB_INPUT_ALT | TB_INPUT_MOUSE;
     if (mode & ~valid) != 0 { return TB_ERR; }
     if (mode & TB_INPUT_ESC) != 0 && (mode & TB_INPUT_ALT) != 0 { return TB_ERR; }
@@ -1685,6 +2388,7 @@ fn tb_set_input_mode(mode: i32) -> i32 {
     return g.input_mode;
 }
 
+// Get or set the color output mode (`TB_OUTPUT_CURRENT`, NORMAL, 256, 216, GRAYSCALE, TRUECOLOR).
 fn tb_set_output_mode(mode: i32) -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
@@ -1698,13 +2402,15 @@ fn tb_set_output_mode(mode: i32) -> i32 {
     return g.output_mode;
 }
 
+// Invalidate the front buffer so the next tb_present() redraws every cell.
 fn tb_invalidate() -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
-    reset_cellbuf(g.front, 0xffffffff, 0xffffffffffffffff, 0xffffffffffffffff);
+    reset_cellbuf(g.front, 0xffffffff, 0xffffffffffffffff, 0xffffffffffffffff, 0);
     return TB_OK;
 }
 
+// Show and position the terminal cursor at (cx, cy), or hide it if either coordinate is < 0.
 fn tb_set_cursor(cx: i32, cy: i32) -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
@@ -1724,6 +2430,7 @@ fn tb_set_cursor(cx: i32, cy: i32) -> i32 {
     return TB_OK;
 }
 
+// Hide the terminal cursor (emits TB_CAP_HIDE_CURSOR or CSI ?25l).
 fn tb_hide_cursor() -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
@@ -1970,10 +2677,8 @@ fn send_attr(fg: uintattr_t, bg: uintattr_t) -> i32 {
     let g = gbl();
     if fg == g.last_fg && bg == g.last_bg { return TB_OK; }
 
-    // 1) Reset all SGR attributes and colors to a known state.
     let _ = outbuf_puts("\x1b[m");
 
-    // 2) Attribute flags live in the high bits of `fg` (termbox convention).
     if fg & TB_BOLD        != 0 { let _ = outbuf_puts("\x1b[1m");  }
     if fg & TB_DIM         != 0 { let _ = outbuf_puts("\x1b[2m");  }
     if fg & TB_ITALIC      != 0 { let _ = outbuf_puts("\x1b[3m");  }
@@ -1981,11 +2686,10 @@ fn send_attr(fg: uintattr_t, bg: uintattr_t) -> i32 {
     if fg & TB_BLINK       != 0 { let _ = outbuf_puts("\x1b[5m");  }
     if fg & TB_REVERSE     != 0 { let _ = outbuf_puts("\x1b[7m");  }
     if fg & TB_INVISIBLE   != 0 { let _ = outbuf_puts("\x1b[8m");  }
-    if fg & TB_STRIKEOUT   != 0 { let _ = outbuf_puts("\x1b[9m");  }
-    if fg & TB_UNDERLINE_2 != 0 { let _ = outbuf_puts("\x1b[21m"); }
-    if fg & TB_OVERLINE    != 0 { let _ = outbuf_puts("\x1b[53m"); }
+    if fg & TB_STRIKEOUT   != 0 { let _ = outbuf_puts(TB_HARDCAP_STRIKEOUT); }
+    if fg & TB_UNDERLINE_2 != 0 { let _ = outbuf_puts(TB_HARDCAP_UNDERLINE_2); }
+    if fg & TB_OVERLINE    != 0 { let _ = outbuf_puts(TB_HARDCAP_OVERLINE); }
 
-    // 3) Foreground and background colors according to output_mode
     send_sgr_color_fg(fg, g.output_mode);
     send_sgr_color_bg(bg, g.output_mode);
 
@@ -1997,13 +2701,6 @@ fn send_attr(fg: uintattr_t, bg: uintattr_t) -> i32 {
 fn cell_cmp(a: tb_cell&, b: tb_cell&) -> i32 {
     if a.ch != b.ch || a.fg != b.fg || a.bg != b.bg { return 1; }
     return 0;
-}
-
-fn cell_copy(dst: tb_cell&, src: tb_cell&) -> i32 {
-    dst.ch = src.ch;
-    dst.fg = src.fg;
-    dst.bg = src.bg;
-    return TB_OK;
 }
 
 fn send_cursor_if(x: i32, y: i32) -> i32 {
@@ -2022,6 +2719,9 @@ fn send_char(ch: u32) -> i32 {
     return outbuf_puts(buf[0..len]);
 }
 
+// Diff back buffer against front buffer, emit minimal ANSI cursor/SGR/UTF-8 sequences,
+// emit EGC combining codepoints, clip wide characters at the right edge, position cursor,
+// and flush to `wfd`.
 fn tb_present() -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
@@ -2035,11 +2735,14 @@ fn tb_present() -> i32 {
             let front_idx = y * g.front.width + x;
             let back = g.back.cells[back_idx];
             let front = g.front.cells[front_idx];
+            let back_ech = g.back_ech_head[back_idx];
+            let front_ech = g.front_ech_head[front_idx];
 
-            let w = tb_wcwidth(back.ch);
+            let safe_ch: u32 = if back.ch == 0 || tb_iswprint(back.ch) == 0 { 0x20 } else { back.ch };
+            let w = tb_wcwidth(safe_ch);
             let w2: i32 = if w < 1 { 1 } else { w };
 
-            if cell_cmp(back, front) != 0 {
+            if cell_cmp(back, front) != 0 || egc_cmp_chains(back_ech, front_ech) != 0 {
                 if any_dirty == 0 {
                     let _ = outbuf_puts("\x1b[m");
                     g.last_fg = TB_DEFAULT;
@@ -2050,6 +2753,7 @@ fn tb_present() -> i32 {
                 }
 
                 g.front.cells[front_idx] = back;
+                egc_copy_to_front(front_idx, back_ech);
 
                 let fg = back.fg;
                 let bg = back.bg;
@@ -2069,12 +2773,20 @@ fn tb_present() -> i32 {
                     }
                     g.last_x = g.front.width - 1;
                 } else {
-                    let _ = send_char(back.ch);
+                    let _ = send_char(safe_ch);
+                    var cur_ech = back_ech;
+                    while cur_ech >= 0 {
+                        let ech_ch = g.egc_pool[cur_ech].ch;
+                        if tb_iswprint(ech_ch) != 0 {
+                            let _ = send_char(ech_ch);
+                        }
+                        cur_ech = g.egc_pool[cur_ech].next;
+                    }
                     g.last_x = x + w2 - 1;
                 }
                 g.last_y = y;
 
-                // Mark trailing cells of wide chars as invalid (start at i=1, NOT 0)
+                // Invalidate trailing columns of a wide character in front buffer
                 var wi_off = 1;
                 while wi_off < w2 {
                     let wi = x + wi_off;
@@ -2083,6 +2795,10 @@ fn tb_present() -> i32 {
                         g.front.cells[wide_idx].ch = 0xffffffff;
                         g.front.cells[wide_idx].fg = 0xffffffffffffffff;
                         g.front.cells[wide_idx].bg = 0xffffffffffffffff;
+                        if g.front_ech_head[wide_idx] >= 0 {
+                            egc_free_chain(g.front_ech_head[wide_idx]);
+                            g.front_ech_head[wide_idx] = -1;
+                        }
                     }
                     wi_off = wi_off + 1;
                 }
@@ -2106,11 +2822,14 @@ fn tb_present() -> i32 {
 // PRINTING FUNCTIONS
 // ===========================================================================
 
+// Print UTF-8 string `str` starting at (x, y), handling `\n`, EGC combining marks, and clipping at right margin.
 fn tb_print(x: i32, y: i32, fg: uintattr_t, bg: uintattr_t, str: const u8[:]) -> i32 {
-    return tb_print_ex(x, y, fg, bg, str);
+    var out_w: u64 = 0;
+    return tb_print_ex(x, y, fg, bg, out_w, str);
 }
 
-fn tb_print_ex(x: i32, y: i32, fg: uintattr_t, bg: uintattr_t, str: const u8[:]) -> i32 {
+// Print UTF-8 string `str` starting at (x, y) and write max rendered column width into `out_w`.
+fn tb_print_ex(x: i32, y: i32, fg: uintattr_t, bg: uintattr_t, out_w: u64&, str: const u8[:]) -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
 
@@ -2120,6 +2839,9 @@ fn tb_print_ex(x: i32, y: i32, fg: uintattr_t, bg: uintattr_t, str: const u8[:])
 
     var cx = x;
     var cy = y;
+    var prev_cx: i32 = -1;
+    var cur_w: u64 = 0;
+    var max_w: u64 = 0;
 
     var si = 0;
     while si < str.len {
@@ -2132,14 +2854,12 @@ fn tb_print_ex(x: i32, y: i32, fg: uintattr_t, bg: uintattr_t, str: const u8[:])
         si = si + rv;
 
         if uni == 0x0a { // newline
+            if cur_w > max_w { max_w = cur_w; }
+            cur_w = 0;
             cx = x;
+            prev_cx = -1;
             cy = cy + 1;
             if cy >= g.height { break; }
-            continue;
-        }
-
-        // Skip characters past right margin until next newline
-        if cx >= g.width {
             continue;
         }
 
@@ -2148,15 +2868,31 @@ fn tb_print_ex(x: i32, y: i32, fg: uintattr_t, bg: uintattr_t, str: const u8[:])
         }
 
         let w = tb_wcwidth(uni);
-        let w2: i32 = if w < 1 { 1 } else { w };
+        if w == 0 {
+            // Attach combining mark / zero-width joiner to the previous cell on this line
+            if prev_cx >= x && prev_cx < g.width && cy >= 0 && cy < g.height {
+                let _ = tb_extend_cell(prev_cx, cy, uni);
+            }
+            continue;
+        }
 
+        // Skip characters past right margin until next newline
+        if cx >= g.width {
+            continue;
+        }
+
+        let w2: i32 = if w < 1 { 1 } else { w };
         if cx >= 0 && cx < g.width && cy >= 0 && cy < g.height {
             let _ = tb_set_cell(cx, cy, uni, fg, bg);
+            prev_cx = cx;
+            cur_w = cur_w + (w2 as u64);
         }
 
         cx = cx + w2;
     }
 
+    if cur_w > max_w { max_w = cur_w; }
+    out_w = max_w;
     return TB_OK;
 }
 
@@ -2167,22 +2903,20 @@ fn tb_send(buf: const u8[:], nbuf: i64) -> i32 {
     return outbuf_nputs(buf, nbuf);
 }
 
-// tb_sendf — append a format string to the output buffer.
+// tb_sendf — non-variadic stub in Goose: writes `fmt` literally without `%` formatting.
 fn tb_sendf(fmt: const u8[:]) -> i32 {
     let g = gbl();
     guard g.initialized != 0 else { return TB_ERR_NOT_INIT; }
     return tb_send(fmt, fmt.len);
 }
 
-// tb_printf — print string at position.
+// tb_printf — non-variadic stub in Goose: prints `fmt` literally via tb_print_ex() without `%` formatting.
 fn tb_printf(x: i32, y: i32, fg: uintattr_t, bg: uintattr_t, fmt: const u8[:]) -> i32 {
-    return tb_print_ex(x, y, fg, bg, fmt);
+    var out_w: u64 = 0;
+    return tb_print_ex(x, y, fg, bg, out_w, fmt);
 }
 
-// tb_printf_ex — print string at position with width output.
+// tb_printf_ex — non-variadic stub in Goose: prints `fmt` literally and writes rendered column width to `out_w`.
 fn tb_printf_ex(x: i32, y: i32, fg: uintattr_t, bg: uintattr_t, out_w: u64&, fmt: const u8[:]) -> i32 {
-    let rv = tb_print_ex(x, y, fg, bg, fmt);
-    if rv != TB_OK { return rv; }
-    out_w = 0;
-    return TB_OK;
+    return tb_print_ex(x, y, fg, bg, out_w, fmt);
 }

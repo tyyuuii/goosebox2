@@ -17,6 +17,8 @@ static int g_has_orig_tios = 0;
 
 /* The pipe fd that the SIGWINCH handler writes to. */
 static volatile sig_atomic_t g_sigwinch_pipe_fd = -1;
+static struct sigaction g_orig_sigwinch;
+static int g_has_orig_sigwinch = 0;
 
 /* SIGWINCH handler: wake up the poll loop by writing to the resize pipe. */
 static void sigwinch_handler(int signum) {
@@ -198,14 +200,44 @@ int tb_adapter_get_ttyname(char *buf, size_t bufsz, const char *tty_name_ptr) {
     return (int)strlen(buf);
 }
 
+/* Get environment variable by name into buffer. */
+int tb_adapter_getenv(const char *name, char *buf, size_t bufsz) {
+    if (!name || !buf || bufsz == 0) return -1;
+    const char *val = getenv(name);
+    if (!val) return -1;
+    size_t len = strlen(val);
+    if (len >= bufsz) len = bufsz - 1;
+    memcpy(buf, val, len);
+    buf[len] = '\0';
+    return (int)len;
+}
+
 /* Get TERM environment variable into buffer. */
 int tb_adapter_get_term(char *buf, size_t bufsz) {
-    if (!buf || bufsz == 0) return -1;
-    const char *term = getenv("TERM");
-    if (!term) return -1;
-    strncpy(buf, term, bufsz - 1);
-    buf[bufsz - 1] = '\0';
-    return (int)strlen(buf);
+    return tb_adapter_getenv("TERM", buf, bufsz);
+}
+
+/* Read a small binary file (e.g. compiled terminfo) into buffer. */
+long long tb_adapter_read_file(const char *path, char *buf, size_t max_bytes) {
+    if (!path || !buf || max_bytes == 0) return -1;
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    size_t total = 0;
+    while (total < max_bytes) {
+        ssize_t n = read(fd, buf + total, max_bytes - total);
+        if (n > 0) {
+            total += (size_t)n;
+        } else if (n == 0) {
+            break;
+        } else if (errno == EINTR) {
+            continue;
+        } else {
+            close(fd);
+            return -1;
+        }
+    }
+    close(fd);
+    return (long long)total;
 }
 
 /* SIGWINCH handler setup: installs a handler that writes a byte to pipe_fd. */
@@ -216,12 +248,20 @@ int tb_adapter_setup_signwinch(int pipe_fd) {
     sa.sa_handler = sigwinch_handler;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
-    return sigaction(SIGWINCH, &sa, NULL) == -1 ? -1 : 0;
+    if (sigaction(SIGWINCH, &sa, &g_orig_sigwinch) == -1) {
+        return -1;
+    }
+    g_has_orig_sigwinch = 1;
+    return 0;
 }
 
-/* Clear SIGWINCH handler (restore default) and reset pipe fd. */
+/* Clear SIGWINCH handler (restore previous handler) and reset pipe fd. */
 int tb_adapter_clear_signwinch(void) {
     g_sigwinch_pipe_fd = -1;
+    if (g_has_orig_sigwinch) {
+        g_has_orig_sigwinch = 0;
+        return sigaction(SIGWINCH, &g_orig_sigwinch, NULL) == -1 ? -1 : 0;
+    }
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = SIG_DFL;

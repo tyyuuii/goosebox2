@@ -68,7 +68,11 @@ long long tb_adapter_now_ms(void);
 /* Sleep for milliseconds. */
 void tb_adapter_sleep_ms(int ms);
 
-/* Get TERM environment variable into buffer. */
+/* Get TERM or arbitrary environment variable into buffer. */
 int tb_adapter_get_term(char *buf, size_t bufsz);
+int tb_adapter_getenv(const char *name, char *buf, size_t bufsz);
+
+/* Read a small binary file (e.g. terminfo) into buffer; returns bytes read or -1. */
+long long tb_adapter_read_file(const char *path, char *buf, size_t max_bytes);
 
 #endif /* TERMBOX2_ADAPTER_H */
