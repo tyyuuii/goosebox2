@@ -314,6 +314,86 @@ fn test_economy_markers_and_respawn() {
     expect(if st.render_scale == 2 && st.is_termux == 1 { 1 } else { 0 }, "init_new_game preserves render_scale and Termux flag");
 }
 
+fn test_in_place_shrink_and_parent_layers() {
+    let st = core();
+    st.genesis_mode = 0;
+    init_new_game();
+    st.screen = SCREEN_PLAY;
+
+    // 1) In-place air shrink inside Tutorial Hall (preserving parent biome & world!)
+    st.px = 9.5;
+    st.py = 3.2;
+    st.pz = 6.2;
+    st.ring_cd_ms = 0;
+    shrink_into_ex(9, 3, 6, BLK_AIR, -1, 1, st.px, st.py, st.pz);
+    expect(if st.depth == 1 && cur_parent_block() == BLK_AIR { 1 } else { 0 }, "In-place air shrink sets depth=1 and parent_block=BLK_AIR");
+    expect(if cur_biome() == BIOME_TUTORIAL { 1 } else { 0 }, "In-place air shrink preserves parent biome (Tutorial Island)");
+    expect(if fabs(st.px - 8.0) < 0.05 && fabs(st.py - 3.2) < 0.05 && fabs(st.pz - 3.2) < 0.05 { 1 } else { 0 }, "In-place air shrink scales fractional offsets by 16x");
+    expect(if st.parent_valid[0] == 1 && st.parent_bx[0] == 9 && st.parent_by[0] == 3 && st.parent_bz[0] == 6 { 1 } else { 0 }, "Parent layer 0 caches exited voxel (9,3,6)");
+    expect(if get_parent_block(0, 8, 2, 9) == BLK_BLACK_CUBE { 1 } else { 0 }, "Parent layer 0 exposes Tutorial Black Cube around player");
+    expect(if st.parent_valid[1] == 1 && get_parent_block(1, 13, 8, 12) == BLK_MYLANTIS_M { 1 } else { 0 }, "Parent layer 1 exposes Outer Space Mylantis M");
+    expect(if get_block(0, 8, 8) == BLK_AIR && get_block(15, 8, 8) == BLK_AIR && get_block(8, 0, 8) == BLK_AIR && get_block(8, 15, 8) == BLK_AIR && get_block(8, 8, 0) == BLK_AIR && get_block(8, 8, 15) == BLK_AIR { 1 } else { 0 }, "In-place air subchunk has zero enclosing walls");
+
+    // 2) Break a block in Tutorial Hall, shrink in-place -> delta appears in parent layer 0
+    init_new_game();
+    st.screen = SCREEN_PLAY;
+    break_block_at(6, 2, 9);
+    expect(if get_block(6, 2, 9) == BLK_AIR { 1 } else { 0 }, "Tutorial crate broken at (6,2,9)");
+    st.px = 9.5; st.py = 3.2; st.pz = 6.2;
+    st.ring_cd_ms = 0;
+    shrink_into_ex(9, 3, 6, BLK_AIR, -1, 1, st.px, st.py, st.pz);
+    expect(if get_parent_block(0, 6, 2, 9) == BLK_AIR { 1 } else { 0 }, "Parent layer 0 reflects broken Tutorial crate delta");
+
+    // 3) 256x Pink Deep Dive inside air keeps Tutorial biome and populates 3 parent layers (depth 1, 0, -1)
+    st.ring_cd_ms = 0;
+    shrink_into_ex(8, 3, 3, BLK_AIR, -1, 1, st.px, st.py, st.pz);
+    expect(if st.depth == 2 && cur_biome() == BIOME_TUTORIAL && st.parent_valid[2] == 1 { 1 } else { 0 }, "2-level air shrink keeps Tutorial biome and 3 valid parent layers");
+    expect(if get_parent_block(2, 8, 7, 8) == BLK_YING_PLANET { 1 } else { 0 }, "Parent layer 2 exposes Ying Planet in Outer Space");
+
+    // 4) Continuous 6-face grow-out from air subchunk lands right at voxel (9,3,6) edge
+    let ex_x = [ -0.1, 16.1, 8.0, 8.0, 8.0, 8.0 ];
+    let ex_y = [ 8.0, 8.0, -0.1, 16.1, 8.0, 8.0 ];
+    let ex_z = [ 8.0, 8.0, 8.0, 8.0, -0.1, 16.1 ];
+    var f: i32 = 0;
+    while f < 6 {
+        init_new_game();
+        st.screen = SCREEN_PLAY;
+        st.px = 9.5; st.py = 3.2; st.pz = 6.2;
+        st.ring_cd_ms = 0;
+        shrink_into_ex(9, 3, 6, BLK_AIR, -1, 1, st.px, st.py, st.pz);
+        st.ring_cd_ms = 0;
+        grow_out_axis(ex_x[f], ex_y[f], ex_z[f]);
+        expect(if st.depth == 0 && st.px >= 8.9 && st.px <= 10.1 && st.py >= 2.9 && st.py <= 4.1 && st.pz >= 5.9 && st.pz <= 7.1 { 1 } else { 0 }, "Air subchunk 6-face grow returns continuously to parent voxel (9,3,6)");
+        f = f + 1;
+    }
+
+    // 5) Face-preserving solid block entry
+    init_new_game();
+    st.screen = SCREEN_PLAY;
+    st.ring_cd_ms = 0;
+    shrink_into_ex(8, 2, 9, BLK_BLACK_CUBE, -1, 1, 8.5, 2.5, 8.7);
+    expect(if st.depth == 1 && st.pz < 3.5 { 1 } else { 0 }, "Approaching Black Cube from -Z lands near -Z face inside child");
+
+    init_new_game();
+    st.screen = SCREEN_PLAY;
+    st.ring_cd_ms = 0;
+    shrink_into_ex(8, 2, 9, BLK_BLACK_CUBE, -1, 1, 9.3, 2.5, 9.5);
+    expect(if st.depth == 1 && st.px > 12.5 { 1 } else { 0 }, "Approaching Black Cube from +X lands near +X face inside child");
+
+    // 6) Black Cube generates authentic 3D Menger Sponge with open center shafts on all 6 faces
+    st.ring_cd_ms = 0;
+    shrink_into(13, 2, 9, BLK_BLACK_CUBE, BIOME_BLACK_CUBE, 1);
+    expect(if cur_biome() == BIOME_BLACK_CUBE { 1 } else { 0 }, "Entered BIOME_BLACK_CUBE");
+    expect(if get_block(7, 7, 0) == BLK_AIR && get_block(0, 7, 7) == BLK_AIR && get_block(7, 15, 7) == BLK_AIR { 1 } else { 0 }, "Menger Sponge Black Cube has open shafts on faces");
+    expect(if get_block(1, 1, 1) == BLK_BLACK_CUBE { 1 } else { 0 }, "Menger Sponge solid lattice corners exist");
+
+    // 7) Pressing F (use_nearest) at Tutorial spawn activates the nearby Green Shrink Ring in-place
+    init_new_game();
+    st.screen = SCREEN_PLAY;
+    use_nearest();
+    expect(if st.screen == SCREEN_PLAY && st.depth == 1 && cur_parent_block() == BLK_AIR && cur_biome() == BIOME_TUTORIAL { 1 } else { 0 }, "use_nearest at Tutorial spawn shrinks 16x in-place via Green Ring");
+}
+
 extern fn exit_proc(code: i32) = "exit";
 
 fn main() {
@@ -321,6 +401,7 @@ fn main() {
     test_infinite_depth_and_early_peacefulness();
     test_weapons_and_physics();
     test_economy_markers_and_respawn();
+    test_in_place_shrink_and_parent_layers();
 
     print("FBW Core Tests: ");
     print(g_pass);

@@ -145,7 +145,7 @@ fn biome_sky_bot(biome: i32) -> u32 {
     return pack_rgb(112, 18, 86);
 }
 
-fn shade_hit_block(blk: u8, axis: i32, dist: f64, hx: f64, hy: f64, hz: f64, sky: u32) -> u32 {
+fn shade_hit_block(blk: u8, axis: i32, dist: f64, hx: f64, hy: f64, hz: f64, sky: u32, layer: i32, fog_scale: f64) -> u32 {
     let base = block_base_rgb(blk);
     var u: f64 = 0.0;
     var v: f64 = 0.0;
@@ -193,6 +193,17 @@ fn shade_hit_block(blk: u8, axis: i32, dist: f64, hx: f64, hy: f64, hz: f64, sky
         }
     }
 
+    // Subtle 16x16 fractal sub-grid lines on giant parent blocks viewed from inside a smaller scale
+    if layer > 0 {
+        let su = u * 16.0;
+        let sv = v * 16.0;
+        let fu = su - (su as! i32);
+        let fv = sv - (sv as! i32);
+        if fu < 0.07 || fv < 0.07 {
+            det256 = (det256 * 224) >> 8;
+        }
+    }
+
     let tot256 = (face256 * det256) >> 8;
     var r = ((((base >> 16) & 0xff) as! i32) * tot256) >> 8;
     var g = ((((base >> 8) & 0xff) as! i32) * tot256) >> 8;
@@ -230,9 +241,11 @@ fn shade_hit_block(blk: u8, axis: i32, dist: f64, hx: f64, hy: f64, hz: f64, sky
         r = 255; g = 248; b = 210;
     }
 
-    if dist > 5.0 {
-        var fog256 = (((dist - 5.0) * 256.0) / 22.0) as! i32;
-        if fog256 > 200 { fog256 = 200; }
+    let fog_start = 6.0 * fog_scale;
+    let fog_span = 22.0 * fog_scale;
+    if dist > fog_start {
+        var fog256 = (((dist - fog_start) * 256.0) / fog_span) as! i32;
+        if fog256 > 192 { fog256 = 192; }
         if fog256 > 0 {
             let ifog = 256 - fog256;
             let sr = ((sky >> 16) & 0xff) as! i32;
@@ -330,11 +343,11 @@ fn render_3d_world() {
     let start_bx = ffloor(ppx);
     let start_by = ffloor(ppy);
     let start_bz = ffloor(ppz);
-    let open_void = if biome == BIOME_SPACE || biome == BIOME_TUTORIAL { 1 } else { 0 };
+    let has_parent = if st.parent_valid[0] != 0 { 1 } else { 0 };
 
     st.target_name_len = 0;
 
-    // 1) Raycast 16x16x16 chunk
+    // 1) Hierarchical 3D DDA Raycast: Layer 0 (1x) + up to 3 outward parent scale layers (16x, 256x, 4096x)
     var py: i32 = 0;
     while py < ph {
         let ny = fov_scale - (py + 0.5) * inv_ph;
@@ -344,7 +357,7 @@ fn render_3d_world() {
         let sky_t = (py as f64) / ph;
         let row_sky = lerp_rgb(sky_top, sky_bot, sky_t) & 0xfcfcfc;
         let row_off = py * pw;
-        let allow_star = if star_sky != 0 && (biome == BIOME_SPACE || py < (ph * 2) / 3) { 1 } else { 0 };
+        let allow_star = if star_sky != 0 && (biome == BIOME_SPACE || has_parent != 0 || py < (ph * 2) / 3) { 1 } else { 0 };
 
         var px: i32 = 0;
         while px < pw {
@@ -371,10 +384,16 @@ fn render_3d_world() {
             var hit: i32 = 0;
             var hit_blk: u8 = BLK_AIR;
             var hit_axis: i32 = 0;
-            var hit_t: f64 = 32.0;
+            var hit_t: f64 = 0.0;
+            var hit_layer: i32 = 0;
+            var hit_fog_scale: f64 = if has_parent != 0 { 4.0 } else { 1.0 };
+            var hit_hx: f64 = 0.0;
+            var hit_hy: f64 = 0.0;
+            var hit_hz: f64 = 0.0;
+            var exited_l0: i32 = 0;
 
             var step_i: i32 = 0;
-            while step_i < 30 {
+            while step_i < 48 {
                 if tmax_x < tmax_y {
                     if tmax_x < tmax_z {
                         hit_t = tmax_x;
@@ -402,10 +421,7 @@ fn render_3d_world() {
                 }
 
                 if ((map_x | map_y | map_z) & -16) != 0 {
-                    if map_y < 0 && open_void == 0 {
-                        hit = 1;
-                        hit_blk = BLK_DIRT;
-                    }
+                    exited_l0 = 1;
                     break;
                 }
 
@@ -413,19 +429,121 @@ fn render_3d_world() {
                 if blk != BLK_AIR {
                     hit = 1;
                     hit_blk = blk;
+                    hit_hx = ppx + rdx * hit_t;
+                    hit_hy = ppy + rdy * hit_t;
+                    hit_hz = ppz + rdz * hit_t;
                     break;
                 }
                 step_i = step_i + 1;
             }
 
+            // If ray exited Layer 0 without hitting, seamlessly trace up to 3 parent scales!
+            if hit == 0 && exited_l0 != 0 && has_parent != 0 {
+                var cur_t: f64 = hit_t;
+                var cur_x: f64 = ppx + rdx * cur_t;
+                var cur_y: f64 = ppy + rdy * cur_t;
+                var cur_z: f64 = ppz + rdz * cur_t;
+                var scale_mul: f64 = 16.0;
+                var pl: i32 = 0;
+                while pl < 3 && hit == 0 {
+                    if st.parent_valid[pl] == 0 { break; }
+                    let pbx = st.parent_bx[pl];
+                    let pby = st.parent_by[pl];
+                    let pbz = st.parent_bz[pl];
+                    let px_p = pbx + fclamp(cur_x, 0.0, 16.0) * 0.0625;
+                    let py_p = pby + fclamp(cur_y, 0.0, 16.0) * 0.0625;
+                    let pz_p = pbz + fclamp(cur_z, 0.0, 16.0) * 0.0625;
+
+                    var mx: i32 = pbx;
+                    var my: i32 = pby;
+                    var mz: i32 = pbz;
+                    let tdx_p = tdx * scale_mul;
+                    let tdy_p = tdy * scale_mul;
+                    let tdz_p = tdz * scale_mul;
+
+                    var tmx: f64 = if rdx < 0.0 { (px_p - mx) * tdx_p } else { ((mx + 1) - px_p) * tdx_p };
+                    var tmy: f64 = if rdy < 0.0 { (py_p - my) * tdy_p } else { ((my + 1) - py_p) * tdy_p };
+                    var tmz: f64 = if rdz < 0.0 { (pz_p - mz) * tdz_p } else { ((mz + 1) - pz_p) * tdz_p };
+
+                    // Immediately cross the boundary face into the neighboring parent voxel
+                    var local_t: f64 = 0.0;
+                    if hit_axis == 0 {
+                        mx = mx + step_x;
+                        tmx = tdx_p;
+                    } else if hit_axis == 1 {
+                        my = my + step_y;
+                        tmy = tdy_p;
+                    } else {
+                        mz = mz + step_z;
+                        tmz = tdz_p;
+                    }
+
+                    var exited_parent: i32 = 0;
+                    var pstep: i32 = 0;
+                    while pstep < 48 {
+                        if ((mx | my | mz) & -16) != 0 {
+                            exited_parent = 1;
+                            break;
+                        }
+                        let pblk = get_parent_block(pl, mx, my, mz);
+                        if pblk != BLK_AIR {
+                            hit = 1;
+                            hit_blk = pblk;
+                            hit_t = cur_t + local_t;
+                            hit_layer = pl + 1;
+                            hit_fog_scale = scale_mul;
+                            let inv_s = 1.0 / scale_mul;
+                            hit_hx = px_p + rdx * (local_t * inv_s);
+                            hit_hy = py_p + rdy * (local_t * inv_s);
+                            hit_hz = pz_p + rdz * (local_t * inv_s);
+                            break;
+                        }
+                        if tmx < tmy {
+                            if tmx < tmz {
+                                local_t = tmx;
+                                mx = mx + step_x;
+                                tmx = tmx + tdx_p;
+                                hit_axis = 0;
+                            } else {
+                                local_t = tmz;
+                                mz = mz + step_z;
+                                tmz = tmz + tdz_p;
+                                hit_axis = 2;
+                            }
+                        } else {
+                            if tmy < tmz {
+                                local_t = tmy;
+                                my = my + step_y;
+                                tmy = tmy + tdy_p;
+                                hit_axis = 1;
+                            } else {
+                                local_t = tmz;
+                                mz = mz + step_z;
+                                tmz = tmz + tdz_p;
+                                hit_axis = 2;
+                            }
+                        }
+                        pstep = pstep + 1;
+                    }
+
+                    if hit != 0 || exited_parent == 0 {
+                        break;
+                    }
+                    let inv_s = 1.0 / scale_mul;
+                    cur_x = px_p + rdx * (local_t * inv_s);
+                    cur_y = py_p + rdy * (local_t * inv_s);
+                    cur_z = pz_p + rdz * (local_t * inv_s);
+                    cur_t = cur_t + local_t;
+                    scale_mul = scale_mul * 16.0;
+                    pl = pl + 1;
+                }
+            }
+
             let pidx = row_off + px;
             var out_col = row_sky;
-            var out_z: f64 = 32.0;
+            var out_z: f64 = 1e6;
             if hit != 0 {
-                let hx = ppx + rdx * hit_t;
-                let hy = ppy + rdy * hit_t;
-                let hz = ppz + rdz * hit_t;
-                out_col = shade_hit_block(hit_blk, hit_axis, hit_t, hx, hy, hz, row_sky);
+                out_col = shade_hit_block(hit_blk, hit_axis, hit_t, hit_hx, hit_hy, hit_hz, row_sky, hit_layer, hit_fog_scale);
                 if deep256 < 256 {
                     let dr = ((((out_col >> 16) & 0xff) as! i32) * deep256) >> 8;
                     let dg = ((((out_col >> 8) & 0xff) as! i32) * deep256) >> 8;
@@ -802,10 +920,10 @@ fn draw_hud() {
     // Row 1: Context / Ring / Target / Marker / Help Hint
     if st.near_ring_kind != ENT_NONE {
         let rmsg =
-            if st.near_ring_kind == ENT_RING_GREEN { "[F] Green Shrink Ring -> Dive 16x deeper" }
-            else if st.near_ring_kind == ENT_RING_RED { "[F] Red Grow Ring -> Ascend 16x outward" }
+            if st.near_ring_kind == ENT_RING_GREEN { "[F] Green Shrink Ring -> Shrink 16x in-place" }
+            else if st.near_ring_kind == ENT_RING_RED { "[F] Red Grow Ring -> Grow 16x outward" }
             else if st.near_ring_kind == ENT_RING_BLUE { "[F] Blue Ring -> Mylantis Portal" }
-            else { "[F] Pink Deep Ring -> Dive 256x deeper!" };
+            else { "[F] Pink Deep Ring -> Dive 256x in-place!" };
         let _ = tb_print(1, hud_y, ui_green() | TB_BOLD, ui_bg(), rmsg);
     } else if st.msg_ms > 0 && st.msg_len > 0 {
         let _ = tb_print(1, hud_y, ui_yellow() | TB_BOLD, ui_bg(), st.msg_buf[0..st.msg_len]);
@@ -858,6 +976,9 @@ fn draw_hud() {
     buf_put_int(sbuf, slen, st.depth);
     buf_put_str(sbuf, slen, " [");
     buf_put_str(sbuf, slen, biome_name(cur_biome()));
+    if st.depth > 0 && cur_parent_block() == BLK_AIR {
+        buf_put_str(sbuf, slen, "/AIR");
+    }
     buf_put_str(sbuf, slen, "] (");
     buf_put_int(sbuf, slen, ffloor(st.px));
     buf_put_ch(sbuf, slen, ',');
@@ -953,7 +1074,7 @@ fn draw_title_screen() {
     let _ = tb_print(cx + 3, cy + 5, ui_white(), ui_panel_bg(),           "Early game (Tutorial, Space -1, Ying Forest 1, Alpha Cube) is");
     let _ = tb_print(cx + 3, cy + 6, ui_white(), ui_panel_bg(),           "peaceful: unlock Weapons 2..0 via Modules & Buy Stations, then");
     let _ = tb_print(cx + 3, cy + 7, ui_white(), ui_panel_bg(),           "brave Yellow Flowers, Mylantis & I2 Menger Lattice -> Core!");
-    let _ = tb_print(cx + 3, cy + 8, ui_magenta(), ui_panel_bg(),         "Shrink into Portals, Green/Pink Rings, [B] Block or [H] ShrinkAny.");
+    let _ = tb_print(cx + 3, cy + 8, ui_magenta(), ui_panel_bg(),         "Shrink in-place via Rings/[B] (same world!) or exit any face to Grow.");
 
     let _ = tb_print(cx + 3, cy + 10, ui_cyan() | TB_BOLD, ui_panel_bg(), "WASD / Space / C(Z): 6-DOF Flight | Q/E: Roll | U: TrueUp");
     let _ = tb_print(cx + 3, cy + 11, ui_white(), ui_panel_bg(),          "Arrows/IJKL/Mouse: Aim | LMB/Enter: Fire | R/RMB: 2nd Fire");
@@ -1050,9 +1171,9 @@ fn draw_tome_modal() {
 
     if st.tome_id == BIOME_TUTORIAL {
         let _ = tb_print(mx + 2, my + 3, ui_white(), ui_panel_bg(), "Every block in Xar holds a 16x16x16 universe inside it.");
-        let _ = tb_print(mx + 2, my + 4, ui_white(), ui_panel_bg(), "Fly straight into the Tutorial Black Cube to enter the");
-        let _ = tb_print(mx + 2, my + 5, ui_white(), ui_panel_bg(), "Ying Forest, or climb out of the skylight/doorway to");
-        let _ = tb_print(mx + 2, my + 6, ui_white(), ui_panel_bg(), "leave Tutorial Island and enter Outer Space (LVL -1)!");
+        let _ = tb_print(mx + 2, my + 4, ui_white(), ui_panel_bg(), "Green/Pink Rings & [B] in open air shrink 16x IN-PLACE");
+        let _ = tb_print(mx + 2, my + 5, ui_white(), ui_panel_bg(), "inside this same room! Fly out any edge to grow back 16x,");
+        let _ = tb_print(mx + 2, my + 6, ui_white(), ui_panel_bg(), "or enter the Black Cube to reach the Ying Forest!");
         let _ = tb_print(mx + 2, my + 8, ui_cyan(), ui_panel_bg(),  "Tip: Use Railgun/Nuke recoil in Rocket Mode [Tab] to soar!");
     } else if st.tome_id == BIOME_WHITE_FLOWER {
         let _ = tb_print(mx + 2, my + 3, ui_white(), ui_panel_bg(), "Welcome to the Small White Flower's Alpha Cube chamber.");
@@ -1084,7 +1205,7 @@ fn draw_info_f1() {
     let _ = tb_print(mx + 2, my + 8, ui_white(), ui_panel_bg(), "LMB / Enter       : Primary Fire  | RMB / R : Secondary Fire");
     let _ = tb_print(mx + 2, my + 9, ui_white(), ui_panel_bg(), "1..9, 0 / Wheel   : Select 10 Weapons (Start w/ Plasma)");
     let _ = tb_print(mx + 2, my + 10, ui_white(), ui_panel_bg(), "F / T             : Use (Stations/Doors/K) / Telekinesis");
-    let _ = tb_print(mx + 2, my + 11, ui_white(), ui_panel_bg(), "B / H             : Shrink Targeted Block / Toggle ShrinkAny");
+    let _ = tb_print(mx + 2, my + 11, ui_white(), ui_panel_bg(), "B / H             : Shrink Block/Air 16x In-Place / ShrinkAny");
     let _ = tb_print(mx + 2, my + 12, ui_white(), ui_panel_bg(), "M / N             : Drop Short Marker / Long Marker");
     let _ = tb_print(mx + 2, my + 13, ui_white(), ui_panel_bg(), "G / O / V / P     : Minimap / Fast 2x / 24-bit Color / Pause");
     let _ = tb_print(mx + 2, my + 15, ui_green() | TB_BOLD, ui_panel_bg(), "Press [F1] or [ESC] to close");
