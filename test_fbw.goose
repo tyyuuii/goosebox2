@@ -52,17 +52,27 @@ fn test_tutorial_and_fractal_scaling() {
     expect(if point_collides(st.px, st.py, st.pz) == 0 { 1 } else { 0 }, "spawn is collision-free");
     expect(if get_block(8, 2, 9) == BLK_BLACK_CUBE { 1 } else { 0 }, "Tutorial Black Cube ahead");
 
-    // 1) Fly forward (+Z) into the Tutorial Black Cube -> shrinks to depth 1 (Ying Forest)
+    // 1) Fly forward (+Z) into the Tutorial Black Cube at depth 0 -> SOLID block stops player cleanly (no touch-teleport!)
     st.ring_cd_ms = 0;
     var step: i32 = 0;
-    while step < 30 && st.depth == 0 {
+    while step < 30 {
         apply_thrust(0.0, 0.0, 3.0);
         step_simulation(50);
         step = step + 1;
     }
-    expect(if st.depth == 1 { 1 } else { 0 }, "touching Tutorial Black Cube shrinks to depth 1");
-    expect(if get_frame(1).biome == BIOME_YING_FOREST { 1 } else { 0 }, "Tutorial Black Cube opens Ying Forest");
-    expect(if point_collides(st.px, st.py, st.pz) == 0 { 1 } else { 0 }, "Ying Forest spawn is collision-free");
+    expect(if st.depth == 0 && st.vz == 0.0 { 1 } else { 0 }, "Tutorial Black Cube blocks player solidly at depth 0 until shrunk");
+
+    // Shrink in-place [B] and physically fly forward (+Z) through the open 4x8 3D archway into Ying Forest!
+    shrink_targeted_block();
+    expect(if st.depth == 1 && cur_parent_block() == BLK_AIR { 1 } else { 0 }, "[B] shrinks 16x in air before Black Cube");
+    step = 0;
+    while step < 35 && cur_parent_block() == BLK_AIR {
+        st.vx = 0.0; st.vy = 0.0; st.vz = 10.0;
+        step_simulation(50);
+        step = step + 1;
+    }
+    expect(if st.depth == 1 && cur_parent_block() == BLK_BLACK_CUBE && get_frame(1).biome == BIOME_YING_FOREST { 1 } else { 0 }, "Flying shrunken through 3D tunnel enters Ying Forest physically");
+    expect(if point_collides(st.px, st.py, st.pz) == 0 { 1 } else { 0 }, "Ying Forest physical entry is collision-free");
 
     // 2) Test all 6 chunk-boundary exits grow back to depth 0 at the right face!
     let faces_x = [ -0.5, 16.5, 8.0, 8.0, 8.0, 8.0 ];
@@ -412,7 +422,7 @@ fn test_sibling_air_traversal_and_air_atoms() {
     // 1) Stay shrunk when flying across multiple sibling air subchunks (East/West/Up)
     init_new_game();
     st.screen = SCREEN_PLAY;
-    st.px = 7.5; st.py = 3.5; st.pz = 5.5;
+    st.px = 7.2; st.py = 3.2; st.pz = 5.2;
     st.ring_cd_ms = 0;
     shrink_into_ex(7, 3, 5, BLK_AIR, -1, 1, st.px, st.py, st.pz);
     expect(if st.depth == 1 && st.parent_bx[0] == 7 { 1 } else { 0 }, "Shrank at parent voxel (7,3,5)");
@@ -426,14 +436,14 @@ fn test_sibling_air_traversal_and_air_atoms() {
     }
     expect(if st.depth == 1 && cur_parent_block() == BLK_AIR && st.parent_bx[0] >= 9 { 1 } else { 0 }, "Flying across sibling air edges stays at depth=1 and updates parent_bx");
 
-    // 2) Hitting Tutorial Hall solid east wall (x=11, z=5) while shrunk in air stops cleanly instead of growing or clipping
+    // 2) Hitting Tutorial Hall thick wall jamb (x=11, y=3.2, z=3.2, away from 6..9 center tunnel) stops cleanly
     step = 0;
     while step < 25 {
         st.vx = 12.0; st.vy = 0.0; st.vz = 0.0;
         step_simulation(100);
         step = step + 1;
     }
-    expect(if st.depth == 1 && st.parent_bx[0] == 10 && st.vx == 0.0 { 1 } else { 0 }, "Macro Tutorial wall at x=11 stops shrunken player at parent_bx=10 without growing");
+    expect(if st.depth == 1 && st.parent_bx[0] == 10 && st.vx == 0.0 { 1 } else { 0 }, "Macro Tutorial wall jamb at x=11 stops shrunken player at parent_bx=10 without growing");
 
     // 3) Manual [V] (grow_in_place) grows back 16x from air cleanly
     grow_in_place();
@@ -485,6 +495,89 @@ fn test_sibling_air_traversal_and_air_atoms() {
     expect(if st.depth == 0 && point_collides(st.px, st.py, st.pz) == 0 { 1 } else { 0 }, "grow_in_place [V] from solid Black Cube exits collision-free to depth=0");
 }
 
+fn test_v3_thick_walls_3d_holes_and_physical_entry() {
+    let st = core();
+    st.genesis_mode = 0;
+
+    // 1) [F] does NOT teleport into Black Cube at depth=0; [B] shrinks in air and allows round-trip archway flight
+    init_new_game();
+    st.screen = SCREEN_PLAY;
+    st.px = 8.5; st.py = 3.2; st.pz = 8.4;
+    use_nearest();
+    expect(if st.depth == 0 { 1 } else { 0 }, "use_nearest [F] no longer touch-warps into Black Cube");
+
+    shrink_targeted_block();
+    expect(if st.depth == 1 && cur_parent_block() == BLK_AIR { 1 } else { 0 }, "[B] shrinks 16x in air near Black Cube");
+
+    // Aim at solid wall jamb x=2.5 (outside x=6..9 archway) -> blocked by 2-thick perimeter!
+    st.px = 2.5; st.py = 3.2; st.pz = 15.6;
+    var step: i32 = 0;
+    while step < 10 {
+        st.vx = 0.0; st.vy = 0.0; st.vz = 8.0;
+        step_simulation(50);
+        step = step + 1;
+    }
+    expect(if cur_parent_block() == BLK_AIR && st.parent_bz[0] == 8 && st.vz == 0.0 { 1 } else { 0 }, "Solid 2-thick Black Cube wall jamb blocks off-center entry");
+
+    // Align with x=8.0, y=4.0 inside x=6..9 archway -> flies physically into Ying Forest, then flies back out -Z staying at depth=1!
+    st.px = 8.0; st.py = 4.0; st.pz = 15.5;
+    step = 0;
+    while step < 12 && cur_parent_block() == BLK_AIR {
+        st.vx = 0.0; st.vy = 0.0; st.vz = 8.0;
+        step_simulation(50);
+        step = step + 1;
+    }
+    expect(if st.depth == 1 && cur_parent_block() == BLK_BLACK_CUBE && cur_biome() == BIOME_YING_FOREST { 1 } else { 0 }, "Steered flight through Black Cube archway enters Ying Forest at depth=1");
+
+    // Fly back -Z through Ying Forest archway -> exits back into Tutorial Hall air while staying shrunk at depth=1!
+    st.px = 8.0; st.py = 4.0; st.pz = 0.5;
+    step = 0;
+    while step < 12 && cur_parent_block() == BLK_BLACK_CUBE {
+        st.vx = 0.0; st.vy = 0.0; st.vz = -8.0;
+        step_simulation(50);
+        step = step + 1;
+    }
+    expect(if st.depth == 1 && cur_parent_block() == BLK_AIR && cur_biome() == BIOME_TUTORIAL { 1 } else { 0 }, "Flying back out archway stays shrunk at depth=1 in Tutorial air");
+
+    // 2) Generic small world block (BLK_WALL_TUT) has 2-3 thick shell, open 4x4 tunnel, ribs, gold pedestal, and 2-level micro-holes
+    init_new_game();
+    st.screen = SCREEN_PLAY;
+    st.ring_cd_ms = 0;
+    shrink_into(11, 3, 5, BLK_WALL_TUT, -1, 1);
+    expect(if st.depth == 1 && cur_biome() == BIOME_TUTORIAL { 1 } else { 0 }, "BLK_WALL_TUT preserves Tutorial biome");
+    expect(if get_block(0, 8, 8) == BLK_AIR && get_block(1, 8, 8) == BLK_AIR && get_block(15, 8, 8) == BLK_AIR { 1 } else { 0 }, "BLK_WALL_TUT pierces open 4x4 3D tunnel through thick walls");
+    expect(if get_block(0, 1, 1) == BLK_WALL_TUT && get_block(1, 1, 1) != BLK_AIR { 1 } else { 0 }, "BLK_WALL_TUT has 2-3 voxel thick solid outer girth");
+    expect(if get_block(8, 2, 8) == BLK_GOLD_ORE || get_block(8, 3, 8) == BLK_GOLD_ORE { 1 } else { 0 }, "BLK_WALL_TUT has internal Gold Ore pedestal for visible depth");
+    expect(if get_block(2, 2, 0) == BLK_AIR && get_block(2, 2, 1) == BLK_ALPHA_CUBE && get_block(14, 12, 12) == BLK_BLACK_CUBE { 1 } else { 0 }, "BLK_WALL_TUT wall alcove hides 2-level micro-hole targets");
+
+    // Tutorial Hall 2-thick walls expose inner alcoves for Alpha Cube & Black Cube
+    init_new_game();
+    st.screen = SCREEN_PLAY;
+    expect(if get_block(5, 3, 4) == BLK_AIR && get_block(4, 3, 4) == BLK_ALPHA_CUBE && get_block(11, 3, 10) == BLK_AIR && get_block(12, 3, 10) == BLK_BLACK_CUBE { 1 } else { 0 }, "Tutorial Hall 2-thick walls expose recessed 2-level alcoves inside room");
+
+    // 3) Shrunken player in air aligned at (8.0, 8.0) flies physically into BLK_WALL_TUT 4x4 tunnel!
+    init_new_game();
+    st.screen = SCREEN_PLAY;
+    st.px = 10.5; st.py = 3.5; st.pz = 5.5;
+    st.ring_cd_ms = 0;
+    shrink_into_ex(10, 3, 5, BLK_AIR, -1, 1, st.px, st.py, st.pz);
+    st.px = 15.6; st.py = 8.0; st.pz = 8.0;
+    step = 0;
+    while step < 12 && cur_parent_block() == BLK_AIR {
+        st.vx = 8.0; st.vy = 0.0; st.vz = 0.0;
+        step_simulation(50);
+        step = step + 1;
+    }
+    expect(if st.depth == 1 && st.parent_bx[0] == 11 && cur_parent_block() == BLK_WALL_TUT { 1 } else { 0 }, "Shrunken player flies physically into small BLK_WALL_TUT 4x4 3D tunnel");
+
+    // 4) Subchunk 3D lookup matches Ying Forest 2-thick walls & 4x8 archway from parent depth=0
+    init_new_game();
+    st.screen = SCREEN_PLAY;
+    expect(if get_subchunk_block(cur_seed(), 0, BIOME_TUTORIAL, 8, 3, 9, BLK_BLACK_CUBE, 8, 3, 0) == BLK_AIR { 1 } else { 0 }, "get_subchunk_block exposes Black Cube open archway");
+    expect(if get_subchunk_block(cur_seed(), 0, BIOME_TUTORIAL, 8, 3, 9, BLK_BLACK_CUBE, 2, 3, 1) == BLK_BLACK_CUBE { 1 } else { 0 }, "get_subchunk_block exposes 2-thick Black Cube wall jamb");
+    expect(if get_subchunk_block(cur_seed(), 0, BIOME_TUTORIAL, 11, 3, 5, BLK_WALL_TUT, 0, 8, 8) == BLK_AIR && get_subchunk_block(cur_seed(), 0, BIOME_TUTORIAL, 11, 3, 5, BLK_WALL_TUT, 1, 1, 1) != BLK_AIR { 1 } else { 0 }, "get_subchunk_block exposes thick wall + 4x4 hole on BLK_WALL_TUT");
+}
+
 extern fn exit_proc(code: i32) = "exit";
 
 fn main() {
@@ -494,6 +587,7 @@ fn main() {
     test_economy_markers_and_respawn();
     test_in_place_shrink_and_parent_layers();
     test_sibling_air_traversal_and_air_atoms();
+    test_v3_thick_walls_3d_holes_and_physical_entry();
 
     print("FBW Core Tests: ");
     print(g_pass);

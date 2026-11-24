@@ -272,34 +272,24 @@ fn draw_pixel_safe(st: fbw_state&, pw: i32, ph: i32, x: i32, y: i32, z: f64, rgb
     }
 }
 
-fn trace_inward_portal(
+fn trace_subvoxel_3d(
+    pseed: u64, pdepth: i32, pbiome: i32,
     mx: i32, my: i32, mz: i32,
     hit_blk: u8, hit_axis: i32, hit_t: f64,
     hx: f64, hy: f64, hz: f64,
     rdx: f64, rdy: f64, rdz: f64,
-    outer_col: u32, row_sky: u32, fog_scale: f64
+    row_sky: u32, fog_scale: f64, sub_world_scale: f64
 ) -> u32 {
-    var u: f64 = if hit_axis == 0 { hz - mz } else { hx - mx };
-    var v: f64 = if hit_axis == 1 { hz - mz } else { hy - my };
-    if u < 0.0 { u = u + 1.0; }
-    if v < 0.0 { v = v + 1.0; }
-    if u <= 0.16 || u >= 0.84 || v <= 0.16 || v >= 0.84 {
-        return outer_col;
-    }
-
-    var fx = fclamp(hx - mx, 0.002, 0.998) * 16.0 + rdx * 0.01;
-    var fy = fclamp(hy - my, 0.002, 0.998) * 16.0 + rdy * 0.01;
-    var fz = fclamp(hz - mz, 0.002, 0.998) * 16.0 + rdz * 0.01;
-    fx = fclamp(fx, 0.001, 15.999);
-    fy = fclamp(fy, 0.001, 15.999);
-    fz = fclamp(fz, 0.001, 15.999);
+    var fx = fclamp((hx - mx) * 16.0, 0.002, 15.998);
+    var fy = fclamp((hy - my) * 16.0, 0.002, 15.998);
+    var fz = fclamp((hz - mz) * 16.0, 0.002, 15.998);
 
     var imx: i32 = clamp_i(ffloor(fx), 0, 15);
     var imy: i32 = clamp_i(ffloor(fy), 0, 15);
     var imz: i32 = clamp_i(ffloor(fz), 0, 15);
 
     var ihit: i32 = 0;
-    var iblk: u8 = get_inward_preview_block(mx, my, mz, hit_blk, imx, imy, imz);
+    var iblk: u8 = get_subchunk_block(pseed, pdepth, pbiome, mx, my, mz, hit_blk, imx, imy, imz);
     var iaxis: i32 = hit_axis;
     var it: f64 = 0.0;
 
@@ -316,7 +306,7 @@ fn trace_inward_portal(
         var tmy: f64 = if rdy < 0.0 { (fy - imy) * tdy } else { ((imy + 1) - fy) * tdy };
         var tmz: f64 = if rdz < 0.0 { (fz - imz) * tdz } else { ((imz + 1) - fz) * tdz };
         var k: i32 = 0;
-        while k < 24 {
+        while k < 28 {
             if tmx < tmy {
                 if tmx < tmz { it = tmx; imx = imx + sx; tmx = tmx + tdx; iaxis = 0; }
                 else { it = tmz; imz = imz + sz; tmz = tmz + tdz; iaxis = 2; }
@@ -325,7 +315,7 @@ fn trace_inward_portal(
                 else { it = tmz; imz = imz + sz; tmz = tmz + tdz; iaxis = 2; }
             }
             if ((imx | imy | imz) & -16) != 0 { break; }
-            let b2 = get_inward_preview_block(mx, my, mz, hit_blk, imx, imy, imz);
+            let b2 = get_subchunk_block(pseed, pdepth, pbiome, mx, my, mz, hit_blk, imx, imy, imz);
             if b2 != BLK_AIR {
                 iblk = b2;
                 ihit = 1;
@@ -336,19 +326,24 @@ fn trace_inward_portal(
     }
 
     if ihit != 0 {
-        let in_col = shade_hit_block(
-            iblk, iaxis, hit_t + it * 0.0625,
+        var in_col = shade_hit_block(
+            iblk, iaxis, hit_t + it * sub_world_scale,
             fx + rdx * it, fy + rdy * it, fz + rdz * it,
             row_sky, 0, fog_scale
         );
-        return lerp_rgb(in_col, outer_col, 0.14) & 0xfcfcfc;
+        if it > 0.02 {
+            let ao = fclamp(1.0 - it * 0.028, 0.54, 0.95);
+            in_col = scale_rgb(in_col, ao) & 0xfcfcfc;
+        }
+        return in_col;
     }
 
-    let st = core();
-    let cseed = hash_block_seed(cur_seed(), mx, my, mz, st.depth + 1);
-    let cbio = pick_biome_for_entry(st.depth + 1, hit_blk, -1, cseed, cur_biome());
+    let cbio = get_subchunk_biome(pseed, pdepth, pbiome, mx, my, mz, hit_blk);
     let csky = lerp_rgb(biome_sky_top(cbio), biome_sky_bot(cbio), fclamp(0.5 - 0.35 * rdy, 0.0, 1.0));
-    return lerp_rgb(csky, outer_col, 0.18) & 0xfcfcfc;
+    if is_block_shrinkable(hit_blk) == 0 {
+        return scale_rgb(lerp_rgb(csky, row_sky, 0.45), 0.56) & 0xfcfcfc;
+    }
+    return lerp_rgb(csky, row_sky, 0.22) & 0xfcfcfc;
 }
 
 fn render_3d_world() {
@@ -576,6 +571,9 @@ fn render_3d_world() {
                             hit_blk = pblk;
                             hit_t = cur_t + local_t;
                             hit_layer = pl + 1;
+                            hit_mx = mx;
+                            hit_my = my;
+                            hit_mz = mz;
                             hit_fog_scale = scale_mul;
                             let inv_s = 1.0 / scale_mul;
                             hit_hx = px_p + rdx * (local_t * inv_s);
@@ -629,11 +627,29 @@ fn render_3d_world() {
             var out_z: f64 = 1e6;
             if hit != 0 {
                 out_col = shade_hit_block(hit_blk, hit_axis, hit_t, hit_hx, hit_hy, hit_hz, row_sky, hit_layer, hit_fog_scale);
-                if hit_layer == 0 && hit_t < 7.5 && is_block_shrinkable(hit_blk) != 0 {
-                    out_col = trace_inward_portal(
-                        hit_mx, hit_my, hit_mz, hit_blk, hit_axis, hit_t,
-                        hit_hx, hit_hy, hit_hz, rdx, rdy, rdz, out_col, row_sky, hit_fog_scale
-                    );
+                if is_block_subdivisible(hit_blk) != 0 {
+                    if hit_layer == 0 && hit_t < 9.5 {
+                        out_col = trace_subvoxel_3d(
+                            cur_seed(), st.depth, biome,
+                            hit_mx, hit_my, hit_mz, hit_blk, hit_axis, hit_t,
+                            hit_hx, hit_hy, hit_hz, rdx, rdy, rdz,
+                            row_sky, hit_fog_scale, 0.0625
+                        );
+                    } else if hit_layer == 1 && hit_t < 95.0 {
+                        out_col = trace_subvoxel_3d(
+                            st.parent_seed[0], st.parent_depth[0], st.parent_biome[0],
+                            hit_mx, hit_my, hit_mz, hit_blk, hit_axis, hit_t,
+                            hit_hx, hit_hy, hit_hz, rdx, rdy, rdz,
+                            row_sky, hit_fog_scale, 1.0
+                        );
+                    } else if hit_layer == 2 && hit_t < 320.0 {
+                        out_col = trace_subvoxel_3d(
+                            st.parent_seed[1], st.parent_depth[1], st.parent_biome[1],
+                            hit_mx, hit_my, hit_mz, hit_blk, hit_axis, hit_t,
+                            hit_hx, hit_hy, hit_hz, rdx, rdy, rdz,
+                            row_sky, hit_fog_scale, 16.0
+                        );
+                    }
                 }
                 if deep256 < 256 {
                     let dr = ((((out_col >> 16) & 0xff) as! i32) * deep256) >> 8;
@@ -1266,11 +1282,11 @@ fn draw_tome_modal() {
     let _ = tb_print(mx + 2, my + 1, ui_yellow() | TB_BOLD, ui_panel_bg(), "XAR TOME — ARCHIVE INSCRIPTION");
 
     if st.tome_id == BIOME_TUTORIAL {
-        let _ = tb_print(mx + 2, my + 3, ui_white(), ui_panel_bg(), "Every block in Xar holds a 16x16x16 universe inside it.");
-        let _ = tb_print(mx + 2, my + 4, ui_white(), ui_panel_bg(), "Green/Pink Rings & [B] shrink YOU 16x anywhere—fly freely");
-        let _ = tb_print(mx + 2, my + 5, ui_white(), ui_panel_bg(), "across rooms, dodge deep air atoms, or press [V] to Grow!");
-        let _ = tb_print(mx + 2, my + 6, ui_white(), ui_panel_bg(), "You can also enter the Black Cube to reach the Ying Forest.");
-        let _ = tb_print(mx + 2, my + 8, ui_cyan(), ui_panel_bg(),  "Tip: Use Railgun/Nuke recoil in Rocket Mode [Tab] to soar!");
+        let _ = tb_print(mx + 2, my + 3, ui_white(), ui_panel_bg(), "Every block in Xar has 2-3x thick walls & a 16x16x16 core.");
+        let _ = tb_print(mx + 2, my + 4, ui_white(), ui_panel_bg(), "Solid cubes block you until you press [B] (or Rings) to shrink");
+        let _ = tb_print(mx + 2, my + 5, ui_white(), ui_panel_bg(), "16x, revealing their 3D tunnel holes! Press [V] to Grow back.");
+        let _ = tb_print(mx + 2, my + 6, ui_white(), ui_panel_bg(), "Shrink inside the hall and fly through Black Cube -> Ying Forest.");
+        let _ = tb_print(mx + 2, my + 8, ui_cyan(), ui_panel_bg(),  "Tip: Check wall corners when shrunk for 2-level micro-holes!");
     } else if st.tome_id == BIOME_WHITE_FLOWER {
         let _ = tb_print(mx + 2, my + 3, ui_white(), ui_panel_bg(), "Welcome to the Small White Flower's Alpha Cube chamber.");
         let _ = tb_print(mx + 2, my + 4, ui_white(), ui_panel_bg(), "Alpha Cubes generate randomized fractal treasures and");

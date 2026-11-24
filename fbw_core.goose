@@ -228,15 +228,18 @@ root struct fbw_state {
     blocks: u8[CHUNK_VOL],
     parent_blocks: u8[12288], // MAX_PARENT_VIS (3) * CHUNK_VOL
     scratch_blocks: u8[CHUNK_VOL],
-    inward_blocks: u8[32768], // 8-slot * CHUNK_VOL 1-level inward portal preview cache
-    inward_seeds: u64[8],
-    inward_blks: u8[8],
-    inward_used: i32[8],
+    inward_blocks: u8[131072], // 32-slot * CHUNK_VOL multi-layer 3D sub-voxel cache
+    inward_seeds: u64[32],
+    inward_blks: u8[32],
+    inward_depths: i32[32],
+    inward_used: i32[32],
     inward_next: i32,
     parent_bx: i32[3],
     parent_by: i32[3],
     parent_bz: i32[3],
     parent_biome: i32[3],
+    parent_depth: i32[3],
+    parent_seed: u64[3],
     parent_valid: i32[3],
     pos_stack: ScaleFrame[>..],
     neg_stack: ScaleFrame[>..],
@@ -646,7 +649,7 @@ fn cur_seed() -> u64 {
 
 fn invalidate_inward_cache() {
     var i: i32 = 0;
-    while i < 8 {
+    while i < 32 {
         st.inward_used[i] = 0;
         i = i + 1;
     }
@@ -705,6 +708,17 @@ fn is_block_shrinkable(b: u8) -> i32 {
     return 0;
 }
 
+fn is_block_subdivisible(b: u8) -> i32 {
+    if is_block_shrinkable(b) != 0 { return 1; }
+    if b == BLK_WALL_TUT || b == BLK_GRASS || b == BLK_DIRT || b == BLK_WOOD ||
+       b == BLK_LEAVES || b == BLK_PETAL_Y || b == BLK_POLLEN || b == BLK_PETAL_W ||
+       b == BLK_MYLANTIS || b == BLK_ICE || b == BLK_SAND || b == BLK_STONE ||
+       b == BLK_GOLD_ORE {
+        return 1;
+    }
+    return 0;
+}
+
 fn is_block_upgrade(b: u8) -> i32 {
     if b >= BLK_UPG_HP && b <= BLK_UPG_WEP { return 1; }
     return 0;
@@ -741,15 +755,9 @@ fn weapon_name(w: i32) -> const u8[:] {
 }
 
 fn block_label(b: u8) -> const u8[:] {
-    if b == BLK_BLACK_CUBE { return "Black Cube (Shrink 16x)"; }
-    if b == BLK_WHITE_FLOWER { return "Small White Flower (Shrink)"; }
-    if b == BLK_ALPHA_CUBE { return "Alpha Cube (Shrink 16x)"; }
-    if b == BLK_FLOWER_Y_CORE { return "Yellow Flower Core (Shrink)"; }
-    if b == BLK_MYLANTIS_M { return "Mylantis 'M' Block (Shrink)"; }
-    if b == BLK_YING_PLANET { return "Ying World Planet (Shrink)"; }
-    if b == BLK_ICE_WORLD { return "Ice World Block (Shrink)"; }
-    if b == BLK_DESERT_WORLD { return "Desert Pyramid (Shrink)"; }
-    if b == BLK_CORE_GATE { return "Core Gate (Shrink to Singularity)"; }
+    if is_block_shrinkable(b) != 0 {
+        return "Fractal World Block (Shrink [B] & fly into 3D hole)";
+    }
     if b == BLK_UPG_WEP { return "Weapon Arsenal Module"; }
     if b == BLK_BUY_STATION { return "Buy Station [F]"; }
     if b == BLK_SELL_STATION { return "Sell Station [F]"; }
@@ -903,7 +911,7 @@ fn add_gold(amount: i32) {
 // ---------------------------------------------------------------------------
 fn pick_biome_for_entry(depth: i32, parent_blk: u8, forced_biome: i32, seed: u64, fallback_biome: i32) -> i32 {
     if forced_biome >= 0 { return forced_biome; }
-    // Shrinking in open air preserves the parent world's biome at every depth!
+    // Shrinking in open air or inside generic solid world blocks preserves the parent world's biome!
     if parent_blk == BLK_AIR {
         if fallback_biome >= 0 { return fallback_biome; }
         if depth < 0 { return BIOME_SPACE; }
@@ -911,15 +919,19 @@ fn pick_biome_for_entry(depth: i32, parent_blk: u8, forced_biome: i32, seed: u64
     }
     if depth < 0 { return BIOME_SPACE; }
     if depth == 0 { return BIOME_TUTORIAL; }
-    if parent_blk == BLK_CORE_GATE { return BIOME_INNER_CORE; }
-    if parent_blk == BLK_WHITE_FLOWER || parent_blk == BLK_PETAL_W { return BIOME_WHITE_FLOWER; }
-    if parent_blk == BLK_ALPHA_CUBE || parent_blk == BLK_FLOWER_Y_CORE || parent_blk == BLK_DESERT_WORLD || parent_blk == BLK_PETAL_Y || parent_blk == BLK_POLLEN {
-        return BIOME_YELLOW_FLOWER;
-    }
-    if parent_blk == BLK_YING_PLANET || parent_blk == BLK_GRASS || parent_blk == BLK_WOOD || parent_blk == BLK_LEAVES {
+    if is_block_shrinkable(parent_blk) == 0 {
+        if fallback_biome >= 0 { return fallback_biome; }
         return BIOME_YING_FOREST;
     }
-    if parent_blk == BLK_MYLANTIS_M || parent_blk == BLK_ICE_WORLD || parent_blk == BLK_MYLANTIS || parent_blk == BLK_ICE {
+    if parent_blk == BLK_CORE_GATE { return BIOME_INNER_CORE; }
+    if parent_blk == BLK_WHITE_FLOWER { return BIOME_WHITE_FLOWER; }
+    if parent_blk == BLK_ALPHA_CUBE || parent_blk == BLK_FLOWER_Y_CORE || parent_blk == BLK_DESERT_WORLD {
+        return BIOME_YELLOW_FLOWER;
+    }
+    if parent_blk == BLK_YING_PLANET {
+        return BIOME_YING_FOREST;
+    }
+    if parent_blk == BLK_MYLANTIS_M || parent_blk == BLK_ICE_WORLD {
         return BIOME_MYLANTIS;
     }
     if parent_blk == BLK_BLACK_CUBE {
@@ -1014,11 +1026,11 @@ fn populate_space_entities(depth: i32) {
 }
 
 fn generate_tutorial_blocks(dst: i32) {
-    // Peaceful Tutorial Island (open sky & open sides so Outer Space is visible & reachable!)
-    var z: i32 = 2;
-    while z <= 13 {
-        var x: i32 = 2;
-        while x <= 13 {
+    // Peaceful Tutorial Island (2-block thick ground, open sky & open sides so Outer Space is visible & reachable!)
+    var z: i32 = 1;
+    while z <= 14 {
+        var x: i32 = 1;
+        while x <= 14 {
             dst_set_block(dst, x, 0, z, BLK_DIRT);
             dst_set_block(dst, x, 1, z, BLK_GRASS);
             x = x + 1;
@@ -1026,18 +1038,21 @@ fn generate_tutorial_blocks(dst: i32) {
         z = z + 1;
     }
 
-    // Tutorial Hall around (x=5..11, y=2..6, z=3..11) with wide skylight, east doorway & north window
+    // Tutorial Hall around (x=4..12, y=2..7, z=2..12) with 2-voxel thick walls, doorway, windows & skylight
     var ry: i32 = 2;
-    while ry <= 6 {
-        var rz: i32 = 3;
-        while rz <= 11 {
-            var rx: i32 = 5;
-            while rx <= 11 {
-                let wall = if rx == 5 || rx == 11 || rz == 3 || rz == 11 || ry == 6 { 1 } else { 0 };
+    while ry <= 7 {
+        var rz: i32 = 2;
+        while rz <= 12 {
+            var rx: i32 = 4;
+            while rx <= 12 {
+                let wall = if rx <= 5 || rx >= 11 || rz <= 3 || rz >= 11 || ry >= 6 { 1 } else { 0 };
                 if wall != 0 {
-                    let is_door = if rx == 11 && rz >= 6 && rz <= 8 && ry >= 2 && ry <= 4 { 1 } else { 0 };
-                    let is_win = if (rx == 5 && rz >= 6 && rz <= 8 && ry >= 3 && ry <= 4) || (rz == 3 && rx >= 7 && rx <= 9 && ry >= 3 && ry <= 4) { 1 } else { 0 };
-                    let is_sky = if ry == 6 && rx >= 7 && rx <= 9 && rz >= 5 && rz <= 9 { 1 } else { 0 };
+                    let is_door = if rx >= 11 && rz >= 6 && rz <= 8 && ry >= 2 && ry <= 4 { 1 } else { 0 };
+                    let is_win =
+                        if (rx <= 5 && rz >= 6 && rz <= 8 && ry >= 3 && ry <= 4) ||
+                           (rz <= 3 && rx >= 7 && rx <= 9 && ry >= 3 && ry <= 4) ||
+                           (rz >= 11 && rx >= 7 && rx <= 9 && ry >= 3 && ry <= 5) { 1 } else { 0 };
+                    let is_sky = if ry >= 6 && rx >= 7 && rx <= 9 && rz >= 5 && rz <= 9 { 1 } else { 0 };
                     if is_door == 0 && is_win == 0 && is_sky == 0 {
                         dst_set_block(dst, rx, ry, rz, BLK_WALL_TUT);
                     }
@@ -1048,6 +1063,13 @@ fn generate_tutorial_blocks(dst: i32) {
         }
         ry = ry + 1;
     }
+
+    // Embedded 2-level micro-hole alcoves visible inside Tutorial Hall's 2-voxel wall thickness
+    dst_set_block(dst, 5, 3, 4, BLK_AIR);
+    dst_set_block(dst, 4, 3, 4, BLK_ALPHA_CUBE);
+    dst_set_block(dst, 11, 3, 10, BLK_AIR);
+    dst_set_block(dst, 12, 3, 10, BLK_BLACK_CUBE);
+    dst_set_block(dst, 12, 4, 10, BLK_GOLD_ORE);
 
     // Iconic Tutorial Black Cube straight ahead at (8, 2..3, 9) -> Ying Forest
     dst_set_block(dst, 8, 2, 9, BLK_BLACK_CUBE);
@@ -1078,24 +1100,44 @@ fn populate_tutorial_entities() {
 }
 
 fn generate_ying_forest_blocks(dst: i32) {
-    var z: i32 = 0;
-    while z < CHUNK_DIM {
-        var x: i32 = 0;
-        while x < CHUNK_DIM {
-            dst_set_block(dst, x, 0, z, BLK_DIRT);
-            dst_set_block(dst, x, 1, z, BLK_GRASS);
-            if (x == 0 || x == 15 || z == 0 || z == 15) && ((x + z) % 4 == 0) {
-                dst_set_block(dst, x, 2, z, BLK_GRASS);
+    // 2-voxel thick floor (Dirt + Grass) + 2-voxel thick Black Cube perimeter with 4x8 cardinal 3D archways!
+    var y: i32 = 0;
+    while y <= 11 {
+        var z: i32 = 0;
+        while z < CHUNK_DIM {
+            var x: i32 = 0;
+            while x < CHUNK_DIM {
+                if y == 0 {
+                    dst_set_block(dst, x, y, z, BLK_DIRT);
+                } else if y == 1 {
+                    dst_set_block(dst, x, y, z, BLK_GRASS);
+                } else {
+                    let is_wall = if x <= 1 || x >= 14 || z <= 1 || z >= 14 { 1 } else { 0 };
+                    let is_roof = if y == 11 && (x <= 2 || x >= 13 || z <= 2 || z >= 13) { 1 } else { 0 };
+                    if is_wall != 0 || is_roof != 0 {
+                        let arch_z = if (z <= 1 || z >= 14) && x >= 6 && x <= 9 && y >= 2 && y <= 9 { 1 } else { 0 };
+                        let arch_x = if (x <= 1 || x >= 14) && z >= 6 && z <= 9 && y >= 2 && y <= 9 { 1 } else { 0 };
+                        if arch_z == 0 && arch_x == 0 {
+                            let trim = if (x == 1 || x == 14 || z == 1 || z == 14) && (y == 2 || y == 10) { 1 } else { 0 };
+                            dst_set_block(dst, x, y, z, if trim != 0 { BLK_STONE } else { BLK_BLACK_CUBE });
+                        }
+                    }
+                }
+                x = x + 1;
             }
-            x = x + 1;
+            z = z + 1;
         }
-        z = z + 1;
+        y = y + 1;
     }
 
+    // Hidden 2-level micro-holes embedded inside Ying Forest's 2-block thick outer walls
+    dst_set_block(dst, 1, 5, 3, BLK_ALPHA_CUBE);
+    dst_set_block(dst, 14, 5, 12, BLK_GOLD_ORE);
+
     // Ying Trees with fractal Yellow Flower buds
-    build_ying_tree_to(dst, 3, 12, 2, 4, 1);
-    build_ying_tree_to(dst, 12, 12, 2, 4, 0);
-    build_ying_tree_to(dst, 13, 3, 2, 5, 1);
+    build_ying_tree_to(dst, 4, 11, 2, 4, 1);
+    build_ying_tree_to(dst, 11, 11, 2, 4, 0);
+    build_ying_tree_to(dst, 11, 4, 2, 5, 1);
 
     // Totem Pole + Health Regen House
     dst_set_block(dst, 3, 2, 4, BLK_WOOD);
@@ -1104,14 +1146,14 @@ fn generate_ying_forest_blocks(dst: i32) {
     dst_set_block(dst, 3, 5, 4, BLK_UPG_REGEN);
 
     // Jumbo Yellow Flower -> Yellow Flower Labyrinth
-    dst_set_block(dst, 8, 2, 12, BLK_WOOD);
-    dst_set_block(dst, 8, 3, 12, BLK_WOOD);
-    var fz: i32 = 10;
-    while fz <= 14 {
+    dst_set_block(dst, 8, 2, 11, BLK_WOOD);
+    dst_set_block(dst, 8, 3, 11, BLK_WOOD);
+    var fz: i32 = 9;
+    while fz <= 13 {
         var fx: i32 = 6;
         while fx <= 10 {
             let dx = fx - 8;
-            let dz = fz - 12;
+            let dz = fz - 11;
             let r2 = dx * dx + dz * dz;
             if r2 <= 4 {
                 if r2 <= 1 { dst_set_block(dst, fx, 4, fz, BLK_POLLEN); }
@@ -1121,7 +1163,7 @@ fn generate_ying_forest_blocks(dst: i32) {
         }
         fz = fz + 1;
     }
-    dst_set_block(dst, 8, 5, 12, BLK_FLOWER_Y_CORE);
+    dst_set_block(dst, 8, 5, 11, BLK_FLOWER_Y_CORE);
 
     // Small White Flower -> Alpha Cube
     dst_set_block(dst, 5, 2, 4, BLK_WHITE_FLOWER);
@@ -1159,27 +1201,26 @@ fn populate_ying_forest_entities(depth: i32, seed: u64) {
 }
 
 fn generate_white_flower_alpha_blocks(dst: i32, seed: u64) {
-    // Open-top White Flower petal calyx housing the Alpha Cube (open on 4 arches + sky!)
+    // Open-top White Flower petal calyx with 2-block thick walls & floor, 4x8 cardinal 3D archways
     var ls = seed;
     var y: i32 = 0;
-    while y <= 10 {
+    while y <= 11 {
         var z: i32 = 0;
         while z < CHUNK_DIM {
             var x: i32 = 0;
             while x < CHUNK_DIM {
-                let is_floor = if y == 0 { 1 } else { 0 };
-                let is_wall = if x == 0 || x == 15 || z == 0 || z == 15 { 1 } else { 0 };
+                let is_floor = if y <= 1 { 1 } else { 0 };
+                let is_wall = if x <= 1 || x >= 14 || z <= 1 || z >= 14 { 1 } else { 0 };
                 if is_floor != 0 {
-                    if (x >= 6 && x <= 9 && z >= 6 && z <= 9) {
-                        dst_set_block(dst, x, y, z, BLK_PETAL_W);
-                    } else if ((x + z) % 3) == 0 {
+                    if (x >= 6 && x <= 9 && z >= 6 && z <= 9) || ((x + z) % 3) == 0 {
                         dst_set_block(dst, x, y, z, BLK_PETAL_W);
                     } else {
                         dst_set_block(dst, x, y, z, BLK_GLASS);
                     }
                 } else if is_wall != 0 {
-                    let is_arch = if y >= 2 && y <= 6 && ((x >= 6 && x <= 9) || (z >= 6 && z <= 9)) { 1 } else { 0 };
-                    if is_arch == 0 {
+                    let arch_z = if (z <= 1 || z >= 14) && x >= 6 && x <= 9 && y >= 2 && y <= 9 { 1 } else { 0 };
+                    let arch_x = if (x <= 1 || x >= 14) && z >= 6 && z <= 9 && y >= 2 && y <= 9 { 1 } else { 0 };
+                    if arch_z == 0 && arch_x == 0 {
                         if ((x + y + z) % 3) == 0 { dst_set_block(dst, x, y, z, BLK_PETAL_W); }
                         else { dst_set_block(dst, x, y, z, BLK_GLASS); }
                     }
@@ -1191,14 +1232,18 @@ fn generate_white_flower_alpha_blocks(dst: i32, seed: u64) {
         y = y + 1;
     }
 
+    // Hidden 2-level micro-holes in calyx wall jambs
+    dst_set_block(dst, 1, 5, 4, BLK_ALPHA_CUBE);
+    dst_set_block(dst, 14, 5, 11, BLK_BLACK_CUBE);
+
     // Central Alpha Cube pedestal + Weapon Module (6:Minigun) + random fractal pillars
     dst_set_block(dst, 8, 2, 8, BLK_ALPHA_CUBE);
     dst_set_block(dst, 8, 3, 8, BLK_ALPHA_CUBE);
-    dst_set_block(dst, 5, 1, 8, BLK_UPG_HP);
-    dst_set_block(dst, 11, 1, 8, BLK_UPG_ARMOR);
-    dst_set_block(dst, 5, 1, 11, BLK_UPG_WEP);
-    dst_set_block(dst, 8, 1, 11, BLK_SELL_STATION);
-    dst_set_block(dst, 8, 1, 4, BLK_TOME);
+    dst_set_block(dst, 5, 2, 8, BLK_UPG_HP);
+    dst_set_block(dst, 11, 2, 8, BLK_UPG_ARMOR);
+    dst_set_block(dst, 5, 2, 11, BLK_UPG_WEP);
+    dst_set_block(dst, 8, 2, 11, BLK_SELL_STATION);
+    dst_set_block(dst, 8, 2, 4, BLK_TOME);
 
     var p: i32 = 0;
     while p < 4 {
@@ -1215,21 +1260,21 @@ fn generate_white_flower_alpha_blocks(dst: i32, seed: u64) {
 }
 
 fn populate_white_flower_alpha_entities(depth: i32) {
-    let _ = spawn_entity(ENT_RING_GREEN, 6.5, 3.2, 6.5, 1, -1, BLK_AIR);
-    let _ = spawn_entity(ENT_RING_PINK, 11.5, 3.2, 5.5, 1, -1, BLK_AIR);
+    let _ = spawn_entity(ENT_RING_GREEN, 6.5, 3.5, 6.5, 1, -1, BLK_AIR);
+    let _ = spawn_entity(ENT_RING_PINK, 11.5, 3.5, 5.5, 1, -1, BLK_AIR);
     let _ = spawn_entity(ENT_RING_RED, 8.0, 12.2, 8.0, 1, -1, BLK_AIR);
 
     if depth >= 3 && st.genesis_mode == 0 {
         let hp_scale = 22 + depth * 10;
-        let _ = spawn_entity(ENT_RAT, 4.5, 2.5, 5.5, hp_scale, -1, 0);
-        let _ = spawn_entity(ENT_GOBLIN, 11.5, 2.5, 11.5, hp_scale + 12, -1, 0);
+        let _ = spawn_entity(ENT_RAT, 4.5, 3.0, 5.5, hp_scale, -1, 0);
+        let _ = spawn_entity(ENT_GOBLIN, 11.5, 3.0, 11.5, hp_scale + 12, -1, 0);
     }
-    let _ = spawn_entity(ENT_GOLD, 6.5, 2.5, 9.5, 1, -1, 0);
-    let _ = spawn_entity(ENT_HEALTH, 9.5, 2.5, 6.5, 1, -1, 0);
+    let _ = spawn_entity(ENT_GOLD, 6.5, 3.0, 9.5, 1, -1, 0);
+    let _ = spawn_entity(ENT_HEALTH, 9.5, 3.0, 6.5, 1, -1, 0);
 }
 
 fn generate_black_cube_blocks(dst: i32, seed: u64) {
-    // Authentic 3D Menger Sponge Lattice (I1 / I2 / I3) — open cross-shafts on ALL 6 faces!
+    // Authentic 3D Menger Sponge Lattice (I1 / I2 / I3) — 5-voxel thick outer frame + open cross-shafts on ALL 6 faces!
     var y: i32 = 0;
     while y < CHUNK_DIM {
         var z: i32 = 0;
@@ -1260,6 +1305,10 @@ fn generate_black_cube_blocks(dst: i32, seed: u64) {
         }
         y = y + 1;
     }
+
+    // Embedded 2-level micro-holes in Menger corner blocks
+    dst_set_block(dst, 1, 4, 14, BLK_ALPHA_CUBE);
+    dst_set_block(dst, 14, 4, 1, BLK_GOLD_ORE);
 
     // Clear a walkable central landing platform & Menger chamber stations
     var cz: i32 = 5;
@@ -1299,24 +1348,21 @@ fn generate_interior_biome_blocks(dst: i32, biome: i32, depth: i32, seed: u64) {
         else if biome == BIOME_MYLANTIS { BLK_ICE }
         else { BLK_GOLD_ORE };
 
-    // Open-sky terraced chamber with wide cardinal portals on all 4 walls so parent chunks remain visible!
+    // Open-sky terraced chamber with 2-block thick walls & floor and wide 3D cardinal archways!
     var y: i32 = 0;
-    while y < CHUNK_DIM {
+    while y <= 11 {
         var z: i32 = 0;
         while z < CHUNK_DIM {
             var x: i32 = 0;
             while x < CHUNK_DIM {
-                let is_floor = if y == 0 { 1 } else { 0 };
-                let is_rim = if (x == 0 || x == 15 || z == 0 || z == 15) && y <= 11 { 1 } else { 0 };
+                let is_floor = if y <= 1 { 1 } else { 0 };
+                let is_rim = if x <= 1 || x >= 14 || z <= 1 || z >= 14 { 1 } else { 0 };
                 if is_floor != 0 {
-                    let pit_open = if biome == BIOME_INNER_CORE && x >= 6 && x <= 9 && z >= 6 && z <= 9 { 0 } else { 0 };
-                    if pit_open == 0 {
-                        if ((x + z) % 5) == 0 { dst_set_block(dst, x, y, z, trim_blk); }
-                        else { dst_set_block(dst, x, y, z, wall_blk); }
-                    }
+                    if ((x + z) % 5) == 0 { dst_set_block(dst, x, y, z, trim_blk); }
+                    else { dst_set_block(dst, x, y, z, wall_blk); }
                 } else if is_rim != 0 {
-                    let arch_x = if (z == 0 || z == 15) && x >= 5 && x <= 10 && y >= 2 && y <= 7 { 1 } else { 0 };
-                    let arch_z = if (x == 0 || x == 15) && z >= 5 && z <= 10 && y >= 2 && y <= 7 { 1 } else { 0 };
+                    let arch_x = if (z <= 1 || z >= 14) && x >= 5 && x <= 10 && y >= 2 && y <= 8 { 1 } else { 0 };
+                    let arch_z = if (x <= 1 || x >= 14) && z >= 5 && z <= 10 && y >= 2 && y <= 8 { 1 } else { 0 };
                     if arch_x == 0 && arch_z == 0 {
                         if ((x + y + z) % 5) == 0 { dst_set_block(dst, x, y, z, trim_blk); }
                         else { dst_set_block(dst, x, y, z, wall_blk); }
@@ -1329,6 +1375,10 @@ fn generate_interior_biome_blocks(dst: i32, biome: i32, depth: i32, seed: u64) {
         y = y + 1;
     }
 
+    // Hidden 2-level micro-holes embedded inside outer wall jambs
+    dst_set_block(dst, 1, 5, 3, BLK_ALPHA_CUBE);
+    dst_set_block(dst, 14, 5, 12, BLK_BLACK_CUBE);
+
     // Floating fractal bridges / petal platforms
     var p: i32 = 0;
     while p < 4 {
@@ -1337,7 +1387,7 @@ fn generate_interior_biome_blocks(dst: i32, biome: i32, depth: i32, seed: u64) {
         ls = splitmix64(ls);
         let pz = 3 + ((ls % 9) as! i32);
         ls = splitmix64(ls);
-        let py = 3 + ((ls % 7) as! i32);
+        let py = 4 + ((ls % 6) as! i32);
         var dz: i32 = -1;
         while dz <= 1 {
             var dx: i32 = -1;
@@ -1345,7 +1395,7 @@ fn generate_interior_biome_blocks(dst: i32, biome: i32, depth: i32, seed: u64) {
                 if dx != 0 || dz != 0 {
                     let tx = px + dx;
                     let tz = pz + dz;
-                    if tx < 7 || tx > 9 || tz < 6 || tz > 9 {
+                    if (tx >= 2 && tx <= 13 && tz >= 2 && tz <= 13) && (tx < 7 || tx > 9 || tz < 6 || tz > 9) {
                         dst_set_block(dst, tx, py, tz, wall_blk);
                     }
                 }
@@ -1356,30 +1406,30 @@ fn generate_interior_biome_blocks(dst: i32, biome: i32, depth: i32, seed: u64) {
         p = p + 1;
     }
 
-    dst_set_block(dst, 5, 1, 8, BLK_BUY_STATION);
-    dst_set_block(dst, 11, 1, 8, BLK_SELL_STATION);
-    dst_set_block(dst, 4, 1, 4, BLK_CRATE);
-    dst_set_block(dst, 11, 1, 4, BLK_GOLD_ORE);
-    if depth >= 3 { dst_set_block(dst, 11, 1, 11, BLK_SPAWNER); }
+    dst_set_block(dst, 5, 2, 8, BLK_BUY_STATION);
+    dst_set_block(dst, 11, 2, 8, BLK_SELL_STATION);
+    dst_set_block(dst, 4, 2, 4, BLK_CRATE);
+    dst_set_block(dst, 11, 2, 4, BLK_GOLD_ORE);
+    if depth >= 3 { dst_set_block(dst, 11, 2, 11, BLK_SPAWNER); }
     if biome == BIOME_MYLANTIS {
-        dst_set_block(dst, 4, 1, 12, BLK_BLACK_MARKET);
+        dst_set_block(dst, 4, 2, 12, BLK_BLACK_MARKET);
         dst_set_block(dst, 12, 2, 12, BLK_LOCKED_DOOR);
         dst_set_block(dst, 12, 2, 13, BLK_UPG_AMMO);
     }
 
     if biome == BIOME_YELLOW_FLOWER {
-        dst_set_block(dst, 8, 1, 4, BLK_UPG_HP);
-        dst_set_block(dst, 8, 1, 12, BLK_KEY_BLOCK);
-        dst_set_block(dst, 5, 1, 12, BLK_UPG_WEP);
+        dst_set_block(dst, 8, 2, 4, BLK_UPG_HP);
+        dst_set_block(dst, 8, 2, 12, BLK_KEY_BLOCK);
+        dst_set_block(dst, 5, 2, 12, BLK_UPG_WEP);
         dst_set_block(dst, 4, 2, 8, BLK_MYLANTIS_M);
     } else if biome == BIOME_MYLANTIS {
-        dst_set_block(dst, 8, 1, 4, BLK_UPG_ROF);
-        dst_set_block(dst, 8, 1, 12, BLK_UPG_SPEED);
-        dst_set_block(dst, 4, 1, 10, BLK_UPG_WEP);
+        dst_set_block(dst, 8, 2, 4, BLK_UPG_ROF);
+        dst_set_block(dst, 8, 2, 12, BLK_UPG_SPEED);
+        dst_set_block(dst, 4, 2, 10, BLK_UPG_WEP);
         dst_set_block(dst, 4, 2, 8, BLK_BLACK_CUBE);
     } else {
-        dst_set_block(dst, 8, 1, 4, BLK_UPG_ARMOR);
-        dst_set_block(dst, 8, 1, 12, BLK_UPG_HP);
+        dst_set_block(dst, 8, 2, 4, BLK_UPG_ARMOR);
+        dst_set_block(dst, 8, 2, 12, BLK_UPG_HP);
         dst_set_block(dst, 4, 2, 8, BLK_BLACK_CUBE);
     }
 }
@@ -1387,20 +1437,20 @@ fn generate_interior_biome_blocks(dst: i32, biome: i32, depth: i32, seed: u64) {
 fn populate_interior_biome_entities(biome: i32, depth: i32) {
     // In-place Green (16x) and Pink (256x) Shrink Rings + Red Grow Ring!
     let _ = spawn_entity(ENT_RING_RED, 8.0, 12.2, 8.0, 1, -1, BLK_AIR);
-    let _ = spawn_entity(ENT_RING_GREEN, 6.2, 3.2, 8.0, 1, -1, BLK_AIR);
-    let _ = spawn_entity(ENT_RING_PINK, 10.2, 3.2, 6.2, 1, -1, BLK_AIR);
+    let _ = spawn_entity(ENT_RING_GREEN, 6.2, 3.5, 8.0, 1, -1, BLK_AIR);
+    let _ = spawn_entity(ENT_RING_PINK, 10.2, 3.5, 6.2, 1, -1, BLK_AIR);
 
     if st.genesis_mode == 0 {
         let d_cap = clamp_i(depth, 1, 40);
         let scale_hp = 30 + d_cap * 18;
         if biome == BIOME_YELLOW_FLOWER {
-            let _ = spawn_entity(ENT_GOBLIN, 4.5, 2.6, 11.5, scale_hp, -1, 0);
-            let _ = spawn_entity(ENT_RAT, 11.5, 2.5, 4.5, scale_hp - 8, -1, 0);
+            let _ = spawn_entity(ENT_GOBLIN, 4.5, 3.0, 11.5, scale_hp, -1, 0);
+            let _ = spawn_entity(ENT_RAT, 11.5, 3.0, 4.5, scale_hp - 8, -1, 0);
             if depth >= 3 {
                 let _ = spawn_entity(ENT_PIRATE, 8.0, 7.5, 12.0, scale_hp + 15, -1, 0);
             }
         } else if biome == BIOME_MYLANTIS {
-            let _ = spawn_entity(ENT_SPIDER, 4.5, 2.5, 11.5, scale_hp, -1, 0);
+            let _ = spawn_entity(ENT_SPIDER, 4.5, 3.0, 11.5, scale_hp, -1, 0);
             let _ = spawn_entity(ENT_MARINE, 5.5, 5.5, 5.5, scale_hp + 15, -1, 0);
             let _ = spawn_entity(ENT_DEMON, 11.5, 3.5, 11.5, scale_hp + 30, -1, 0);
         } else if biome == BIOME_BLACK_CUBE {
@@ -1414,12 +1464,89 @@ fn populate_interior_biome_entities(biome: i32, depth: i32) {
     }
 
     if biome == BIOME_INNER_CORE && st.k_rescued == 0 {
-        let _ = spawn_entity(ENT_FRIEND_K, 8.0, 2.6, 13.6, 1, -1, 0);
+        let _ = spawn_entity(ENT_FRIEND_K, 8.0, 3.0, 13.6, 1, -1, 0);
     }
 
-    let _ = spawn_entity(ENT_GOLD, 6.5, 2.4, 5.5, 1, -1, 0);
-    let _ = spawn_entity(ENT_AMMO, 4.0, 2.4, 8.0, 1, -1, 0);
-    let _ = spawn_entity(ENT_HEALTH, 8.0, 2.4, 3.5, 1, -1, 0);
+    let _ = spawn_entity(ENT_GOLD, 6.5, 3.0, 5.5, 1, -1, 0);
+    let _ = spawn_entity(ENT_AMMO, 4.0, 3.0, 8.0, 1, -1, 0);
+    let _ = spawn_entity(ENT_HEALTH, 8.0, 3.0, 3.5, 1, -1, 0);
+}
+
+fn generate_generic_hollow_block(dst: i32, blk: u8, depth: i32, seed: u64) {
+    // Every solid world block subdivides into a 16x16x16 hollow structure with 2-3 sub-block
+    // thick walls ("girth"), recessed 3D tunnels on cardinal faces, inner beams/pillars,
+    // and embedded 2-level micro-holes in the thick wall jambs!
+    let _ = depth;
+    let thick: i32 = 2 + ((seed & 1) as! i32); // 2 or 3 voxels thick
+    let trim_blk: u8 =
+        if blk == BLK_WALL_TUT || blk == BLK_STONE { BLK_STONE }
+        else if blk == BLK_GRASS || blk == BLK_DIRT { BLK_WOOD }
+        else if blk == BLK_WOOD || blk == BLK_LEAVES { BLK_GRASS }
+        else if blk == BLK_PETAL_Y || blk == BLK_POLLEN { BLK_POLLEN }
+        else if blk == BLK_PETAL_W { BLK_ICE }
+        else if blk == BLK_MYLANTIS || blk == BLK_ICE { BLK_MYLANTIS }
+        else { BLK_SAND };
+
+    let has_floor_pit: i32 = if (seed & 4) != 0 { 1 } else { 0 };
+    var y: i32 = 0;
+    while y < CHUNK_DIM {
+        var z: i32 = 0;
+        while z < CHUNK_DIM {
+            var x: i32 = 0;
+            while x < CHUNK_DIM {
+                let in_x_wall = if x < thick || x >= CHUNK_DIM - thick { 1 } else { 0 };
+                let in_z_wall = if z < thick || z >= CHUNK_DIM - thick { 1 } else { 0 };
+                let in_y_bot = if y < thick { 1 } else { 0 };
+                let in_y_top = if y >= CHUNK_DIM - thick { 1 } else { 0 };
+
+                if in_x_wall != 0 || in_z_wall != 0 || in_y_bot != 0 || in_y_top != 0 {
+                    // Cardinal 4x4 3D tunnels piercing completely through the 2-3 thick walls
+                    let tunnel_z = if x >= 6 && x <= 9 && y >= 6 && y <= 9 && in_x_wall == 0 && in_y_bot == 0 && in_y_top == 0 { 1 } else { 0 };
+                    let tunnel_x = if z >= 6 && z <= 9 && y >= 6 && y <= 9 && in_z_wall == 0 && in_y_bot == 0 && in_y_top == 0 { 1 } else { 0 };
+                    let sky_hole = if in_y_top != 0 && x >= 6 && x <= 9 && z >= 6 && z <= 9 { 1 } else { 0 };
+                    let pit_hole = if has_floor_pit != 0 && in_y_bot != 0 && x >= 7 && x <= 8 && z >= 7 && z <= 8 { 1 } else { 0 };
+
+                    // Recessed 2x2 micro-hole alcoves on outer skin exposing 2-level secret pockets inside wall thickness
+                    let alcove_front = if z == 0 && x >= 2 && x <= 3 && y >= 2 && y <= 3 { 1 } else { 0 };
+                    let alcove_side = if x == 15 && z >= 12 && z <= 13 && y >= 12 && y <= 13 { 1 } else { 0 };
+
+                    if tunnel_z == 0 && tunnel_x == 0 && sky_hole == 0 && pit_hole == 0 && alcove_front == 0 && alcove_side == 0 {
+                        let inner_skin = if x == thick - 1 || x == CHUNK_DIM - thick || z == thick - 1 || z == CHUNK_DIM - thick || y == thick - 1 { 1 } else { 0 };
+                        dst_set_block(dst, x, y, z, if inner_skin != 0 && ((x + y + z) & 1) == 0 { trim_blk } else { blk });
+                    }
+                }
+                x = x + 1;
+            }
+            z = z + 1;
+        }
+        y = y + 1;
+    }
+
+    // Internal structural ribs & lower pedestal so looking through any 3D hole shows multi-layer depth!
+    var b: i32 = thick;
+    while b <= 15 - thick {
+        dst_set_block(dst, b, 5, 5, trim_blk);
+        dst_set_block(dst, b, 5, 10, trim_blk);
+        b = b + 1;
+    }
+    dst_set_block(dst, 5, 4, 5, trim_blk);
+    dst_set_block(dst, 10, 4, 5, trim_blk);
+    dst_set_block(dst, 5, 4, 10, trim_blk);
+    dst_set_block(dst, 10, 4, 10, trim_blk);
+    dst_set_block(dst, 8, thick, 8, BLK_GOLD_ORE);
+
+    // 2-level hidden micro-hole targets seated inside the thick wall alcoves
+    dst_set_block(dst, 2, 2, 1, BLK_ALPHA_CUBE);
+    dst_set_block(dst, 14, 12, 12, BLK_BLACK_CUBE);
+}
+
+fn populate_generic_hollow_entities(depth: i32) {
+    let _ = spawn_entity(ENT_RING_GREEN, 8.0, 8.0, 4.8, 1, -1, BLK_AIR);
+    let _ = spawn_entity(ENT_RING_RED, 8.0, 12.2, 8.0, 1, -1, BLK_AIR);
+    let _ = spawn_entity(ENT_GOLD, 8.0, 8.0, 11.2, 1, -1, 0);
+    if depth >= 3 && st.genesis_mode == 0 {
+        let _ = spawn_entity(ENT_RAT, 5.5, 4.5, 10.5, 24 + depth * 6, -1, 0);
+    }
 }
 
 fn generate_air_subchunk_blocks(dst: i32, biome: i32, seed: u64, air_depth: i32) {
@@ -1590,7 +1717,11 @@ fn generate_chunk_blocks_to(dst_layer: i32, depth: i32, biome: i32, parent_blk: 
         generate_air_subchunk_blocks(dst_layer, biome, seed, air_depth);
     } else if depth < 0 || biome == BIOME_SPACE {
         generate_space_blocks(dst_layer);
-    } else if depth == 0 || biome == BIOME_TUTORIAL {
+    } else if depth == 0 && biome == BIOME_TUTORIAL {
+        generate_tutorial_blocks(dst_layer);
+    } else if is_block_shrinkable(parent_blk) == 0 {
+        generate_generic_hollow_block(dst_layer, parent_blk, depth, seed);
+    } else if biome == BIOME_TUTORIAL {
         generate_tutorial_blocks(dst_layer);
     } else if biome == BIOME_YING_FOREST {
         generate_ying_forest_blocks(dst_layer);
@@ -1610,27 +1741,53 @@ fn generate_chunk_blocks_to(dst_layer: i32, depth: i32, biome: i32, parent_blk: 
     }
 }
 
-fn get_inward_preview_block(mx: i32, my: i32, mz: i32, blk: u8, cx: i32, cy: i32, cz: i32) -> u8 {
+fn get_subchunk_biome(
+    parent_seed: u64, parent_depth: i32, parent_biome: i32,
+    mx: i32, my: i32, mz: i32, blk: u8
+) -> i32 {
+    if parent_depth == -1 && mx == 8 && my == 7 && mz == 8 && blk == BLK_YING_PLANET {
+        return BIOME_TUTORIAL;
+    }
+    let child_d = parent_depth + 1;
+    let cseed = hash_block_seed(parent_seed, mx, my, mz, child_d);
+    return pick_biome_for_entry(child_d, blk, -1, cseed, parent_biome);
+}
+
+fn get_subchunk_block(
+    parent_seed: u64, parent_depth: i32, parent_biome: i32,
+    mx: i32, my: i32, mz: i32, blk: u8,
+    cx: i32, cy: i32, cz: i32
+) -> u8 {
     if cx < 0 || cx >= CHUNK_DIM || cy < 0 || cy >= CHUNK_DIM || cz < 0 || cz >= CHUNK_DIM {
         return BLK_AIR;
     }
-    let child_d = st.depth + 1;
-    let cseed = hash_block_seed(cur_seed(), mx, my, mz, child_d);
+    let is_tut_crown = if parent_depth == -1 && mx == 8 && my == 7 && mz == 8 && blk == BLK_YING_PLANET { 1 } else { 0 };
+    let child_d = parent_depth + 1;
+    let cseed =
+        if is_tut_crown != 0 { 0x5841525f54555430 }
+        else { hash_block_seed(parent_seed, mx, my, mz, child_d) };
     var slot: i32 = 0;
-    while slot < 8 {
-        if st.inward_used[slot] != 0 && st.inward_seeds[slot] == cseed && st.inward_blks[slot] == blk {
+    while slot < 32 {
+        if st.inward_used[slot] != 0 && st.inward_seeds[slot] == cseed && st.inward_blks[slot] == blk && st.inward_depths[slot] == child_d {
             return st.inward_blocks[slot * CHUNK_VOL + b_idx(cx, cy, cz)];
         }
         slot = slot + 1;
     }
     slot = st.inward_next;
-    st.inward_next = (st.inward_next + 1) % 8;
+    st.inward_next = (st.inward_next + 1) % 32;
     st.inward_used[slot] = 1;
     st.inward_seeds[slot] = cseed;
     st.inward_blks[slot] = blk;
-    let cbio = pick_biome_for_entry(child_d, blk, -1, cseed, cur_biome());
+    st.inward_depths[slot] = child_d;
+    let cbio =
+        if is_tut_crown != 0 { BIOME_TUTORIAL }
+        else { pick_biome_for_entry(child_d, blk, -1, cseed, parent_biome) };
     generate_chunk_blocks_to(10 + slot, child_d, cbio, blk, cseed, 0);
     return st.inward_blocks[slot * CHUNK_VOL + b_idx(cx, cy, cz)];
+}
+
+fn get_inward_preview_block(mx: i32, my: i32, mz: i32, blk: u8, cx: i32, cy: i32, cz: i32) -> u8 {
+    return get_subchunk_block(cur_seed(), st.depth, cur_biome(), mx, my, mz, blk, cx, cy, cz);
 }
 
 fn load_current_chunk() {
@@ -1648,7 +1805,11 @@ fn load_current_chunk() {
         populate_air_subchunk_entities(st.depth, seed);
     } else if st.depth < 0 || biome == BIOME_SPACE {
         populate_space_entities(st.depth);
-    } else if st.depth == 0 || biome == BIOME_TUTORIAL {
+    } else if st.depth == 0 && biome == BIOME_TUTORIAL {
+        populate_tutorial_entities();
+    } else if is_block_shrinkable(cf.parent_block) == 0 {
+        populate_generic_hollow_entities(st.depth);
+    } else if biome == BIOME_TUTORIAL {
         populate_tutorial_entities();
     } else if biome == BIOME_YING_FOREST {
         populate_ying_forest_entities(st.depth, seed);
@@ -1673,6 +1834,8 @@ fn load_current_chunk() {
             st.parent_by[pl] = child_f.by;
             st.parent_bz[pl] = child_f.bz;
             st.parent_biome[pl] = pf.biome;
+            st.parent_depth[pl] = pd;
+            st.parent_seed[pl] = pf.seed;
             generate_chunk_blocks_to(pl, pd, pf.biome, pf.parent_block, pf.seed, compute_air_depth(pd));
         }
         pl = pl + 1;
@@ -2020,9 +2183,9 @@ fn init_new_game() {
 
     load_current_chunk();
     if st.genesis_mode != 0 {
-        set_status_msg("Genesis Mode (Peaceful): Shrink forever with Black Cube, Rings & [B]!", 4200);
+        set_status_msg("Genesis Mode: Press [B] to shrink 16x and fly through 3D wall holes!", 4200);
     } else {
-        set_status_msg("Tutorial: Fly into Black Cube -> Ying Forest, or exit to Space!", 4200);
+        set_status_msg("Tutorial: Solid walls! Press [B] to shrink 16x, then fly into Black Cube hole!", 4200);
     }
 }
 
@@ -2146,9 +2309,12 @@ fn check_touch_special_block(tx: f64, ty: f64, tz: f64) -> i32 {
         collect_upgrade_block(bx, by, bz, blk);
         return 1;
     }
-    if (is_block_shrinkable(blk) != 0 || (st.shrink_any != 0 && is_block_solid(blk) != 0)) && st.ring_cd_ms <= 0 {
+    if st.shrink_any != 0 && is_block_solid(blk) != 0 && st.ring_cd_ms <= 0 {
         shrink_into_ex(bx, by, bz, blk, -1, 1, st.px, st.py, st.pz);
         return 2;
+    }
+    if is_block_subdivisible(blk) != 0 && st.msg_ms <= 0 {
+        set_status_msg("Solid wall! Press [B] to shrink 16x and fly through its 3D holes.", 1400);
     }
     return 0;
 }
@@ -2288,8 +2454,8 @@ fn step_air_single_axis(axis: i32, sdir: i32, cand_x: f64, cand_y: f64, cand_z: 
         return 1;
     }
 
-    // Neighbor macro voxel is SOLID: allow direct open-space entry if it is a Shrinkable Portal (or ShrinkAny ON)
-    if is_block_shrinkable(tblk) != 0 || (st.shrink_any != 0 && st.ring_cd_ms <= 0) {
+    // Neighbor macro voxel is SOLID: allow physical flight through its 3D tunnel holes!
+    if is_block_subdivisible(tblk) != 0 || (st.shrink_any != 0 && st.ring_cd_ms <= 0) {
         let is_tut_crown = if anc_d == -1 && target_bx == 8 && target_by == 7 && target_bz == 8 && tblk == BLK_YING_PLANET { 1 } else { 0 };
         var top_seed: u64 =
             if is_tut_crown != 0 { 0x5841525f54555430 }
@@ -2309,10 +2475,25 @@ fn step_air_single_axis(axis: i32, sdir: i32, cand_x: f64, cand_y: f64, cand_z: 
                 st.px = nx_w;
                 st.py = ny_w;
                 st.pz = nz_w;
-                st.ring_cd_ms = 180;
-                st.flash_ms = 160;
+                st.flash_ms = 120;
                 st.flash_rgb = pack_rgb(40, 235, 130);
-                set_status_msg("Entered fractal block at current scale!", 1400);
+                set_status_msg("Entered 3D fractal tunnel!", 1400);
+                return 1;
+            } else if st.shrink_any != 0 && st.ring_cd_ms <= 0 {
+                set_frame(cur_d, ScaleFrame {
+                    bx: target_bx, by: target_by, bz: target_bz,
+                    biome: top_bio, parent_block: tblk, seed: top_seed
+                });
+                load_current_chunk();
+                var sx: f64 = 8.0;
+                var sy: f64 = 8.0;
+                var sz: f64 = 8.0;
+                find_clear_air_pos(nx_w, ny_w, nz_w, sx, sy, sz);
+                st.px = sx;
+                st.py = sy;
+                st.pz = sz;
+                st.ring_cd_ms = 180;
+                set_status_msg("ShrinkAny passed through solid wall!", 1400);
                 return 1;
             }
         } else {
@@ -2325,7 +2506,6 @@ fn step_air_single_axis(axis: i32, sdir: i32, cand_x: f64, cand_y: f64, cand_z: 
                 let wbx = (wf.bx + sdx + CHUNK_DIM) & 15;
                 let wby = (wf.by + sdy + CHUNK_DIM) & 15;
                 let wbz = (wf.bz + sdz + CHUNK_DIM) & 15;
-                // Inspect parent chunk to check if entry cell is solid or open air
                 generate_chunk_blocks_to(3, wd - 1, rbio, if wd == cur_d + 1 { tblk } else { BLK_AIR }, rseed, rair);
                 if dst_get_block(3, wbx, wby, wbz) != BLK_AIR {
                     return 0;
@@ -2363,14 +2543,16 @@ fn step_air_single_axis(axis: i32, sdir: i32, cand_x: f64, cand_y: f64, cand_z: 
         }
     }
 
+    if st.msg_ms <= 0 {
+        set_status_msg("Solid wall jamb — steer into the 3D hole or press [B] to shrink!", 1200);
+    }
     return 0;
 }
 
 fn move_player_vec(dx: f64, dy: f64, dz: f64) {
-    let in_air = if cur_parent_block() == BLK_AIR { 1 } else { 0 };
-
+    let can_cross_x = if cur_parent_block() == BLK_AIR || st.depth >= 1 { 1 } else { 0 };
     let nx = st.px + dx;
-    if in_air != 0 && (nx < 0.0 || nx >= 16.0) {
+    if can_cross_x != 0 && (nx < 0.0 || nx >= 16.0) {
         let sdir: i32 = if nx < 0.0 { -1 } else { 1 };
         if step_air_single_axis(0, sdir, nx, st.py, st.pz) == 0 {
             st.px = fclamp(st.px, 0.25, 15.75);
@@ -2383,9 +2565,9 @@ fn move_player_vec(dx: f64, dy: f64, dz: f64) {
         st.vx = 0.0;
     }
 
-    let in_air_y = if cur_parent_block() == BLK_AIR { 1 } else { 0 };
+    let can_cross_y = if cur_parent_block() == BLK_AIR || st.depth >= 1 { 1 } else { 0 };
     let ny = st.py + dy;
-    if in_air_y != 0 && (ny < 0.0 || ny >= 16.0) {
+    if can_cross_y != 0 && (ny < 0.0 || ny >= 16.0) {
         let sdir: i32 = if ny < 0.0 { -1 } else { 1 };
         if step_air_single_axis(1, sdir, st.px, ny, st.pz) == 0 {
             st.py = fclamp(st.py, 0.25, 15.75);
@@ -2398,9 +2580,9 @@ fn move_player_vec(dx: f64, dy: f64, dz: f64) {
         st.vy = 0.0;
     }
 
-    let in_air_z = if cur_parent_block() == BLK_AIR { 1 } else { 0 };
+    let can_cross_z = if cur_parent_block() == BLK_AIR || st.depth >= 1 { 1 } else { 0 };
     let nz = st.pz + dz;
-    if in_air_z != 0 && (nz < 0.0 || nz >= 16.0) {
+    if can_cross_z != 0 && (nz < 0.0 || nz >= 16.0) {
         let sdir: i32 = if nz < 0.0 { -1 } else { 1 };
         if step_air_single_axis(2, sdir, st.px, st.py, nz) == 0 {
             st.pz = fclamp(st.pz, 0.25, 15.75);
@@ -2413,8 +2595,8 @@ fn move_player_vec(dx: f64, dy: f64, dz: f64) {
         st.vz = 0.0;
     }
 
-    // Exiting the outer face of an enclosed SOLID fractal block (parent_block != BLK_AIR) grows 16x outward!
-    if cur_parent_block() != BLK_AIR {
+    // At root depths (<= 0, Tutorial Island / Space), exiting past 0..16 grows 16x outward into Outer Space
+    if st.depth <= 0 && cur_parent_block() != BLK_AIR {
         if st.px < 0.0 || st.px >= 16.0 || st.py < 0.0 || st.py >= 16.0 || st.pz < 0.0 || st.pz >= 16.0 {
             grow_out_axis(st.px, st.py, st.pz);
         }
@@ -2864,26 +3046,28 @@ fn warp_to_marker(slot: i32) -> i32 {
 
 fn shrink_targeted_block() {
     st.ring_cd_ms = 0;
-    var fx: f64 = 0.0;
-    var fy: f64 = 0.0;
-    var fz: f64 = 0.0;
-    camera_forward(fx, fy, fz);
-    var t: f64 = 0.4;
-    while t <= 4.5 {
-        let hx = st.px + fx * t;
-        let hy = st.py + fy * t;
-        let hz = st.pz + fz * t;
-        let bx = ffloor(hx);
-        let by = ffloor(hy);
-        let bz = ffloor(hz);
-        let b = get_block(bx, by, bz);
-        if b != BLK_AIR {
-            shrink_into_ex(bx, by, bz, b, -1, 1, hx - fx * 0.35, hy - fy * 0.35, hz - fz * 0.35);
-            return;
+    if st.shrink_any != 0 {
+        var fx: f64 = 0.0;
+        var fy: f64 = 0.0;
+        var fz: f64 = 0.0;
+        camera_forward(fx, fy, fz);
+        var t: f64 = 0.4;
+        while t <= 4.5 {
+            let hx = st.px + fx * t;
+            let hy = st.py + fy * t;
+            let hz = st.pz + fz * t;
+            let bx = ffloor(hx);
+            let by = ffloor(hy);
+            let bz = ffloor(hz);
+            let b = get_block(bx, by, bz);
+            if b != BLK_AIR {
+                shrink_into_ex(bx, by, bz, b, -1, 1, hx - fx * 0.35, hy - fy * 0.35, hz - fz * 0.35);
+                return;
+            }
+            t = t + 0.35;
         }
-        t = t + 0.35;
     }
-    // In open air: shrink 16x in-place inside current air voxel (preserving the surrounding world!)
+    // Always shrink YOU 16x in-place in open air so surrounding blocks become giant 3D walls with visible holes!
     let pbx = clamp_i(ffloor(st.px), 0, 15);
     let pby = clamp_i(ffloor(st.py), 0, 15);
     let pbz = clamp_i(ffloor(st.pz), 0, 15);
@@ -2917,7 +3101,7 @@ fn use_nearest() {
         i = i + 1;
     }
 
-    // 2) Ray-probe ahead up to 2.5 units for Station / Tome / Locked Door / Shrinkable Block
+    // 2) Ray-probe ahead up to 2.5 units for Station / Tome / Locked Door / Fractal Block hint
     var fx: f64 = 0.0;
     var fy: f64 = 0.0;
     var fz: f64 = 0.0;
@@ -2948,7 +3132,7 @@ fn use_nearest() {
             return;
         }
         if is_block_shrinkable(b) != 0 {
-            shrink_into(bx, by, bz, b, -1, 1);
+            set_status_msg("Solid block! Press [B] to shrink 16x and fly through its 3D hole!", 1600);
             return;
         }
         t = t + 0.35;
