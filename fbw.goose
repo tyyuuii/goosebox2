@@ -627,27 +627,27 @@ fn render_3d_world() {
             var out_z: f64 = 1e6;
             if hit != 0 {
                 out_col = shade_hit_block(hit_blk, hit_axis, hit_t, hit_hx, hit_hy, hit_hz, row_sky, hit_layer, hit_fog_scale);
-                if is_block_subdivisible(hit_blk) != 0 {
-                    if hit_layer == 0 && hit_t < 9.5 {
-                        out_col = trace_subvoxel_3d(
-                            cur_seed(), st.depth, biome,
-                            hit_mx, hit_my, hit_mz, hit_blk, hit_axis, hit_t,
-                            hit_hx, hit_hy, hit_hz, rdx, rdy, rdz,
-                            row_sky, hit_fog_scale, 0.0625
-                        );
-                    } else if hit_layer == 1 && hit_t < 95.0 {
+                if should_render_hole_lod(st.depth, hit_layer, hit_blk, hit_t) != 0 {
+                    if hit_layer == 1 {
                         out_col = trace_subvoxel_3d(
                             st.parent_seed[0], st.parent_depth[0], st.parent_biome[0],
                             hit_mx, hit_my, hit_mz, hit_blk, hit_axis, hit_t,
                             hit_hx, hit_hy, hit_hz, rdx, rdy, rdz,
                             row_sky, hit_fog_scale, 1.0
                         );
-                    } else if hit_layer == 2 && hit_t < 320.0 {
+                    } else if hit_layer == 2 {
                         out_col = trace_subvoxel_3d(
                             st.parent_seed[1], st.parent_depth[1], st.parent_biome[1],
                             hit_mx, hit_my, hit_mz, hit_blk, hit_axis, hit_t,
                             hit_hx, hit_hy, hit_hz, rdx, rdy, rdz,
                             row_sky, hit_fog_scale, 16.0
+                        );
+                    } else if hit_layer == 3 {
+                        out_col = trace_subvoxel_3d(
+                            st.parent_seed[2], st.parent_depth[2], st.parent_biome[2],
+                            hit_mx, hit_my, hit_mz, hit_blk, hit_axis, hit_t,
+                            hit_hx, hit_hy, hit_hz, rdx, rdy, rdz,
+                            row_sky, hit_fog_scale, 256.0
                         );
                     }
                 }

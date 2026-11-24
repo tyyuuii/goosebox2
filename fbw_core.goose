@@ -719,6 +719,16 @@ fn is_block_subdivisible(b: u8) -> i32 {
     return 0;
 }
 
+fn should_render_hole_lod(depth: i32, hit_layer: i32, hit_blk: u8, hit_t: f64) -> i32 {
+    if depth <= 0 || hit_layer <= 0 { return 0; }
+    if is_block_subdivisible(hit_blk) == 0 { return 0; }
+    if is_block_shrinkable(hit_blk) == 0 && depth < 3 && hit_layer < 3 { return 0; }
+    if hit_layer == 1 { return if hit_t < 22.0 { 1 } else { 0 }; }
+    if hit_layer == 2 { return if hit_t < 84.0 { 1 } else { 0 }; }
+    if hit_layer == 3 { return if hit_t < 260.0 { 1 } else { 0 }; }
+    return 0;
+}
+
 fn is_block_upgrade(b: u8) -> i32 {
     if b >= BLK_UPG_HP && b <= BLK_UPG_WEP { return 1; }
     return 0;

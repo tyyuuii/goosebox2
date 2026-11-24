@@ -578,6 +578,23 @@ fn test_v3_thick_walls_3d_holes_and_physical_entry() {
     expect(if get_subchunk_block(cur_seed(), 0, BIOME_TUTORIAL, 11, 3, 5, BLK_WALL_TUT, 0, 8, 8) == BLK_AIR && get_subchunk_block(cur_seed(), 0, BIOME_TUTORIAL, 11, 3, 5, BLK_WALL_TUT, 1, 1, 1) != BLK_AIR { 1 } else { 0 }, "get_subchunk_block exposes thick wall + 4x4 hole on BLK_WALL_TUT");
 }
 
+fn test_v4_lod_and_scale_gated_holes() {
+    // 1) Level 0 never exposes 3D sub-voxel holes on any block or layer
+    expect(if should_render_hole_lod(0, 0, BLK_WALL_TUT, 2.0) == 0 && should_render_hole_lod(0, 0, BLK_BLACK_CUBE, 2.0) == 0 && should_render_hole_lod(0, 1, BLK_BLACK_CUBE, 2.0) == 0 { 1 } else { 0 }, "Level 0 hides all 3D sub-voxel holes for clean solid blocks");
+
+    // 2) Same-scale Layer 0 blocks stay crisp and solid at any shrink depth
+    expect(if should_render_hole_lod(1, 0, BLK_BLACK_CUBE, 1.5) == 0 && should_render_hole_lod(3, 0, BLK_WALL_TUT, 1.5) == 0 { 1 } else { 0 }, "Layer 0 same-scale blocks never render noisy sub-voxel holes");
+
+    // 3) At shallow shrink (depth=1..2), shrinkable blocks show close entrance holes while regular world blocks remain solid
+    expect(if should_render_hole_lod(1, 1, BLK_BLACK_CUBE, 12.0) == 1 && should_render_hole_lod(1, 1, BLK_BLACK_CUBE, 40.0) == 0 { 1 } else { 0 }, "Layer 1 shrinkable portal blocks reveal close holes and fade via LOD at distance");
+    expect(if should_render_hole_lod(1, 1, BLK_WALL_TUT, 8.0) == 0 && should_render_hole_lod(2, 2, BLK_GRASS, 12.0) == 0 { 1 } else { 0 }, "Regular world blocks stay clean & solid at depth < 3 on layers 1-2");
+
+    // 4) Very small depth >= 3 (or hit_layer >= 3) reveals 3D holes on regular blocks with distance LOD
+    expect(if should_render_hole_lod(3, 1, BLK_WALL_TUT, 12.0) == 1 && should_render_hole_lod(3, 1, BLK_WALL_TUT, 28.0) == 0 { 1 } else { 0 }, "At depth=3, regular Layer 1 blocks reveal close holes and cull far holes");
+    expect(if should_render_hole_lod(3, 2, BLK_WALL_TUT, 40.0) == 1 && should_render_hole_lod(3, 2, BLK_WALL_TUT, 120.0) == 0 { 1 } else { 0 }, "Layer 2 (16x) holes obey 84.0 distance LOD");
+    expect(if should_render_hole_lod(3, 3, BLK_WALL_TUT, 120.0) == 1 && should_render_hole_lod(3, 3, BLK_WALL_TUT, 300.0) == 0 { 1 } else { 0 }, "Layer 3 (256x) holes render up close and cull past 260.0 LOD");
+}
+
 extern fn exit_proc(code: i32) = "exit";
 
 fn main() {
@@ -588,6 +605,7 @@ fn main() {
     test_in_place_shrink_and_parent_layers();
     test_sibling_air_traversal_and_air_atoms();
     test_v3_thick_walls_3d_holes_and_physical_entry();
+    test_v4_lod_and_scale_gated_holes();
 
     print("FBW Core Tests: ");
     print(g_pass);
