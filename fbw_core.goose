@@ -228,11 +228,11 @@ root struct fbw_state {
     blocks: u8[CHUNK_VOL],
     parent_blocks: u8[12288], // MAX_PARENT_VIS (3) * CHUNK_VOL
     scratch_blocks: u8[CHUNK_VOL],
-    inward_blocks: u8[131072], // 32-slot * CHUNK_VOL multi-layer 3D sub-voxel cache
-    inward_seeds: u64[32],
-    inward_blks: u8[32],
-    inward_depths: i32[32],
-    inward_used: i32[32],
+    inward_blocks: u8[1048576], // 256-slot * CHUNK_VOL multi-layer 3D sub-voxel cache
+    inward_seeds: u64[256],
+    inward_blks: u8[256],
+    inward_depths: i32[256],
+    inward_used: i32[256],
     inward_next: i32,
     parent_bx: i32[3],
     parent_by: i32[3],
@@ -259,6 +259,9 @@ root struct fbw_state {
     yaw: f64,
     pitch: f64,
     roll: f64,
+    yaw_vel: f64,
+    pitch_vel: f64,
+    turning_ms: i32,
     true_up: i32,     // 1 = True Up locks horizon level; 0 = Q/E roll freely
     rocket_mode: i32, // 1 = Low-drag Rocket Mode (Tab)
 
@@ -649,7 +652,7 @@ fn cur_seed() -> u64 {
 
 fn invalidate_inward_cache() {
     var i: i32 = 0;
-    while i < 32 {
+    while i < 256 {
         st.inward_used[i] = 0;
         i = i + 1;
     }
@@ -719,14 +722,45 @@ fn is_block_subdivisible(b: u8) -> i32 {
     return 0;
 }
 
-fn should_render_hole_lod(depth: i32, hit_layer: i32, hit_blk: u8, hit_t: f64) -> i32 {
+fn should_render_hole_lod_ex(depth: i32, hit_layer: i32, hit_blk: u8, hit_t: f64, is_turning: i32) -> i32 {
     if depth <= 0 || hit_layer <= 0 { return 0; }
     if is_block_subdivisible(hit_blk) == 0 { return 0; }
     if is_block_shrinkable(hit_blk) == 0 && depth < 3 && hit_layer < 3 { return 0; }
-    if hit_layer == 1 { return if hit_t < 22.0 { 1 } else { 0 }; }
-    if hit_layer == 2 { return if hit_t < 84.0 { 1 } else { 0 }; }
-    if hit_layer == 3 { return if hit_t < 260.0 { 1 } else { 0 }; }
+    if is_turning != 0 {
+        if hit_layer >= 2 { return 0; }
+        return if hit_t < 15.0 { 1 } else { 0 };
+    }
+    if hit_layer == 1 {
+        let cap1 = if depth >= 3 { 18.0 } else { 22.0 };
+        return if hit_t < cap1 { 1 } else { 0 };
+    }
+    if hit_layer == 2 {
+        let cap2 = if depth >= 3 { 56.0 } else { 84.0 };
+        return if hit_t < cap2 { 1 } else { 0 };
+    }
+    if hit_layer == 3 {
+        let cap3 = if depth >= 3 { 150.0 } else { 260.0 };
+        return if hit_t < cap3 { 1 } else { 0 };
+    }
     return 0;
+}
+
+fn should_render_hole_lod(depth: i32, hit_layer: i32, hit_blk: u8, hit_t: f64) -> i32 {
+    return should_render_hole_lod_ex(depth, hit_layer, hit_blk, hit_t, 0);
+}
+
+fn subvoxel_max_steps(hit_layer: i32, hit_t: f64, is_turning: i32) -> i32 {
+    if is_turning != 0 { return 12; }
+    if hit_layer == 1 {
+        if hit_t < 10.0 { return 24; }
+        return 16;
+    }
+    if hit_layer == 2 {
+        if hit_t < 32.0 { return 18; }
+        return 11;
+    }
+    if hit_t < 110.0 { return 14; }
+    return 9;
 }
 
 fn is_block_upgrade(b: u8) -> i32 {
@@ -1763,28 +1797,33 @@ fn get_subchunk_biome(
     return pick_biome_for_entry(child_d, blk, -1, cseed, parent_biome);
 }
 
-fn get_subchunk_block(
+fn resolve_subchunk_slot(
     parent_seed: u64, parent_depth: i32, parent_biome: i32,
-    mx: i32, my: i32, mz: i32, blk: u8,
-    cx: i32, cy: i32, cz: i32
-) -> u8 {
-    if cx < 0 || cx >= CHUNK_DIM || cy < 0 || cy >= CHUNK_DIM || cz < 0 || cz >= CHUNK_DIM {
-        return BLK_AIR;
-    }
+    mx: i32, my: i32, mz: i32, blk: u8
+) -> i32 {
     let is_tut_crown = if parent_depth == -1 && mx == 8 && my == 7 && mz == 8 && blk == BLK_YING_PLANET { 1 } else { 0 };
     let child_d = parent_depth + 1;
     let cseed =
         if is_tut_crown != 0 { 0x5841525f54555430 }
         else { hash_block_seed(parent_seed, mx, my, mz, child_d) };
-    var slot: i32 = 0;
-    while slot < 32 {
-        if st.inward_used[slot] != 0 && st.inward_seeds[slot] == cseed && st.inward_blks[slot] == blk && st.inward_depths[slot] == child_d {
-            return st.inward_blocks[slot * CHUNK_VOL + b_idx(cx, cy, cz)];
-        }
-        slot = slot + 1;
+    let kh = cseed ^ ((blk as u64) * 0x9e3779b97f4a7c15) ^ (((child_d & 0xffff) as u64) * 0xbf58476d1ce4e5b9);
+    let h0 = ((kh ^ (kh >> 8)) & 255) as! i32;
+    if st.inward_used[h0] != 0 && st.inward_seeds[h0] == cseed && st.inward_blks[h0] == blk && st.inward_depths[h0] == child_d {
+        return h0;
     }
-    slot = st.inward_next;
-    st.inward_next = (st.inward_next + 1) % 32;
+    let h1 = (h0 + 131) & 255;
+    if st.inward_used[h1] != 0 && st.inward_seeds[h1] == cseed && st.inward_blks[h1] == blk && st.inward_depths[h1] == child_d {
+        return h1;
+    }
+    var slot: i32 = h0;
+    if st.inward_used[h0] != 0 {
+        if st.inward_used[h1] == 0 {
+            slot = h1;
+        } else {
+            slot = if (st.inward_next & 1) == 0 { h0 } else { h1 };
+            st.inward_next = st.inward_next + 1;
+        }
+    }
     st.inward_used[slot] = 1;
     st.inward_seeds[slot] = cseed;
     st.inward_blks[slot] = blk;
@@ -1793,6 +1832,18 @@ fn get_subchunk_block(
         if is_tut_crown != 0 { BIOME_TUTORIAL }
         else { pick_biome_for_entry(child_d, blk, -1, cseed, parent_biome) };
     generate_chunk_blocks_to(10 + slot, child_d, cbio, blk, cseed, 0);
+    return slot;
+}
+
+fn get_subchunk_block(
+    parent_seed: u64, parent_depth: i32, parent_biome: i32,
+    mx: i32, my: i32, mz: i32, blk: u8,
+    cx: i32, cy: i32, cz: i32
+) -> u8 {
+    if cx < 0 || cx >= CHUNK_DIM || cy < 0 || cy >= CHUNK_DIM || cz < 0 || cz >= CHUNK_DIM {
+        return BLK_AIR;
+    }
+    let slot = resolve_subchunk_slot(parent_seed, parent_depth, parent_biome, mx, my, mz, blk);
     return st.inward_blocks[slot * CHUNK_VOL + b_idx(cx, cy, cz)];
 }
 
@@ -1956,7 +2007,7 @@ fn shrink_into_ex(bx: i32, by: i32, bz: i32, target_blk: u8, forced_biome: i32, 
     } else {
         st.vx = 0.0; st.vy = 0.0; st.vz = 0.0;
     }
-    st.ring_cd_ms = 240;
+    st.ring_cd_ms = 260;
     st.flash_ms = 200;
     st.flash_rgb = pack_rgb(40, 235, 130);
     if target_blk == BLK_AIR {
@@ -2054,7 +2105,7 @@ fn grow_out_axis(exit_x: f64, exit_y: f64, exit_z: f64) {
     } else {
         st.vx = 0.0; st.vy = 0.0; st.vz = 0.0;
     }
-    st.ring_cd_ms = 240;
+    st.ring_cd_ms = 260;
     st.flash_ms = 200;
     st.flash_rgb = pack_rgb(245, 70, 70);
     set_status_msg("Grew 16x outward in-place!", 1600);
@@ -2142,6 +2193,9 @@ fn init_new_game() {
     st.yaw = HALF_PI;
     st.pitch = -0.04;
     st.roll = 0.0;
+    st.yaw_vel = 0.0;
+    st.pitch_vel = 0.0;
+    st.turning_ms = 0;
     st.true_up = 1;
     st.rocket_mode = 0;
 
@@ -2218,6 +2272,9 @@ fn respawn_at_tutorial_preserving_progress() {
     st.yaw = HALF_PI;
     st.pitch = -0.04;
     st.roll = 0.0;
+    st.yaw_vel = 0.0;
+    st.pitch_vel = 0.0;
+    st.turning_ms = 0;
     st.ring_cd_ms = 400;
     st.flash_ms = 320;
     st.flash_rgb = pack_rgb(220, 40, 60);
@@ -2337,10 +2394,18 @@ fn apply_thrust(ax: f64, ay: f64, az: f64) {
     st.vz = st.vz + az * mul * boost;
 }
 
+fn apply_turn_impulse(dyaw: f64, dpitch: f64) {
+    st.yaw_vel = fclamp(st.yaw_vel + dyaw, -2.8, 2.8);
+    st.pitch_vel = fclamp(st.pitch_vel + dpitch, -2.0, 2.0);
+    st.turning_ms = 140;
+}
+
 fn apply_brake() {
     st.vx = st.vx * 0.18;
     st.vy = st.vy * 0.18;
     st.vz = st.vz * 0.18;
+    st.yaw_vel = st.yaw_vel * 0.15;
+    st.pitch_vel = st.pitch_vel * 0.15;
 }
 
 fn scratch_point_collides(x: f64, y: f64, z: f64) -> i32 {
@@ -3085,10 +3150,10 @@ fn shrink_targeted_block() {
 }
 
 fn use_nearest() {
-    // 1) Check Friend K, Rings
+    // 1) Check Friend K, Rings (strictly matching the HUD [F] Ring prompt radius < 2.4)
     var i: i32 = 0;
     var best_ring: i32 = -1;
-    var best_d: f64 = 2.6;
+    var best_d: f64 = 2.4;
     while i < MAX_ENTITIES {
         if st.entities[i].active != 0 {
             let k = st.entities[i].kind;
@@ -3141,7 +3206,7 @@ fn use_nearest() {
             }
             return;
         }
-        if is_block_shrinkable(b) != 0 {
+        if is_block_shrinkable(b) != 0 && (best_ring < 0 || best_d >= 1.6) {
             set_status_msg("Solid block! Press [B] to shrink 16x and fly through its 3D hole!", 1600);
             return;
         }
@@ -3292,6 +3357,19 @@ fn step_simulation(dt_ms: i32) {
     if st.flash_ms > 0 { st.flash_ms = st.flash_ms - dt_ms; if st.flash_ms < 0 { st.flash_ms = 0; } }
     if st.msg_ms > 0 { st.msg_ms = st.msg_ms - dt_ms; if st.msg_ms < 0 { st.msg_ms = 0; } }
     if st.telekinesis_ms > 0 { st.telekinesis_ms = st.telekinesis_ms - dt_ms; if st.telekinesis_ms < 0 { st.telekinesis_ms = 0; } }
+    if st.turning_ms > 0 { st.turning_ms = st.turning_ms - dt_ms; if st.turning_ms < 0 { st.turning_ms = 0; } }
+
+    // Smooth Angular Velocity Looking (matching jet mode flight inertia)
+    if fabs(st.yaw_vel) > 0.0005 || fabs(st.pitch_vel) > 0.0005 {
+        st.yaw = wrap_angle(st.yaw + st.yaw_vel * dt);
+        st.pitch = fclamp(st.pitch + st.pitch_vel * dt, -1.25, 1.25);
+        if fabs(st.pitch) >= 1.249 { st.pitch_vel = 0.0; }
+        let turn_decay = fclamp(1.0 - 9.2 * dt, 0.08, 0.96);
+        st.yaw_vel = st.yaw_vel * turn_decay;
+        st.pitch_vel = st.pitch_vel * turn_decay;
+        if fabs(st.yaw_vel) < 0.002 { st.yaw_vel = 0.0; }
+        if fabs(st.pitch_vel) < 0.002 { st.pitch_vel = 0.0; }
+    }
 
     // True Up smoothly levels camera roll
     if st.true_up != 0 && fabs(st.roll) > 0.001 {
@@ -3355,18 +3433,8 @@ fn step_simulation(dt_ms: i32) {
         let dist = fsqrt(dx * dx + dy * dy + dz * dz);
 
         if k >= ENT_RING_GREEN && k <= ENT_RING_PINK {
+            // Rings activate explicitly with [F] (never auto-warp on touch/proximity)
             if dist < 2.4 { st.near_ring_kind = k; }
-            if dist < 0.78 && st.ring_cd_ms <= 0 {
-                let rx = clamp_i(ffloor(st.entities[i].x), 0, 15);
-                let ry = clamp_i(ffloor(st.entities[i].y), 0, 15);
-                let rz = clamp_i(ffloor(st.entities[i].z), 0, 15);
-                let tb = st.entities[i].target_block;
-                let tbio = st.entities[i].target_biome;
-                if k == ENT_RING_RED { grow_out_axis(st.px, st.py, st.pz); }
-                else if k == ENT_RING_PINK { shrink_into_ex(rx, ry, rz, tb, tbio, 2, st.px, st.py, st.pz); }
-                else { shrink_into_ex(rx, ry, rz, tb, tbio, 1, st.px, st.py, st.pz); }
-                return;
-            }
         } else if k == ENT_FRIEND_K {
             if dist < 1.15 {
                 st.k_rescued = 1;

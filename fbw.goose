@@ -278,7 +278,7 @@ fn trace_subvoxel_3d(
     hit_blk: u8, hit_axis: i32, hit_t: f64,
     hx: f64, hy: f64, hz: f64,
     rdx: f64, rdy: f64, rdz: f64,
-    row_sky: u32, fog_scale: f64, sub_world_scale: f64
+    row_sky: u32, fog_scale: f64, sub_world_scale: f64, max_steps: i32
 ) -> u32 {
     var fx = fclamp((hx - mx) * 16.0, 0.002, 15.998);
     var fy = fclamp((hy - my) * 16.0, 0.002, 15.998);
@@ -288,8 +288,11 @@ fn trace_subvoxel_3d(
     var imy: i32 = clamp_i(ffloor(fy), 0, 15);
     var imz: i32 = clamp_i(ffloor(fz), 0, 15);
 
+    // Resolve O(1) 256-slot subchunk cache once per block impact instead of per DDA step
+    let slot_base = resolve_subchunk_slot(pseed, pdepth, pbiome, mx, my, mz, hit_blk) * CHUNK_VOL;
+
     var ihit: i32 = 0;
-    var iblk: u8 = get_subchunk_block(pseed, pdepth, pbiome, mx, my, mz, hit_blk, imx, imy, imz);
+    var iblk: u8 = st.inward_blocks[slot_base + ((imy << 8) | (imz << 4) | imx)];
     var iaxis: i32 = hit_axis;
     var it: f64 = 0.0;
 
@@ -306,7 +309,7 @@ fn trace_subvoxel_3d(
         var tmy: f64 = if rdy < 0.0 { (fy - imy) * tdy } else { ((imy + 1) - fy) * tdy };
         var tmz: f64 = if rdz < 0.0 { (fz - imz) * tdz } else { ((imz + 1) - fz) * tdz };
         var k: i32 = 0;
-        while k < 28 {
+        while k < max_steps {
             if tmx < tmy {
                 if tmx < tmz { it = tmx; imx = imx + sx; tmx = tmx + tdx; iaxis = 0; }
                 else { it = tmz; imz = imz + sz; tmz = tmz + tdz; iaxis = 2; }
@@ -315,7 +318,7 @@ fn trace_subvoxel_3d(
                 else { it = tmz; imz = imz + sz; tmz = tmz + tdz; iaxis = 2; }
             }
             if ((imx | imy | imz) & -16) != 0 { break; }
-            let b2 = get_subchunk_block(pseed, pdepth, pbiome, mx, my, mz, hit_blk, imx, imy, imz);
+            let b2 = st.inward_blocks[slot_base + ((imy << 8) | (imz << 4) | imx)];
             if b2 != BLK_AIR {
                 iblk = b2;
                 ihit = 1;
@@ -397,11 +400,13 @@ fn render_3d_world() {
     let half_w_off = 0.5 * inv_pw - fov_scale * aspect;
     let inv_ph = (2.0 * fov_scale) / ph;
 
-    // Precompute horizontal camera ray offsets once per frame
+    // Precompute horizontal camera ray offsets once per frame (adaptive 2x pixel skip when turning!)
     var col_rx: f64[MAX_PW] = [0.0; MAX_PW];
     var col_ry: f64[MAX_PW] = [0.0; MAX_PW];
     var col_rz: f64[MAX_PW] = [0.0; MAX_PW];
-    let step_px: i32 = if st.render_scale == 2 { 2 } else { 1 };
+    let is_turning: i32 = if st.turning_ms > 0 || fabs(st.yaw_vel) > 0.05 || fabs(st.pitch_vel) > 0.05 { 1 } else { 0 };
+    let step_px: i32 = if st.render_scale == 2 || is_turning != 0 { 2 } else { 1 };
+    let max_pl: i32 = if st.depth >= 3 && is_turning != 0 { 2 } else { 3 };
     var pxi: i32 = 0;
     while pxi < pw {
         let nx = pxi * inv_pw + half_w_off;
@@ -525,7 +530,7 @@ fn render_3d_world() {
                 var cur_z: f64 = ppz + rdz * cur_t;
                 var scale_mul: f64 = 16.0;
                 var pl: i32 = 0;
-                while pl < 3 && hit == 0 {
+                while pl < max_pl && hit == 0 {
                     if st.parent_valid[pl] == 0 { break; }
                     let pbx = st.parent_bx[pl];
                     let pby = st.parent_by[pl];
@@ -627,27 +632,28 @@ fn render_3d_world() {
             var out_z: f64 = 1e6;
             if hit != 0 {
                 out_col = shade_hit_block(hit_blk, hit_axis, hit_t, hit_hx, hit_hy, hit_hz, row_sky, hit_layer, hit_fog_scale);
-                if should_render_hole_lod(st.depth, hit_layer, hit_blk, hit_t) != 0 {
+                if should_render_hole_lod_ex(st.depth, hit_layer, hit_blk, hit_t, is_turning) != 0 {
+                    let msteps = subvoxel_max_steps(hit_layer, hit_t, is_turning);
                     if hit_layer == 1 {
                         out_col = trace_subvoxel_3d(
                             st.parent_seed[0], st.parent_depth[0], st.parent_biome[0],
                             hit_mx, hit_my, hit_mz, hit_blk, hit_axis, hit_t,
                             hit_hx, hit_hy, hit_hz, rdx, rdy, rdz,
-                            row_sky, hit_fog_scale, 1.0
+                            row_sky, hit_fog_scale, 1.0, msteps
                         );
                     } else if hit_layer == 2 {
                         out_col = trace_subvoxel_3d(
                             st.parent_seed[1], st.parent_depth[1], st.parent_biome[1],
                             hit_mx, hit_my, hit_mz, hit_blk, hit_axis, hit_t,
                             hit_hx, hit_hy, hit_hz, rdx, rdy, rdz,
-                            row_sky, hit_fog_scale, 16.0
+                            row_sky, hit_fog_scale, 16.0, msteps
                         );
                     } else if hit_layer == 3 {
                         out_col = trace_subvoxel_3d(
                             st.parent_seed[2], st.parent_depth[2], st.parent_biome[2],
                             hit_mx, hit_my, hit_mz, hit_blk, hit_axis, hit_t,
                             hit_hx, hit_hy, hit_hz, rdx, rdy, rdz,
-                            row_sky, hit_fog_scale, 256.0
+                            row_sky, hit_fog_scale, 256.0, msteps
                         );
                     }
                 }
@@ -887,12 +893,24 @@ fn blit_fb_to_termbox() {
         let bot_row = (r * 2 + 1) * pw;
         var cur_fg: uintattr_t = 0xffffffffffffffff;
         var cur_bg: uintattr_t = 0xffffffffffffffff;
+        var last_top_rgb: u32 = 0xffffffff;
+        var last_bot_rgb: u32 = 0xffffffff;
+        var last_fg: uintattr_t = 0;
+        var last_bg: uintattr_t = 0;
         var c: i32 = 0;
         while c < pw {
             let top_rgb = st.fb_rgb[top_row + c];
             let bot_rgb = st.fb_rgb[bot_row + c];
+            if top_rgb != last_top_rgb {
+                last_top_rgb = top_rgb;
+                last_fg = color_to_attr(top_rgb, tc);
+            }
+            if bot_rgb != last_bot_rgb {
+                last_bot_rgb = bot_rgb;
+                last_bg = if bot_rgb == top_rgb { last_fg } else { color_to_attr(bot_rgb, tc) };
+            }
             if top_rgb == bot_rgb {
-                let col = color_to_attr(top_rgb, tc);
+                let col = last_fg;
                 if col == cur_bg {
                     let _ = tb_set_cell(c, r, ' ', cur_fg, cur_bg);
                 } else if col == cur_fg {
@@ -903,11 +921,9 @@ fn blit_fb_to_termbox() {
                     let _ = tb_set_cell(c, r, ' ', cur_fg, cur_bg);
                 }
             } else {
-                let fg = color_to_attr(top_rgb, tc);
-                let bg = color_to_attr(bot_rgb, tc);
-                cur_fg = fg;
-                cur_bg = bg;
-                let _ = tb_set_cell(c, r, CH_HALF_TOP, fg, bg);
+                cur_fg = last_fg;
+                cur_bg = last_bg;
+                let _ = tb_set_cell(c, r, CH_HALF_TOP, last_fg, last_bg);
             }
             c = c + 1;
         }
@@ -1722,10 +1738,10 @@ fn handle_key(ev: tb_event&) -> i32 {
     else if ch == 'a' || ch == 'A' { apply_thrust(-rx * thrust, 0.0, -rz * thrust); }
     else if key == TB_KEY_SPACE || ch == ' ' || key == TB_KEY_PGUP { apply_thrust(0.0, thrust * 0.9, 0.0); }
     else if ch == 'c' || ch == 'C' || ch == 'z' || ch == 'Z' || key == TB_KEY_PGDN { apply_thrust(0.0, -thrust * 0.9, 0.0); }
-    else if key == TB_KEY_ARROW_LEFT || ch == 'j' || ch == 'J' { st.yaw = wrap_angle(st.yaw - 0.11); }
-    else if key == TB_KEY_ARROW_RIGHT || ch == 'l' || ch == 'L' { st.yaw = wrap_angle(st.yaw + 0.11); }
-    else if key == TB_KEY_ARROW_UP || ch == 'i' || ch == 'I' { st.pitch = fclamp(st.pitch + 0.08, -1.25, 1.25); }
-    else if key == TB_KEY_ARROW_DOWN || ch == 'k' || ch == 'K' { st.pitch = fclamp(st.pitch - 0.08, -1.25, 1.25); }
+    else if key == TB_KEY_ARROW_LEFT || ch == 'j' || ch == 'J' { apply_turn_impulse(-1.05, 0.0); }
+    else if key == TB_KEY_ARROW_RIGHT || ch == 'l' || ch == 'L' { apply_turn_impulse(1.05, 0.0); }
+    else if key == TB_KEY_ARROW_UP || ch == 'i' || ch == 'I' { apply_turn_impulse(0.0, 0.78); }
+    else if key == TB_KEY_ARROW_DOWN || ch == 'k' || ch == 'K' { apply_turn_impulse(0.0, -0.78); }
 
     return 1;
 }
@@ -1740,6 +1756,7 @@ fn handle_mouse(ev: tb_event&) {
                 let dy = ev.y - st.mouse_last_y;
                 if dx != 0 || dy != 0 {
                     st.mouse_drag_moved = 1;
+                    st.turning_ms = 120;
                 }
                 st.yaw = wrap_angle(st.yaw + dx * 0.025);
                 st.pitch = fclamp(st.pitch - dy * 0.035, -1.25, 1.25);

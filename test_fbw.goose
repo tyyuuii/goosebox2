@@ -595,6 +595,68 @@ fn test_v4_lod_and_scale_gated_holes() {
     expect(if should_render_hole_lod(3, 3, BLK_WALL_TUT, 120.0) == 1 && should_render_hole_lod(3, 3, BLK_WALL_TUT, 300.0) == 0 { 1 } else { 0 }, "Layer 3 (256x) holes render up close and cull past 260.0 LOD");
 }
 
+fn test_v5_smooth_turning_rings_cache_and_lod() {
+    let st = core();
+    st.genesis_mode = 0;
+
+    // 1) Angular velocity turning integrates smoothly per tick and decays / brakes cleanly
+    init_new_game();
+    st.screen = SCREEN_PLAY;
+    let y0 = st.yaw;
+    let p0 = st.pitch;
+    apply_turn_impulse(1.05, 0.78);
+    expect(if st.yaw_vel > 0.5 && st.pitch_vel > 0.5 && st.turning_ms > 0 { 1 } else { 0 }, "Turn impulse populates yaw_vel, pitch_vel, and turning_ms");
+    step_simulation(33);
+    expect(if st.yaw > y0 && st.pitch > p0 && st.yaw_vel > 0.0 && st.yaw_vel < 1.05 { 1 } else { 0 }, "step_simulation integrates angular velocity smoothly with damping");
+    apply_brake();
+    expect(if st.yaw_vel < 0.25 && st.pitch_vel < 0.25 { 1 } else { 0 }, "apply_brake [X] damps both linear and angular velocity");
+
+    // 2) Walking into or shrinking/growing near a ring NEVER accidentally triggers it; [F] activates explicitly
+    init_new_game();
+    st.screen = SCREEN_PLAY;
+    st.px = 9.5; st.py = 3.2; st.pz = 6.2; // Exact Tutorial Green Shrink Ring position
+    st.ring_cd_ms = 0;
+    var s: i32 = 0;
+    while s < 5 {
+        step_simulation(50);
+        s = s + 1;
+    }
+    expect(if st.depth == 0 && st.near_ring_kind == ENT_RING_GREEN { 1 } else { 0 }, "Touching Green Shrink Ring shows [F] prompt without accidental touch-warp");
+    shrink_targeted_block();
+    expect(if st.depth == 1 && st.ring_cd_ms > 0 { 1 } else { 0 }, "[B] shrinks cleanly near ring with active cooldown");
+    grow_in_place();
+    expect(if st.depth == 0 && st.ring_cd_ms > 0 { 1 } else { 0 }, "[V] grows back to depth 0 without misfiring ring");
+
+    // Explicit [F] near the ring triggers it cleanly!
+    st.px = 9.5; st.py = 3.2; st.pz = 6.2;
+    step_simulation(33);
+    use_nearest();
+    expect(if st.depth == 1 { 1 } else { 0 }, "Pressing [F] near Green Ring activates shrink reliably");
+
+    // 3) 256-slot hash-indexed subchunk cache handles >64 unique neighbor blocks without thrashing
+    init_new_game();
+    st.screen = SCREEN_PLAY;
+    var ok_cache: i32 = 1;
+    var x: i32 = 0;
+    while x < 10 {
+        var z: i32 = 0;
+        while z < 8 {
+            let slot_a = resolve_subchunk_slot(cur_seed(), 0, BIOME_TUTORIAL, x, 3, z, BLK_WALL_TUT);
+            let slot_b = resolve_subchunk_slot(cur_seed(), 0, BIOME_TUTORIAL, x, 3, z, BLK_WALL_TUT);
+            if slot_a < 0 || slot_a >= 256 || slot_a != slot_b { ok_cache = 0; }
+            z = z + 1;
+        }
+        x = x + 1;
+    }
+    expect(ok_cache, "256-slot subchunk cache hits deterministically across 80 unique blocks");
+
+    // 4) Nested depth>=3 & turn-time LOD cull outer holes and scale inner DDA step cap
+    expect(if should_render_hole_lod_ex(3, 2, BLK_BLACK_CUBE, 60.0, 0) == 0 && should_render_hole_lod_ex(3, 2, BLK_BLACK_CUBE, 40.0, 0) == 1 { 1 } else { 0 }, "Deep depth>=3 tightens Layer 2 LOD cap from 84.0 to 56.0");
+    expect(if should_render_hole_lod_ex(3, 3, BLK_BLACK_CUBE, 200.0, 0) == 0 && should_render_hole_lod_ex(3, 3, BLK_BLACK_CUBE, 120.0, 0) == 1 { 1 } else { 0 }, "Deep depth>=3 tightens Layer 3 LOD cap from 260.0 to 150.0");
+    expect(if should_render_hole_lod_ex(2, 2, BLK_BLACK_CUBE, 20.0, 1) == 0 && should_render_hole_lod_ex(2, 1, BLK_BLACK_CUBE, 12.0, 1) == 1 { 1 } else { 0 }, "Turning skips outer Layer 2+ holes while keeping close Layer 1 portals");
+    expect(if subvoxel_max_steps(1, 6.0, 0) == 24 && subvoxel_max_steps(3, 140.0, 0) == 9 && subvoxel_max_steps(1, 6.0, 1) == 12 { 1 } else { 0 }, "subvoxel_max_steps scales inner DDA budget by layer, distance, and turning");
+}
+
 extern fn exit_proc(code: i32) = "exit";
 
 fn main() {
@@ -606,6 +668,7 @@ fn main() {
     test_sibling_air_traversal_and_air_atoms();
     test_v3_thick_walls_3d_holes_and_physical_entry();
     test_v4_lod_and_scale_gated_holes();
+    test_v5_smooth_turning_rings_cache_and_lod();
 
     print("FBW Core Tests: ");
     print(g_pass);
